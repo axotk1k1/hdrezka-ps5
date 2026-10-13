@@ -179,6 +179,25 @@ std::string inner_after(const std::string &html, size_t from, const char *close,
     return html.substr(gt + 1, stop - gt - 1);
 }
 
+// Where the class attribute that lists `word` among its classes starts
+// (the position of the word inside it), from `from` on; npos when none does.
+size_t find_class(const std::string &html, const char *word, size_t from = 0)
+{
+    const std::string key = "class=\"";
+    const size_t len = strlen(word);
+    for (size_t at = html.find(key, from); at != std::string::npos; at = html.find(key, at + 1)) {
+        const size_t begin = at + key.size();
+        const size_t end = html.find('"', begin);
+        if (end == std::string::npos) break;
+        for (size_t w = html.find(word, begin); w != std::string::npos && w + len <= end; w = html.find(word, w + 1)) {
+            const bool left = w == begin || html[w - 1] == ' ';
+            const bool right = w + len == end || html[w + len] == ' ';
+            if (left && right) return w;
+        }
+    }
+    return std::string::npos;
+}
+
 // The value of attribute `name` in the tag text `tag`.
 std::string attr_of(const std::string &tag, const char *name)
 {
@@ -1059,6 +1078,230 @@ std::vector<CatalogItem> Client::get_movie_list(const std::string &filter, int g
         *has_next = nav && next != std::string::npos && !disabled;
     }
     return parse_catalog_html(html, "home", mirror_);
+}
+
+// The value of a JSON string member, unescaped (defined with the comments' reader).
+static std::string json_string(const std::string &json, const char *key);
+
+bool Client::login(const std::string &email, const std::string &password, std::string &error)
+{
+    error.clear();
+    std::map<std::string, std::string> fields;
+    fields["login_name"] = email;
+    fields["login_password"] = password;
+    fields["login_not_save"] = "0";
+    const std::string response = http_post("/ajax/login/", fields);
+    if (response.empty()) {
+        error = "Ошибка сети";
+        return false;
+    }
+    if (response.find("\"success\":true") == std::string::npos) {
+        error = json_string(response, "message");
+        return false;
+    }
+    write_log("[DEBUG] login ok, user id '%s'\n", session_user_id().c_str());
+    return true;
+}
+
+void Client::logout()
+{
+    http_post("/logout", {});
+    // Whatever the site answered, this device forgets the session: the cookie
+    // file loses its dle_* and PHPSESSID lines (the mirror's own stay).
+    std::lock_guard<std::recursive_mutex> net_lock(net_mu_);
+    if (cookie_file_.empty())
+        return;
+    std::string kept;
+    if (FILE *f = fopen(cookie_file_.c_str(), "r")) {
+        char line[4096];
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "\tdle_") || strstr(line, "\tPHPSESSID\t"))
+                continue;
+            kept += line;
+        }
+        fclose(f);
+    }
+    if (FILE *f = fopen(cookie_file_.c_str(), "w")) {
+        fputs(kept.c_str(), f);
+        fclose(f);
+    }
+}
+
+std::string Client::session_user_id() const
+{
+    if (cookie_file_.empty())
+        return "";
+    std::string id;
+    if (FILE *f = fopen(cookie_file_.c_str(), "r")) {
+        char line[4096];
+        while (fgets(line, sizeof(line), f)) {
+            // Netscape format: domain, flag, path, secure, expiry, name, value
+            const char *name = strstr(line, "\tdle_user_id\t");
+            if (!name)
+                continue;
+            std::string value = name + strlen("\tdle_user_id\t");
+            while (!value.empty() && (value.back() == '\n' || value.back() == '\r'))
+                value.pop_back();
+            if (!value.empty() && value != "deleted" && value != "0")
+                id = value;
+        }
+        fclose(f);
+    }
+    return id;
+}
+
+bool Client::get_account(Account &acc)
+{
+    acc = {};
+    acc.id = session_user_id();
+    if (acc.id.empty())
+        return false;
+    const std::string html = http_get("/user/" + acc.id + "/");
+    if (html.empty())
+        return false;
+    // Signed in is told by the page not offering to sign in.
+    acc.logged_in = html.find("b-tophead__login") == std::string::npos;
+    const size_t title = html.find("<title>");
+    if (title != std::string::npos)
+        acc.name = strip_tags(inner_after(html, title, "</title>"));
+    // The e-mail: input.b-field with id="email" (the settings form)
+    for (size_t at = find_class(html, "b-field"); at != std::string::npos; at = find_class(html, "b-field", at + 1)) {
+        const size_t open = html.rfind('<', at);
+        const size_t close = html.find('>', at);
+        if (open == std::string::npos || close == std::string::npos)
+            break;
+        const std::string tag = html.substr(open, close - open);
+        if (attr_of(tag, "id") == "email") {
+            acc.email = decode_entities(attr_of(tag, "value"));
+            break;
+        }
+    }
+    // The avatar: div.b-userprofile__avatar_holder img
+    const size_t holder = find_class(html, "b-userprofile__avatar_holder");
+    if (holder != std::string::npos) {
+        const size_t img = html.find("<img", holder);
+        const size_t img_end = img == std::string::npos ? img : html.find('>', img);
+        if (img_end != std::string::npos) {
+            std::string src = attr_of(html.substr(img, img_end - img), "src");
+            if (!src.empty() && src.rfind("http", 0) != 0)
+                src = mirror_ + (src[0] == '/' ? "" : "/") + src;
+            acc.avatar = src;
+        }
+    }
+    // The subscription: li.b-tophead-premuser, the days left in its <b>
+    const size_t prem = find_class(html, "b-tophead-premuser");
+    if (prem != std::string::npos) {
+        acc.premium = true;
+        const size_t li_end = html.find("</li>", prem);
+        const size_t b_at = html.find("<b>", prem);
+        if (b_at != std::string::npos && (li_end == std::string::npos || b_at < li_end)) {
+            const std::string digits = strip_tags(inner_after(html, b_at, "</b>"));
+            int days = 0;
+            for (char c : digits)
+                if (c >= '0' && c <= '9')
+                    days = days * 10 + (c - '0');
+            acc.premium_days = days;
+        }
+    }
+    return acc.logged_in;
+}
+
+std::vector<WatchLaterItem> Client::get_watch_later()
+{
+    std::vector<WatchLaterItem> out;
+    const std::string html = http_get("/continue/");
+    const std::string mark = "b-videosaves__list_item";
+    bool first = true;
+    for (size_t at = html.find(mark); at != std::string::npos;) {
+        const size_t next = html.find(mark, at + mark.size());
+        // The list opens with its heading row, which the app drops too
+        if (first) {
+            first = false;
+            at = next;
+            continue;
+        }
+        const size_t tag_open = html.rfind('<', at);
+        const size_t tag_close = html.find('>', at);
+        const std::string chunk = html.substr(at, (next == std::string::npos ? std::min(html.size(), at + 4000) : next) - at);
+        WatchLaterItem item;
+        if (tag_open != std::string::npos && tag_close != std::string::npos) {
+            item.id = attr_of(html.substr(tag_open, tag_close - tag_open), "id");
+            const std::string prefix = "videosave-";
+            if (item.id.rfind(prefix, 0) == 0)
+                item.id.erase(0, prefix.size());
+        }
+        const size_t date = find_class(chunk, "date");
+        if (date != std::string::npos) item.date = strip_tags(inner_after(chunk, date, "</div>"));
+        const size_t title = find_class(chunk, "title");
+        if (title != std::string::npos) {
+            const size_t a = chunk.find("<a", title);
+            if (a != std::string::npos) {
+                const std::string tag = chunk.substr(a, chunk.find('>', a) - a);
+                item.url = attr_of(tag, "href");
+                item.cover_url = attr_of(tag, "data-cover_url");
+                item.title = strip_tags(inner_after(chunk, a, "</a>"));
+            }
+            const size_t small = chunk.find("<small", title);
+            if (small != std::string::npos) item.project_info = strip_tags(inner_after(chunk, small, "</small>"));
+        }
+        const size_t info = find_class(chunk, "info");
+        if (info != std::string::npos) {
+            std::string cell = inner_after(chunk, info, "</div>");
+            const size_t holder = cell.find("<span");
+            if (holder != std::string::npos) {
+                const size_t a = cell.find("<a", holder);
+                if (a != std::string::npos) item.next_info = strip_tags(inner_after(cell, a, "</a>"));
+                cell.erase(holder);
+            }
+            item.info = strip_tags(cell);
+        }
+        if (!item.url.empty() && item.url.rfind("http", 0) != 0)
+            item.url = mirror_ + (item.url.front() == '/' ? "" : "/") + item.url;
+        if (!item.title.empty())
+            out.push_back(item);
+        at = next;
+    }
+    write_log("[DEBUG] get_watch_later -> %zu\n", out.size());
+    return out;
+}
+
+bool Client::remove_watch_later(const std::string &id)
+{
+    std::map<std::string, std::string> fields;
+    fields["id"] = id;
+    return http_post("/engine/ajax/cdn_saves_remove.php", fields).find("\"success\":true") != std::string::npos;
+}
+
+std::vector<BookmarkFolder> Client::get_bookmark_folders()
+{
+    std::vector<BookmarkFolder> out;
+    const std::string html = http_get("/favorites/");
+    const std::string mark = "class=\"b-favorites_content__cats_list_item";
+    for (size_t at = html.find(mark); at != std::string::npos;) {
+        const size_t next = html.find(mark, at + mark.size());
+        const size_t tag_open = html.rfind('<', at);
+        const size_t tag_close = html.find('>', at);
+        const std::string chunk = html.substr(at, (next == std::string::npos ? std::min(html.size(), at + 2000) : next) - at);
+        BookmarkFolder folder;
+        if (tag_open != std::string::npos && tag_close != std::string::npos)
+            folder.id = attr_of(html.substr(tag_open, tag_close - tag_open), "data-cat_id");
+        const size_t name = chunk.find("class=\"name\"");
+        if (name != std::string::npos) folder.name = strip_tags(inner_after(chunk, name, "</span>"));
+        const size_t b = chunk.find("<b>");
+        if (b != std::string::npos) folder.count = strip_tags(inner_after(chunk, b, "</b>"));
+        const size_t link = chunk.find("b-favorites_content__cats_list_link");
+        if (link != std::string::npos) {
+            const size_t a = chunk.rfind("<a", link);
+            if (a != std::string::npos) folder.url = attr_of(chunk.substr(a, chunk.find('>', a) - a), "href");
+        }
+        if (!folder.url.empty() && folder.url.rfind("http", 0) != 0)
+            folder.url = mirror_ + (folder.url.front() == '/' ? "" : "/") + folder.url;
+        if (!folder.name.empty())
+            out.push_back(folder);
+        at = next;
+    }
+    write_log("[DEBUG] get_bookmark_folders -> %zu\n", out.size());
+    return out;
 }
 
 std::vector<CatalogItem> Client::get_list_at(const std::string &url)

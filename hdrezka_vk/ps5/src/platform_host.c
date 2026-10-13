@@ -132,3 +132,21 @@ void
 audio_stop(void)
 {
 }
+
+bool
+keyboard_open(const char *title, const char *text, bool password, int max_chars)
+{
+   (void)title;
+   (void)text;
+   (void)password;
+   (void)max_chars;
+   return false;
+}
+
+int
+keyboard_poll(char *out, size_t size)
+{
+   (void)out;
+   (void)size;
+   return -1;
+}

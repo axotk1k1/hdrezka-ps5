@@ -436,3 +436,174 @@ audio_stop(void)
    (void)sceAudioOutClose(audio_port);
    audio_port = -1;
 }
+
+/* The console's keyboard. libSceImeDialog is not among the modules a title
+ * starts with, so it is loaded when first asked for and its calls are looked
+ * up by name: a console that has no such module costs a false, not a title
+ * that will not start. The structures are the IME dialog's as PS4 and PS5
+ * share them; its text is UTF-16. */
+int sceKernelLoadStartModule(const char *path, size_t argc, const void *argv, uint32_t flags,
+                             void *option, int *result);
+int sceKernelDlsym(int handle, const char *symbol, void **address);
+
+struct ime_dialog_param {
+   int32_t user_id;
+   int32_t type;                 /* 0: the default keyboard */
+   uint64_t supported_languages; /* 0: all */
+   int32_t enter_label;
+   int32_t input_method;
+   void *filter;
+   uint32_t option;
+   uint32_t max_text_length;
+   uint16_t *input_text_buffer;
+   float pos_x, pos_y;
+   int32_t horizontal_alignment;
+   int32_t vertical_alignment;
+   const uint16_t *placeholder;
+   const uint16_t *title;
+   int8_t reserved[16];
+};
+struct ime_dialog_result {
+   int32_t end_status; /* 0 entered, 1 cancelled, 2 aborted */
+   int8_t reserved[12];
+};
+#define IME_OPTION_PASSWORD 0x00000004u
+#define IME_OPTION_NO_AUTO_CAPITALIZATION 0x00000002u
+#define IME_OPTION_NO_LEARNING 0x00000040u
+#define IME_DIALOG_FINISHED 2
+
+static struct {
+   bool looked_up, available, open;
+   int (*init)(const struct ime_dialog_param *param, void *extended);
+   int (*get_status)(void);
+   int (*get_result)(struct ime_dialog_result *result);
+   int (*term)(void);
+   uint16_t text[256];
+   uint16_t title[64];
+} ime;
+
+static size_t
+utf8_to_utf16(const char *in, uint16_t *out, size_t capacity)
+{
+   size_t n = 0;
+   const unsigned char *s = (const unsigned char *)(in ? in : "");
+   while (*s && n + 2 < capacity) {
+      uint32_t cp = *s++;
+      int more = cp >= 0xf0 ? 3 : cp >= 0xe0 ? 2 : cp >= 0xc0 ? 1 : 0;
+      if (more)
+         cp &= 0x3f >> more;
+      while (more-- > 0 && (*s & 0xc0) == 0x80)
+         cp = (cp << 6) | (*s++ & 0x3f);
+      if (cp >= 0x10000) {
+         cp -= 0x10000;
+         out[n++] = (uint16_t)(0xd800 | (cp >> 10));
+         out[n++] = (uint16_t)(0xdc00 | (cp & 0x3ff));
+      } else
+         out[n++] = (uint16_t)cp;
+   }
+   out[n] = 0;
+   return n;
+}
+
+static void
+utf16_to_utf8(const uint16_t *in, char *out, size_t size)
+{
+   size_t n = 0;
+   while (*in && n + 5 < size) {
+      uint32_t cp = *in++;
+      if (cp >= 0xd800 && cp < 0xdc00 && *in >= 0xdc00 && *in < 0xe000)
+         cp = 0x10000 + ((cp - 0xd800) << 10) + (*in++ - 0xdc00);
+      if (cp < 0x80)
+         out[n++] = (char)cp;
+      else if (cp < 0x800) {
+         out[n++] = (char)(0xc0 | (cp >> 6));
+         out[n++] = (char)(0x80 | (cp & 0x3f));
+      } else if (cp < 0x10000) {
+         out[n++] = (char)(0xe0 | (cp >> 12));
+         out[n++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+         out[n++] = (char)(0x80 | (cp & 0x3f));
+      } else {
+         out[n++] = (char)(0xf0 | (cp >> 18));
+         out[n++] = (char)(0x80 | ((cp >> 12) & 0x3f));
+         out[n++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+         out[n++] = (char)(0x80 | (cp & 0x3f));
+      }
+   }
+   if (size)
+      out[n] = 0;
+}
+
+static bool
+ime_look_up(void)
+{
+   if (ime.looked_up)
+      return ime.available;
+   ime.looked_up = true;
+   const int module = sceKernelLoadStartModule("/system/common/lib/libSceImeDialog.sprx", 0, NULL, 0, NULL, NULL);
+   if (module < 0) {
+      say("keyboard: no libSceImeDialog (0x%08x)", (unsigned)module);
+      return false;
+   }
+   void *address[4] = { NULL, NULL, NULL, NULL };
+   static const char *const names[4] = { "sceImeDialogInit", "sceImeDialogGetStatus",
+                                         "sceImeDialogGetResult", "sceImeDialogTerm" };
+   for (int i = 0; i < 4; i++) {
+      if (sceKernelDlsym(module, names[i], &address[i]) < 0 || !address[i]) {
+         say("keyboard: libSceImeDialog has no %s", names[i]);
+         return false;
+      }
+   }
+   ime.init = (int (*)(const struct ime_dialog_param *, void *))address[0];
+   ime.get_status = (int (*)(void))address[1];
+   ime.get_result = (int (*)(struct ime_dialog_result *))address[2];
+   ime.term = (int (*)(void))address[3];
+   ime.available = true;
+   return true;
+}
+
+bool
+keyboard_open(const char *title, const char *text, bool password, int max_chars)
+{
+   if (ime.open || !ime_look_up())
+      return false;
+   struct ime_dialog_param param;
+   memset(&param, 0, sizeof(param));
+   if (sceUserServiceGetInitialUser(&param.user_id) < 0)
+      return false;
+   utf8_to_utf16(text, ime.text, sizeof(ime.text) / sizeof(ime.text[0]));
+   utf8_to_utf16(title, ime.title, sizeof(ime.title) / sizeof(ime.title[0]));
+   param.option = IME_OPTION_NO_AUTO_CAPITALIZATION | IME_OPTION_NO_LEARNING | (password ? IME_OPTION_PASSWORD : 0);
+   const int capacity = (int)(sizeof(ime.text) / sizeof(ime.text[0])) - 1;
+   param.max_text_length = (uint32_t)(max_chars > 0 && max_chars < capacity ? max_chars : capacity);
+   param.input_text_buffer = ime.text;
+   param.title = ime.title;
+   param.pos_x = 1920.0f / 2.0f;
+   param.pos_y = 1080.0f / 2.0f;
+   param.horizontal_alignment = 1; /* centred on the position */
+   param.vertical_alignment = 1;
+   const int result = ime.init(&param, NULL);
+   if (result < 0) {
+      say("keyboard: sceImeDialogInit 0x%08x", (unsigned)result);
+      return false;
+   }
+   ime.open = true;
+   return true;
+}
+
+int
+keyboard_poll(char *out, size_t size)
+{
+   if (!ime.open)
+      return -1;
+   if (ime.get_status() != IME_DIALOG_FINISHED)
+      return 0;
+   struct ime_dialog_result result;
+   memset(&result, 0, sizeof(result));
+   const int got = ime.get_result(&result);
+   ime.term();
+   ime.open = false;
+   if (got < 0 || result.end_status != 0)
+      return -1;
+   utf16_to_utf8(ime.text, out, size);
+   return 1;
+}

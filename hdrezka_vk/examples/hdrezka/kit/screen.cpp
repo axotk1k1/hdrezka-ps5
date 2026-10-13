@@ -1024,7 +1024,8 @@ class Store final : public app::Concept
 
 #if defined(PS5_HOST_REFERENCE)
     // The reference build has no pad. HDREZKA_HOST_KEYS scripts one for its
-    // pictures: "2.0:left,2.5:down,3:confirm" presses each at its second.
+    // pictures: "2.0:left,2.5:down,3:confirm" presses each at its second;
+    // "4:type=name@mail.ru" types into the open text field.
     void host_script(InputFrame &input, float dt)
     {
         static const char *script = std::getenv("HDREZKA_HOST_KEYS");
@@ -1048,6 +1049,10 @@ class Store final : public app::Concept
                 else if (key == "down") input.nav = Direction::down;
                 else if (key == "confirm") input.pressed |= action_bit(Action::confirm);
                 else if (key == "back") input.pressed |= action_bit(Action::back);
+                else if (key == "menu") input.pressed |= action_bit(Action::menu);
+                else if (key == "west") input.pressed |= action_bit(Action::west);
+                // "type=text": into the field the keyboard sheet is open for
+                else if (key.rfind("type=", 0) == 0 && kb_open_ && kb_target_) *kb_target_ += key.substr(5);
             }
             p = end ? end + 1 : nullptr;
         }
@@ -1089,8 +1094,11 @@ class Store final : public app::Concept
         clock_ += dt;
         if (page_open_)
             rebuild_page_model();
+        // The console's keyboard (or the sheet of keys) takes the pad while it is up.
+        if (kb_active())
+            kb_update(input, feedback);
         // The topmost layer takes the input; the layers under it only animate.
-        if (search_open_)
+        else if (search_open_)
             update_search(input, feedback);
         else if (profile_open_)
             update_profile(input, feedback);
@@ -2173,13 +2181,74 @@ class Store final : public app::Concept
         }
     }
 
+    // ---- the profile: HDrezkaTV's account screen -----------------------------
+    //
+    // Signed out: the login form on the left (a field opens the console's own
+    // keyboard through kb_begin; on a PC the sheet of keys comes up instead),
+    // a QR code of the site on the right. Signed in: the greeting with the
+    // avatar, the subscription with its days, "Досмотреть", "Закладки" and
+    // "Выйти", and the lists those two open.
+
+    enum ProfileView : int
+    {
+        kProfileMain,
+        kProfileWatchLater,
+        kProfileBookmarks,
+    };
+    enum ProfileIll : int
+    {
+        kIllEnter,
+        kIllWelcome,
+        kIllMovieNight,
+        kIllHomeCinema,
+        kIllCount,
+    };
+    enum ProfileItem : int
+    {
+        kProfileLogin = 0,    // signed out: the login field
+        kProfilePassword = 1, // ... the password field
+        kProfileSubmit = 2,   // ... the sign-in button
+        kProfileContinue = 0, // signed in: Досмотреть
+        kProfileFolders = 1,  // ... Закладки
+        kProfileLogout = 2,   // ... Выйти
+    };
+
+    static std::string tv_days_text(int days)
+    {
+        const int tens = days % 100;
+        const int ones = days % 10;
+        const char *word = (tens >= 11 && tens <= 14) ? "дней" : ones == 1 ? "день" : (ones >= 2 && ones <= 4) ? "дня" : "дней";
+        return std::to_string(days) + " " + word;
+    }
+
     void update_profile(const InputFrame &input, app::Feedback &feedback)
     {
         auto &app = rezka::App::instance();
         rezka::Account acc;
+        std::size_t later_count = 0, folder_count = 0;
         {
             std::lock_guard<std::mutex> lock(app.catalog_mutex);
             acc = app.account;
+            later_count = app.watch_later.size();
+            folder_count = app.bookmark_folders.size();
+        }
+        // Signing in or out resets the screen
+        if (acc.logged_in != profile_was_logged_)
+        {
+            profile_was_logged_ = acc.logged_in;
+            profile_view_ = kProfileMain;
+            profile_focus_ = 0;
+            if (acc.logged_in)
+                login_password_.clear();
+        }
+        if (acc.logged_in && !acc.avatar.empty())
+            app.request_photo(acc.avatar);
+
+        if (profile_view_ != kProfileMain)
+        {
+            const int count = static_cast<int>(profile_view_ == kProfileWatchLater ? later_count : folder_count);
+            update_profile_list(input, feedback, acc, count);
+            return;
         }
         if (input.is_pressed(Action::back))
         {
@@ -2187,168 +2256,339 @@ class Store final : public app::Concept
             feedback.play(audio::Cue::back);
             return;
         }
-        if (acc.logged_in)
+        const int last = 2;
+        if (input.nav == Direction::up || input.nav == Direction::down)
         {
-            if (input.is_pressed(Action::confirm))
+            const int step = input.nav == Direction::down ? 1 : -1;
+            const int next = std::clamp(profile_focus_ + step, 0, last);
+            if (next == profile_focus_)
+                tv_refuse(feedback, input.nav_repeat);
+            else
             {
-                rezka::BigThread([]() { rezka::App::instance().client.logout(); }).detach();
-                std::lock_guard<std::mutex> lock(app.catalog_mutex);
-                app.account = {};
-                app.account.status = "Вы вышли из профиля";
-                app.catalog_version++;
-                feedback.play(audio::Cue::select);
-            }
-            return;
-        }
-        const bool bumpers =
-            input.is_pressed(Action::page_prev) || input.is_pressed(Action::page_next) ||
-            ((ps5_pad().pressed & (PAD_L1 | PAD_R1)) != 0);
-        if (bumpers)
-        {
-            login_field_ = 1 - login_field_;
-            login_fields_focus_ = true;
-            feedback.play(audio::Cue::tab);
-            return;
-        }
-        if (input.is_pressed(Action::west))
-        {
-            erase_from(login_field_ == 0 ? login_email_ : login_password_);
-            feedback.play(audio::Cue::toggle);
-            return;
-        }
-        if (input.is_pressed(Action::north))
-        {
-            if (login_email_.empty() || login_password_.empty())
-            {
-                feedback.play(audio::Cue::error, 1.0f, 0.0f, 0.6f);
-                return;
-            }
-            app.login_async(login_email_, login_password_);
-            feedback.play(audio::Cue::select);
-            return;
-        }
-
-        // Focus can sit on the email/password fields (↑ from the top key row /
-        // L1·R1). ↓ returns to the keyboard.
-        if (login_fields_focus_)
-        {
-            if (input.nav == Direction::down)
-            {
-                login_fields_focus_ = false;
-                key_row_ = 0;
+                profile_focus_ = next;
                 feedback.play(audio::Cue::focus);
             }
-            else if (input.nav == Direction::up || input.nav == Direction::left ||
-                     input.nav == Direction::right)
-            {
-                login_field_ = 1 - login_field_;
-                feedback.play(audio::Cue::tab);
-            }
             return;
         }
-        if (input.nav == Direction::up && key_row_ == 0)
-        {
-            login_fields_focus_ = true;
-            feedback.play(audio::Cue::tab);
+        if (!input.is_pressed(Action::confirm))
             return;
-        }
 
-        navigate_key_grid(input, feedback);
-        if (input.is_pressed(Action::confirm))
+        if (acc.logged_in)
         {
-            if (key_row_ == 4 && key_col_ >= 9)
+            if (profile_focus_ == kProfileLogout)
             {
-                if (login_email_.empty() || login_password_.empty())
-                {
-                    feedback.play(audio::Cue::error, 1.0f, 0.0f, 0.6f);
-                    return;
-                }
-                app.login_async(login_email_, login_password_);
+                app.logout_async();
                 feedback.play(audio::Cue::select);
                 return;
             }
-            const bool toggled = (key_row_ == 4 && key_col_ <= 2);
-            type_into(login_field_ == 0 ? login_email_ : login_password_);
-            feedback.play(toggled ? audio::Cue::toggle : audio::Cue::select);
+            if (acc.logged_in && !app.account_lists_loading.load() && later_count == 0 && folder_count == 0)
+                app.load_account_lists_async();
+            profile_view_ = profile_focus_ == kProfileContinue ? kProfileWatchLater : kProfileBookmarks;
+            profile_list_focus_ = 0;
+            feedback.play(audio::Cue::open);
+            return;
         }
+        if (profile_focus_ == kProfileLogin)
+            kb_begin(&login_email_, "Логин или e-mail", false, feedback);
+        else if (profile_focus_ == kProfilePassword)
+            kb_begin(&login_password_, "Пароль", true, feedback);
+        else if (login_email_.empty() || login_password_.empty())
+            tv_refuse(feedback, false);
+        else if (!app.login_busy.load())
+        {
+            app.login_async(login_email_, login_password_);
+            feedback.play(audio::Cue::select);
+        }
+    }
+
+    void update_profile_list(const InputFrame &input, app::Feedback &feedback, const rezka::Account &,
+                             int count)
+    {
+        auto &app = rezka::App::instance();
+        if (input.is_pressed(Action::back))
+        {
+            profile_view_ = kProfileMain;
+            feedback.play(audio::Cue::back);
+            return;
+        }
+        if (input.nav == Direction::up || input.nav == Direction::down)
+        {
+            const int next = std::clamp(profile_list_focus_ + (input.nav == Direction::down ? 1 : -1), 0,
+                                        std::max(0, count - 1));
+            if (next == profile_list_focus_)
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                profile_list_focus_ = next;
+                feedback.play(audio::Cue::focus);
+            }
+            return;
+        }
+        if (count == 0 || !input.is_pressed(Action::confirm))
+            return;
+        if (profile_view_ == kProfileWatchLater)
+        {
+            rezka::WatchLaterItem item;
+            {
+                std::lock_guard<std::mutex> lock(app.catalog_mutex);
+                if (profile_list_focus_ >= static_cast<int>(app.watch_later.size()))
+                    return;
+                item = app.watch_later[static_cast<std::size_t>(profile_list_focus_)];
+            }
+            rezka::CatalogItem entry;
+            entry.id = item.id;
+            entry.title = item.title;
+            entry.url = item.url;
+            entry.cover_url = item.cover_url;
+            entry.info = item.project_info;
+            const int index = app.adopt_catalog_item(entry);
+            if (index < 0)
+            {
+                tv_refuse(feedback, false);
+                return;
+            }
+            profile_open_ = false;
+            dp_stack_.clear();
+            open_page(index, false, feedback);
+            return;
+        }
+        rezka::BookmarkFolder folder;
+        {
+            std::lock_guard<std::mutex> lock(app.catalog_mutex);
+            if (profile_list_focus_ >= static_cast<int>(app.bookmark_folders.size()))
+                return;
+            folder = app.bookmark_folders[static_cast<std::size_t>(profile_list_focus_)];
+        }
+        profile_open_ = false;
+        dp_open_list(folder.name, folder.url, feedback);
+    }
+
+    // One of the profile's buttons: a rounded plate, its icon and label.
+    void draw_profile_row(gfx::DrawList &list, const Rect &r, bool focused, int icon, const std::string &label,
+                          const std::string &trailing = "") const
+    {
+        const float dp = kTvDp;
+        list.rounded_rect(r, 28.0f * dp, focused ? tv_secondary_container() : tv_surface_variant().with_alpha(0.3f));
+        if (focused)
+            list.bordered_rect(r, 28.0f * dp, kClear, 2.0f * dp, tv_primary());
+        const Color ink = focused ? tv_on_secondary_container() : tv_on_surface();
+        if (icon >= 0)
+            tv_icon(list, icon, r.x + 24.0f * dp, r.cy() - 12.0f * dp, 24.0f * dp, ink);
+        tv_text(list, tv_medium(), label, r.x + (icon >= 0 ? 64.0f : 24.0f) * dp, r.cy() - 12.0f * dp, 18.0f * dp,
+                24.0f * dp, ink, gfx::Align::left, 0.1f * dp);
+        if (!trailing.empty())
+            tv_text(list, tv_regular(), trailing, r.x + r.w - 24.0f * dp, r.cy() - 10.0f * dp, 14.0f * dp,
+                    20.0f * dp, tv_on_surface_variant(), gfx::Align::right);
+    }
+
+    // A field of the login form.
+    void draw_profile_field(gfx::DrawList &list, const Rect &r, bool focused, const char *label,
+                            const std::string &value, bool secret) const
+    {
+        const float dp = kTvDp;
+        list.rounded_rect(r, 8.0f * dp, tv_surface_variant().with_alpha(0.25f));
+        list.bordered_rect(r, 8.0f * dp, kClear, (focused ? 2.0f : 1.0f) * dp,
+                           focused ? tv_primary() : tv_border());
+        const bool empty = value.empty();
+        // The label floats above the text, as in the app's outlined fields
+        tv_text(list, tv_regular(), label, r.x + 16.0f * dp, r.y + 6.0f * dp, 12.0f * dp, 16.0f * dp,
+                focused ? tv_primary() : tv_on_surface_variant());
+        const std::string shown =
+            secret ? kb_masked(value) : value;
+        const std::string fit = tv_regular().font->fit(shown, 16.0f * dp, r.w - 32.0f * dp);
+        tv_text(list, tv_regular(), empty ? std::string("Нажмите, чтобы ввести") : fit, r.x + 16.0f * dp,
+                r.y + 26.0f * dp, 16.0f * dp, 24.0f * dp,
+                empty ? tv_on_surface_variant().with_alpha(0.6f) : tv_on_surface());
+    }
+
+    // An illustration of the strip tv/ill-*.png, fitted into `box` and centred.
+    void draw_profile_ill(gfx::DrawList &list, int which, const Rect &box) const
+    {
+        const std::uint32_t texture = tv_ill_[which];
+        if (texture == 0 || tv_ill_aspect_[which] <= 0.0f)
+            return;
+        float w = box.w, h = box.w / tv_ill_aspect_[which];
+        if (h > box.h)
+        {
+            h = box.h;
+            w = h * tv_ill_aspect_[which];
+        }
+        list.image(texture, {box.cx() - w * 0.5f, box.cy() - h * 0.5f, w, h}, gfx::kFullUv, kWhite);
     }
 
     void draw_profile(gfx::DrawList &list) const
     {
         if (!profile_open_)
             return;
-        const ui::Fonts &fonts = context_.fonts;
+        const float dp = kTvDp;
+        auto &app = rezka::App::instance();
         rezka::Account acc;
+        std::vector<rezka::WatchLaterItem> later;
+        std::vector<rezka::BookmarkFolder> folders;
         {
-            auto &app = rezka::App::instance();
             std::lock_guard<std::mutex> lock(app.catalog_mutex);
             acc = app.account;
+            later = app.watch_later;
+            folders = app.bookmark_folders;
         }
-        list.rounded_rect({0, 0, kWidth, kHeight}, 0, Color::rgb(0x000000, 0.72f));
-        const Rect panel{280.0f, 120.0f, 1360.0f, 840.0f};
-        list.rounded_rect(panel, 28.0f, kCoal);
-        list.bordered_rect(panel, 28.0f, kClear, 2.0f, kAccent);
-        ui::text(list, fonts.semibold, "Профиль HDRezka", panel.x + 48.0f, panel.y + 64.0f, 32, kInk);
+        list.rounded_rect({0, 0, kWidth, kHeight}, 0.0f, tv_surface());
+        const float left = 48.0f * dp;
+        const float col_w = 400.0f * dp;
 
-        if (acc.logged_in)
+        if (profile_view_ != kProfileMain)
         {
-            ui::text(list, fonts.display, acc.name.empty() ? "Пользователь" : acc.name.c_str(),
-                     panel.x + 48.0f, panel.y + 180.0f, 48, kInk);
-            ui::text(list, fonts.regular, acc.email.c_str(), panel.x + 48.0f, panel.y + 240.0f, 24,
-                     kInk.with_alpha(0.7f));
-            ui::text(list, fonts.semibold, acc.premium ? "Premium" : "Обычный аккаунт",
-                     panel.x + 48.0f, panel.y + 300.0f, 28, acc.premium ? kAccent : kInk);
-            if (!acc.premium_text.empty())
-                ui::text(list, fonts.regular, acc.premium_text.c_str(), panel.x + 48.0f, panel.y + 350.0f, 22,
-                         kInk.with_alpha(0.7f));
-            ui::text(list, fonts.regular, "✕ Выйти     ○ Закрыть", panel.cx(), panel.y + panel.h - 36.0f, 22,
-                     kInk.with_alpha(0.7f), gfx::Align::center);
+            draw_profile_list(list, acc, later, folders);
+            kb_draw(list);
             return;
         }
 
-        const Rect email_r{panel.x + 48.0f, panel.y + 88.0f, panel.w - 96.0f, 52.0f};
-        const Rect pass_r{panel.x + 48.0f, panel.y + 152.0f, panel.w - 96.0f, 52.0f};
-        list.rounded_rect(email_r, 12.0f, kPanel);
-        list.rounded_rect(pass_r, 12.0f, kPanel);
-        const Rect &active_field = login_field_ == 0 ? email_r : pass_r;
-        list.bordered_rect(active_field, 12.0f, kClear, login_fields_focus_ ? 2.5f : 1.5f, kAccent);
-        if (login_fields_focus_)
-            list.glow(active_field, 12.0f, 14.0f, kAccent.with_alpha(0.35f));
-        ui::text(list, fonts.regular, login_email_.empty() ? "Email или логин" : login_email_.c_str(),
-                 email_r.x + 20.0f, centred(email_r.cy(), 24), 24,
-                 login_email_.empty() ? kInk.with_alpha(0.45f) : kInk);
-        std::string dots(login_password_.size(), '*');
-        ui::text(list, fonts.regular, login_password_.empty() ? "Пароль" : dots.c_str(),
-                 pass_r.x + 20.0f, centred(pass_r.cy(), 24), 24,
-                 login_password_.empty() ? kInk.with_alpha(0.45f) : kInk);
-        if (!acc.status.empty())
-            ui::text(list, fonts.regular, acc.status.c_str(), panel.x + 48.0f, panel.y + 220.0f, 20, kAccent);
-
-        constexpr float kCell = 68.0f;
-        constexpr float kGap = 8.0f;
-        const float grid_w = kKeyCols * kCell + (kKeyCols - 1) * kGap;
-        const float ox = panel.cx() - grid_w * 0.5f;
-        const float oy = panel.y + 236.0f;
-        const char **cur_keys = keys_for_lang(key_lang_);
-        for (int i = 0; i < 48; ++i)
+        if (!acc.logged_in)
         {
-            const int row = i / kKeyCols;
-            const int col = i % kKeyCols;
-            const Rect key{ox + static_cast<float>(col) * (kCell + kGap),
-                           oy + static_cast<float>(row) * (kCell * 0.86f + kGap), kCell, 52.0f};
-            const bool on = row == key_row_ && col == key_col_;
-            list.rounded_rect(key, 10.0f, on ? kAccent : kPanel);
+            tv_text(list, tv_regular(), "Вход в аккаунт", left, 40.0f * dp, 28.0f * dp, 36.0f * dp, tv_on_surface());
+            tv_text(list, tv_regular(), "Войдите, чтобы смотреть закладки и продолжать с того же места", left,
+                    80.0f * dp, 14.0f * dp, 20.0f * dp, tv_on_surface_variant());
+            const Rect email{left, 120.0f * dp, col_w, 56.0f * dp};
+            const Rect pass{left, 192.0f * dp, col_w, 56.0f * dp};
+            draw_profile_field(list, email, profile_focus_ == kProfileLogin, "Логин или e-mail", login_email_, false);
+            draw_profile_field(list, pass, profile_focus_ == kProfilePassword, "Пароль", login_password_, true);
+
+            const bool busy = app.login_busy.load();
+            const std::string status = busy ? std::string("Входим в аккаунт…") : acc.status;
+            if (!status.empty())
+                tv_text(list, tv_regular(), status, left, 260.0f * dp, 14.0f * dp, 20.0f * dp,
+                        busy ? tv_on_surface_variant() : tv_error());
+            const Rect button{left, 292.0f * dp, 200.0f * dp, 48.0f * dp};
+            const bool on = profile_focus_ == kProfileSubmit;
+            list.rounded_rect(button, 24.0f * dp, on ? tv_primary() : tv_primary_container());
             if (on)
-                list.bordered_rect(key, 10.0f, kClear, 2.0f, kWhite);
-            ui::text(list, fonts.semibold, cur_keys[i], key.cx(), centred(key.cy(), 20), 20,
-                     on ? kOnAccent : kInk, gfx::Align::center);
+                list.bordered_rect(button.inset(-3.0f * dp), 27.0f * dp, kClear, 2.0f * dp, tv_on_surface());
+            tv_text(list, tv_medium(), "Войти", button.cx(), button.cy() - 12.0f * dp, 18.0f * dp, 24.0f * dp,
+                    on ? tv_on_primary() : tv_on_primary_container(), gfx::Align::center, 0.1f * dp);
+            draw_profile_ill(list, kIllEnter, {left, 360.0f * dp, 200.0f * dp, 150.0f * dp});
+
+            // The QR code: the site, to sign in on a phone and come back
+            const Rect card{kWidth - 48.0f * dp - 360.0f * dp, 48.0f * dp, 360.0f * dp, 380.0f * dp};
+            list.rounded_rect(card, 28.0f * dp, tv_surface_variant().with_alpha(0.3f));
+            const Rect plate{card.x + 40.0f * dp, card.y + 24.0f * dp, 280.0f * dp, 280.0f * dp};
+            list.rounded_rect(plate, 16.0f * dp, kWhite);
+            if (profile_qr_.size > 0)
+            {
+                const int n = profile_qr_.size;
+                const float module = (plate.w - 32.0f * dp) / static_cast<float>(n + 2);
+                const float ax = plate.x + 16.0f * dp + module;
+                const float ay = plate.y + 16.0f * dp + module;
+                for (int y = 0; y < n; ++y)
+                    for (int x = 0; x < n; ++x)
+                        if (profile_qr_.at(x, y))
+                            list.rounded_rect({ax + x * module, ay + y * module, module + 0.6f, module + 0.6f}, 0.0f,
+                                              Color::rgb(0x101214));
+            }
+            std::vector<std::string> lines = tv_regular().font->wrap(
+                "Быстрый вход по QR-коду: откройте сайт на смартфоне и войдите в аккаунт", 14.0f * dp,
+                card.w - 48.0f * dp);
+            float y = plate.y + plate.h + 16.0f * dp;
+            for (std::size_t i = 0; i < lines.size() && i < 3; ++i, y += 20.0f * dp)
+                tv_text(list, tv_regular(), lines[i], card.cx(), y, 14.0f * dp, 20.0f * dp, tv_on_surface_variant(),
+                        gfx::Align::center);
+            kb_draw(list);
+            return;
         }
-        const float ay = oy + 4.0f * (kCell * 0.86f + kGap) + 6.0f;
-        draw_key_action_row(list, ox, ay, kCell, kGap, 56.0f, "▶ ВОЙТИ");
-        ui::text(list, fonts.regular,
-                 "L1/R1 или ↑↓ поле     ENG/РУС/#!     □ стереть     △ войти     ○ закрыть",
-                 panel.cx(), panel.y + panel.h - 36.0f, 20, kInk.with_alpha(0.7f),
-                 gfx::Align::center);
+
+        // The greeting
+        const float avatar = 96.0f * dp;
+        const Rect face{left, 40.0f * dp, avatar, avatar};
+        list.circle(face.cx(), face.cy(), avatar * 0.5f, tv_primary_container());
+        if (!dp_photo(list, acc.avatar, face, avatar * 0.5f, kWhite, 1.0f))
+            tv_icon(list, kTvIconAccount, face.x + avatar * 0.2f, face.y + avatar * 0.2f, avatar * 0.6f,
+                    tv_on_primary_container());
+        const float tx = face.x + avatar + 24.0f * dp;
+        const std::string name = acc.name.empty() ? std::string("Пользователь") : acc.name;
+        tv_text(list, tv_regular(), tv_regular().font->fit("Привет, " + name + "!", 28.0f * dp, 520.0f * dp), tx,
+                face.y + 4.0f * dp, 28.0f * dp, 36.0f * dp, tv_on_surface());
+        if (!acc.email.empty())
+            tv_text(list, tv_regular(), tv_regular().font->fit(acc.email, 14.0f * dp, 520.0f * dp), tx,
+                    face.y + 44.0f * dp, 14.0f * dp, 20.0f * dp, tv_on_surface_variant());
+        // The subscription
+        const std::string sub = acc.premium
+            ? (acc.premium_days > 0 ? "Premium · осталось " + tv_days_text(acc.premium_days) : std::string("Premium"))
+            : std::string("Подписка не оформлена");
+        const float sub_w = tv_medium().measure(sub, 14.0f * dp, 0.1f * dp) + 32.0f * dp;
+        const Rect pill{tx, face.y + 68.0f * dp, sub_w, 28.0f * dp};
+        list.rounded_rect(pill, 14.0f * dp, acc.premium ? tv_primary_container() : tv_surface_variant().with_alpha(0.5f));
+        tv_text(list, tv_medium(), sub, pill.cx(), pill.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp,
+                acc.premium ? tv_on_primary_container() : tv_on_surface_variant(), gfx::Align::center, 0.1f * dp);
+
+        const float row_w = 400.0f * dp;
+        const float row_h = 56.0f * dp;
+        float y = 176.0f * dp;
+        draw_profile_row(list, {left, y, row_w, row_h}, profile_focus_ == kProfileContinue, kTvIconPlayArrow,
+                         "Досмотреть", std::to_string(later.size()));
+        y += row_h + 12.0f * dp;
+        draw_profile_row(list, {left, y, row_w, row_h}, profile_focus_ == kProfileFolders, kTvIconBookmark,
+                         "Закладки", std::to_string(folders.size()));
+        y += row_h + 12.0f * dp;
+        draw_profile_row(list, {left, y, row_w, row_h}, profile_focus_ == kProfileLogout, kTvIconBlock, "Выйти");
+        draw_profile_ill(list, kIllWelcome, {kWidth - 48.0f * dp - 420.0f * dp, 120.0f * dp, 420.0f * dp, 220.0f * dp * 2.0f});
+        kb_draw(list);
+    }
+
+    // "Досмотреть" and "Закладки": a column of rows, the focused one kept in view.
+    void draw_profile_list(gfx::DrawList &list, const rezka::Account &, const std::vector<rezka::WatchLaterItem> &later,
+                           const std::vector<rezka::BookmarkFolder> &folders) const
+    {
+        const float dp = kTvDp;
+        const bool watch = profile_view_ == kProfileWatchLater;
+        const float left = 48.0f * dp;
+        const float width = kWidth - 2.0f * left;
+        tv_text(list, tv_regular(), watch ? "Досмотреть" : "Закладки", left, 40.0f * dp, 28.0f * dp, 36.0f * dp,
+                tv_on_surface());
+        const int count = static_cast<int>(watch ? later.size() : folders.size());
+        if (count == 0)
+        {
+            const bool loading = rezka::App::instance().account_lists_loading.load();
+            tv_text(list, tv_regular(), loading ? "Загрузка…" : watch ? "Здесь пока пусто" : "Закладок пока нет",
+                    kWidth * 0.5f, 360.0f * dp + 200.0f * dp, 18.0f * dp, 24.0f * dp, tv_on_surface_variant(),
+                    gfx::Align::center);
+            draw_profile_ill(list, watch ? kIllMovieNight : kIllHomeCinema,
+                             {kWidth * 0.5f - 300.0f * dp, 120.0f * dp, 600.0f * dp, 220.0f * dp});
+            return;
+        }
+        const float row_h = 64.0f * dp;
+        const float gap = 8.0f * dp;
+        const float top = 100.0f * dp;
+        const int visible = std::max(1, static_cast<int>((kHeight - top - 24.0f * dp) / (row_h + gap)));
+        const int first = std::clamp(profile_list_focus_ - visible / 2, 0, std::max(0, count - visible));
+        for (int i = first; i < count && i < first + visible; ++i)
+        {
+            const Rect r{left, top + static_cast<float>(i - first) * (row_h + gap), width, row_h};
+            const bool on = i == profile_list_focus_;
+            list.rounded_rect(r, 16.0f * dp, on ? tv_secondary_container() : tv_surface_variant().with_alpha(0.3f));
+            if (on)
+                list.bordered_rect(r, 16.0f * dp, kClear, 2.0f * dp, tv_primary());
+            const Color ink = on ? tv_on_secondary_container() : tv_on_surface();
+            if (watch)
+            {
+                const auto &item = later[static_cast<std::size_t>(i)];
+                tv_text(list, tv_medium(), tv_medium().font->fit(item.title, 16.0f * dp, width * 0.62f),
+                        r.x + 24.0f * dp, r.y + 8.0f * dp, 16.0f * dp, 24.0f * dp, ink);
+                const std::string sub = item.info.empty() ? item.project_info : item.info;
+                tv_text(list, tv_regular(), tv_regular().font->fit(sub, 12.0f * dp, width * 0.62f), r.x + 24.0f * dp,
+                        r.y + 34.0f * dp, 12.0f * dp, 18.0f * dp, tv_on_surface_variant());
+                if (!item.next_info.empty())
+                    tv_text(list, tv_regular(), tv_regular().font->fit(item.next_info, 12.0f * dp, width * 0.3f),
+                            r.x + r.w - 24.0f * dp, r.cy() - 9.0f * dp, 12.0f * dp, 18.0f * dp, tv_primary(),
+                            gfx::Align::right);
+            }
+            else
+            {
+                const auto &folder = folders[static_cast<std::size_t>(i)];
+                tv_icon(list, kTvIconBookmark, r.x + 24.0f * dp, r.cy() - 12.0f * dp, 24.0f * dp, ink);
+                tv_text(list, tv_medium(), tv_medium().font->fit(folder.name, 16.0f * dp, width * 0.7f),
+                        r.x + 64.0f * dp, r.cy() - 12.0f * dp, 16.0f * dp, 24.0f * dp, ink);
+                tv_text(list, tv_regular(), folder.count, r.x + r.w - 24.0f * dp, r.cy() - 10.0f * dp, 14.0f * dp,
+                        20.0f * dp, tv_on_surface_variant(), gfx::Align::right);
+            }
+        }
     }
 
     // ---- the home page: HDrezkaTV's "MovieList" screen ----------------------
@@ -2536,6 +2776,21 @@ class Store final : public app::Concept
             tv_youtube_ = app.renderer->create_texture(w, h, rgba);
         if (rgba)
             rezka::TextureLoader::free_decoded_image(rgba);
+        // The profile's illustrations
+        static const char *const ill_files[4] = {
+            VK_EXAMPLE_ASSETS_DIR "tv/ill-enter.png", VK_EXAMPLE_ASSETS_DIR "tv/ill-welcome_cats.png",
+            VK_EXAMPLE_ASSETS_DIR "tv/ill-movie_night.png", VK_EXAMPLE_ASSETS_DIR "tv/ill-home_cinema.png"};
+        for (int i = 0; i < 4; ++i)
+        {
+            rgba = rezka::TextureLoader::load_file_rgba(ill_files[i], &w, &h);
+            if (rgba && w > 0 && h > 0)
+            {
+                tv_ill_[i] = app.renderer->create_texture(w, h, rgba);
+                tv_ill_aspect_[i] = static_cast<float>(w) / static_cast<float>(h);
+            }
+            if (rgba)
+                rezka::TextureLoader::free_decoded_image(rgba);
+        }
     }
 
     // The Material icons of the strip, in its order.
@@ -2716,6 +2971,24 @@ class Store final : public app::Concept
         key_col_ = 0;
         login_field_ = 0;
         login_fields_focus_ = true;
+        profile_view_ = 0;
+        profile_focus_ = 0;
+        profile_list_focus_ = 0;
+        {
+            auto &app = rezka::App::instance();
+            bool logged_in = false, empty = false;
+            {
+                std::lock_guard<std::mutex> lock(app.catalog_mutex);
+                logged_in = app.account.logged_in;
+                empty = app.watch_later.empty() && app.bookmark_folders.empty();
+            }
+            profile_was_logged_ = logged_in;
+            if (logged_in && empty)
+                app.load_account_lists_async();
+            // The code of the site, for signing in on a phone
+            if (!logged_in)
+                qr::encode(app.client.get_mirror() + "/", profile_qr_);
+        }
         feedback.play(audio::Cue::open);
     }
     void tv_open_search(app::Feedback &feedback)
@@ -3227,6 +3500,160 @@ class Store final : public app::Concept
         list.pop_transform();
         tv_draw_clock(list);
         tv_draw_drawer(list);
+    }
+
+    // ---- text entry ----------------------------------------------------------
+    //
+    // A field is typed into with the console's own keyboard (the platform
+    // layer's keyboard_open: the PS5 IME dialog). Where there is none — the
+    // reference build on a PC, or a console that refuses — this sheet comes up
+    // instead: the kit's key table in the app's colours, with the field over it.
+
+    void kb_begin(std::string *target, const char *title, bool password, app::Feedback &feedback)
+    {
+        kb_target_ = target;
+        kb_title_ = title;
+        kb_password_ = password;
+        if (keyboard_open(title, target->c_str(), password, 64))
+        {
+            kb_system_ = true;
+            return;
+        }
+        kb_open_ = true;
+        key_row_ = 1;
+        key_col_ = 0;
+        key_lang_ = 0;
+        feedback.play(audio::Cue::modal_open);
+    }
+    bool kb_active() const
+    {
+        return kb_open_ || kb_system_;
+    }
+    void kb_update(const InputFrame &input, app::Feedback &feedback)
+    {
+        if (kb_system_)
+        {
+            char text[512] = "";
+            const int state = keyboard_poll(text, sizeof(text));
+            if (state == 0)
+                return;
+            if (state > 0 && kb_target_)
+                *kb_target_ = text;
+            kb_system_ = false;
+            return;
+        }
+        if (!kb_target_)
+        {
+            kb_open_ = false;
+            return;
+        }
+        std::string &target = *kb_target_;
+        if (input.is_pressed(Action::back) || input.is_pressed(Action::menu))
+        {
+            kb_open_ = false;
+            feedback.play(audio::Cue::modal_close);
+            return;
+        }
+        if (input.is_pressed(Action::west))
+        {
+            erase_from(target);
+            feedback.play(audio::Cue::toggle);
+            return;
+        }
+        if (input.is_pressed(Action::north))
+        {
+            cycle_key_lang();
+            feedback.play(audio::Cue::toggle);
+            return;
+        }
+        navigate_key_grid(input, feedback);
+        if (!input.is_pressed(Action::confirm))
+            return;
+        if (key_row_ < 4)
+        {
+            const int index = key_row_ * kKeyCols + key_col_;
+            if (target.size() < 96)
+                target += keys_for_lang(key_lang_)[index];
+            feedback.play(audio::Cue::select);
+        }
+        else if (key_col_ <= 2)
+        {
+            cycle_key_lang();
+            feedback.play(audio::Cue::toggle);
+        }
+        else if (key_col_ <= 6)
+        {
+            target.push_back(' ');
+            feedback.play(audio::Cue::select);
+        }
+        else if (key_col_ <= 8)
+        {
+            erase_from(target);
+            feedback.play(audio::Cue::toggle);
+        }
+        else
+        {
+            kb_open_ = false;
+            feedback.play(audio::Cue::modal_close);
+        }
+    }
+    // What a password field shows: a dot a character.
+    static std::string kb_masked(const std::string &text)
+    {
+        std::string dots;
+        for (const char c : text)
+            if ((static_cast<unsigned char>(c) & 0xc0) != 0x80)
+                dots += "\xe2\x80\xa2";
+        return dots;
+    }
+    void kb_draw(gfx::DrawList &list) const
+    {
+        if (!kb_open_ || !kb_target_)
+            return;
+        const float dp = kTvDp;
+        const float cell = 36.0f * dp, gap = 4.0f * dp;
+        const float grid_w = kKeyCols * cell + (kKeyCols - 1) * gap;
+        const float w = grid_w + 40.0f * dp;
+        const float h = (20.0f + 28.0f + 16.0f + 48.0f + 16.0f) * dp + 5.0f * (cell + gap) + 16.0f * dp;
+        const Rect card{(kWidth - w) * 0.5f, kHeight - h - 24.0f * dp, w, h};
+        list.rounded_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, kBlack.with_alpha(0.6f));
+        list.bordered_rect(card, 28.0f * dp, tv_surface(), 1.0f * dp, tv_border_variant());
+        tv_text(list, tv_regular(), kb_title_, card.x + 20.0f * dp, card.y + 20.0f * dp, 22.0f * dp, 28.0f * dp, tv_on_surface());
+        // The field being typed into, with a caret
+        const Rect field{card.x + 20.0f * dp, card.y + 64.0f * dp, grid_w, 48.0f * dp};
+        list.bordered_rect(field, 8.0f * dp, kClear, 2.0f * dp, tv_primary());
+        const std::string shown = tv_regular().font->fit(kb_password_ ? kb_masked(*kb_target_) : *kb_target_, 16.0f * dp, grid_w - 40.0f * dp);
+        const float text_w = tv_text(list, tv_regular(), shown, field.x + 16.0f * dp, field.cy() - 12.0f * dp, 16.0f * dp, 24.0f * dp,
+                                     tv_on_surface(), gfx::Align::left, 0.5f * dp);
+        if (std::fmod(clock_, 1.0f) < 0.5f)
+            list.rounded_rect({field.x + 16.0f * dp + text_w + 2.0f, field.cy() - 11.0f * dp, 2.0f, 22.0f * dp}, 0.0f, tv_primary());
+        const float gx = card.x + 20.0f * dp, gy = field.y + field.h + 16.0f * dp;
+        const char **keys = keys_for_lang(key_lang_);
+        for (int row = 0; row < 4; ++row)
+            for (int col = 0; col < kKeyCols; ++col)
+            {
+                const Rect r{gx + static_cast<float>(col) * (cell + gap), gy + static_cast<float>(row) * (cell + gap), cell, cell};
+                const bool focused = row == key_row_ && col == key_col_;
+                list.rounded_rect(r, 8.0f * dp, focused ? tv_on_surface() : tv_surface_variant().with_alpha(0.4f));
+                tv_text(list, tv_medium(), keys[row * kKeyCols + col], r.cx(), r.cy() - 12.0f * dp, 16.0f * dp, 24.0f * dp,
+                        focused ? tv_inverse_on_surface() : tv_on_surface(), gfx::Align::center);
+            }
+        // The last row: the layout, the space, the erase and the done keys
+        const struct
+        {
+            int from, to;
+            const char *label;
+        } actions[4] = {{0, 2, lang_button_label(key_lang_)}, {3, 6, "Пробел"}, {7, 8, "Стереть"}, {9, 11, "Готово"}};
+        for (const auto &action : actions)
+        {
+            const Rect r{gx + static_cast<float>(action.from) * (cell + gap), gy + 4.0f * (cell + gap),
+                         static_cast<float>(action.to - action.from + 1) * (cell + gap) - gap, cell};
+            const bool focused = key_row_ == 4 && key_col_ >= action.from && key_col_ <= action.to;
+            const bool done = action.from == 9;
+            list.rounded_rect(r, 8.0f * dp, focused ? tv_on_surface() : done ? tv_primary() : tv_surface_variant().with_alpha(0.4f));
+            tv_text(list, tv_medium(), action.label, r.cx(), r.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp,
+                    focused ? tv_inverse_on_surface() : done ? tv_on_primary() : tv_on_surface(), gfx::Align::center, 0.1f * dp);
+        }
     }
 
     // ---- a title's page: HDrezkaTV's "MovieDetails" screen -------------------
@@ -8136,6 +8563,14 @@ class Store final : public app::Concept
 
     std::string tv_list_title_;   // heads a list opened from a title's page
     std::uint32_t tv_youtube_ = 0;
+    // The profile
+    std::uint32_t tv_ill_[4] = {0, 0, 0, 0}; // tv/ill-*.png, by ProfileIll
+    float tv_ill_aspect_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    qr::Code profile_qr_;
+    int profile_view_ = 0;
+    int profile_focus_ = 0;
+    int profile_list_focus_ = 0;
+    bool profile_was_logged_ = false;
 
     // A title's page (HDrezkaTV's MovieDetails screen).
     int dp_row_ = 1;
@@ -8162,6 +8597,12 @@ class Store final : public app::Concept
     int dp_dialog_list_ = 0;
     std::string dp_dialog_title_;
     std::string dp_dialog_text_;
+    // Text entry.
+    std::string *kb_target_ = nullptr; // the field being typed into
+    std::string kb_title_;
+    bool kb_password_ = false;
+    bool kb_open_ = false;             // the sheet of keys is up
+    bool kb_system_ = false;           // the console's own keyboard is
     // The player's controls.
     bool pl_controls_ = true;
     float pl_timer_ = 4.0f;

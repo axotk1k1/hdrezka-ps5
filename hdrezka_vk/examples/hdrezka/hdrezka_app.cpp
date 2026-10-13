@@ -1072,46 +1072,119 @@ void App::load_details_async(int movie_idx)
     }).detach();
 }
 
+namespace {
+// A request the player is waiting on: the poster worker stands aside for it.
+struct UrgentRequest {
+    std::atomic<int> &n;
+    explicit UrgentRequest(std::atomic<int> &count) : n(count) { ++n; }
+    ~UrgentRequest() { --n; }
+};
+} // namespace
+
 void App::login_async(const std::string &email, const std::string &password)
 {
-    BigThread([this, email, password]() {
-        std::string error;
-        if (!client.pick_mirror()) {
-            std::lock_guard<std::mutex> lock(catalog_mutex);
-            account.status = "HDRezka не отвечает";
-            catalog_version++;
-            return;
-        }
-        if (!client.login(email, password, error)) {
-            std::lock_guard<std::mutex> lock(catalog_mutex);
-            account.status = error.empty() ? "Неверный логин или пароль" : error;
-            catalog_version++;
-            return;
-        }
-        Account acc;
-        client.get_account(acc);
-        acc.email = email;
-        if (acc.name.empty())
-            acc.name = email;
-        acc.status.clear();
+    if (login_busy.exchange(true))
+        return;
+    {
         std::lock_guard<std::mutex> lock(catalog_mutex);
-        account = std::move(acc);
-        catalog_version++;
+        account.status.clear();
+    }
+    BigThread([this, email, password]() {
+        UrgentRequest urgent(urgent_requests);
+        std::string error;
+        bool ok = client.pick_mirror();
+        if (!ok)
+            error = "Ошибка сети";
+        else
+            ok = client.login(email, password, error);
+        Account acc;
+        if (ok) {
+            client.get_account(acc);
+            acc.logged_in = true;
+            acc.email = email;
+            if (acc.name.empty())
+                acc.name = email;
+        } else
+            // The app's own words for a refusal, when the site gives none
+            acc.status = error.empty() ? "Неверный логин или пароль" : error;
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            account = std::move(acc);
+            catalog_version++;
+        }
+        account_version++;
+        login_busy = false;
+        if (ok)
+            load_account_lists_async();
     }).detach();
 }
 
 void App::refresh_account_async()
 {
     BigThread([this]() {
-        if (!client.pick_mirror())
+        if (client.session_user_id().empty() || !client.pick_mirror())
             return;
         Account acc;
         if (!client.get_account(acc))
             return;
-        std::lock_guard<std::mutex> lock(catalog_mutex);
-        if (acc.logged_in)
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
             account = std::move(acc);
+            catalog_version++;
+        }
+        account_version++;
+        load_account_lists_async();
+    }).detach();
+}
+
+void App::logout_async()
+{
+    {
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        account = {};
+        watch_later.clear();
+        bookmark_folders.clear();
         catalog_version++;
+    }
+    account_version++;
+    BigThread([this]() {
+        UrgentRequest urgent(urgent_requests);
+        client.logout();
+    }).detach();
+}
+
+void App::load_account_lists_async()
+{
+    if (account_lists_loading.exchange(true))
+        return;
+    BigThread([this]() {
+        UrgentRequest urgent(urgent_requests);
+        std::vector<WatchLaterItem> later = client.get_watch_later();
+        std::vector<BookmarkFolder> folders = client.get_bookmark_folders();
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            watch_later = std::move(later);
+            bookmark_folders = std::move(folders);
+        }
+        account_lists_loading = false;
+        account_version++;
+    }).detach();
+}
+
+void App::remove_watch_later_async(const std::string &id)
+{
+    {
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        for (size_t i = 0; i < watch_later.size(); ++i)
+            if (watch_later[i].id == id) {
+                watch_later.erase(watch_later.begin() + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+    }
+    account_version++;
+    BigThread([this, id]() {
+        UrgentRequest urgent(urgent_requests);
+        client.remove_watch_later(id);
     }).detach();
 }
 

@@ -17,6 +17,30 @@ struct Account {
     bool logged_in = false;
     bool premium = false;
     std::string premium_text;
+    std::string id;
+    int premium_days = 0;  // left of the subscription
+    std::string details;   // what else the page says: e-mail, the date of joining
+};
+
+// A title of the account's "Досмотреть" list.
+struct WatchLaterItem
+{
+    std::string id;
+    std::string date;
+    std::string title;
+    std::string project_info; // the small print by the title: year, country, genre
+    std::string url;
+    std::string cover_url;
+    std::string info;         // what was watched: the season, the episode, the voice
+    std::string next_info;    // what is out since
+};
+
+struct BookmarkFolder
+{
+    std::string id;
+    std::string name;
+    std::string count;
+    std::string url;
 };
 
 struct CatalogItem
@@ -212,9 +236,22 @@ public:
     const std::string &get_mirror() const { return mirror_; }
     void set_cookie_file(const std::string &path) { cookie_file_ = path; }
     const std::string &get_cookie_file() const { return cookie_file_; }
-    void logout() {}
-    bool login(const std::string& email, const std::string& password, std::string& error) { error = "Not implemented"; return false; }
-    bool get_account(Account& acc) { return false; }
+    // The site's own sign-in, as the app does it: POST /ajax/login/ with
+    // login_name, login_password and login_not_save=0. The session is the
+    // dle_user_id and dle_password cookies the answer sets, kept in the cookie
+    // file; error is the site's message when it refuses.
+    bool login(const std::string &email, const std::string &password, std::string &error);
+    // POST /logout, then the session's cookies are dropped from the file.
+    void logout();
+    // The id of the signed-in user, from the cookie file; empty when there is none.
+    std::string session_user_id() const;
+    // The signed-in user's page (/user/<id>/): name, avatar, premium.
+    bool get_account(Account &acc);
+    // "Досмотреть": the titles the account has started (/continue/).
+    std::vector<WatchLaterItem> get_watch_later();
+    bool remove_watch_later(const std::string &id);
+    // The account's bookmark folders (/favorites/), and a folder's titles.
+    std::vector<BookmarkFolder> get_bookmark_folders();
 
     // Fetch slider premiere content (id: 1 films, 2 series, 3 cartoons, 82 anime)
     // Parses div.b-newest_slider__list like HDrezkaTV.

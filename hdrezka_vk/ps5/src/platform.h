@@ -8,6 +8,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -102,6 +103,16 @@ typedef void (*audio_fill_fn)(int16_t *frames, int count, void *user);
 bool audio_start(audio_fill_fn fill, void *user);
 /* Stops the thread and closes the output; call it before what fill uses goes. */
 void audio_stop(void);
+
+/* Text entry with the console's own keyboard (its IME dialog), drawn by the
+ * system over the title. keyboard_open starts it with `text` in the field
+ * (UTF-8; `password` hides what is typed) and returns false when the console
+ * has none to offer: the caller then falls back on a keyboard of its own (the
+ * host reference build always does). While it is up, keyboard_poll returns 0;
+ * once, when the player has finished, 1 with the text in out, or -1 when they
+ * cancelled. */
+bool keyboard_open(const char *title, const char *text, bool password, int max_chars);
+int keyboard_poll(char *out, size_t size);
 
 #ifdef __cplusplus
 }

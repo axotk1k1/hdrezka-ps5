@@ -276,6 +276,104 @@
       "url": "https://pictogrammers.com/library/mdi/icon/youtube/",
       "changes": "rasterised at 128 px in the red and white the trailer tile shows",
       "licence_file": "licenses/Apache-2.0.txt"
+    },
+    {
+      "path": "tv/ill-enter.png",
+      "from": "file",
+      "source": "ps5/assets/tv/ill-enter.png",
+      "used_by": [
+        "hdrezka"
+      ],
+      "title": "Illustration for sign-in (the profile's login form)",
+      "author": "HdRezka for PS5 contributors",
+      "licence": "GPL-3.0",
+      "url": "https://github.com/",
+      "changes": "generated for this project, kept as a PNG",
+      "licence_file": "licenses/GPL-3.0.txt"
+    },
+    {
+      "path": "tv/ill-home_cinema.png",
+      "from": "file",
+      "source": "ps5/assets/tv/ill-home_cinema.png",
+      "used_by": [
+        "hdrezka"
+      ],
+      "title": "Illustration for the empty bookmarks list",
+      "author": "HdRezka for PS5 contributors",
+      "licence": "GPL-3.0",
+      "url": "https://github.com/",
+      "changes": "generated for this project, kept as a PNG",
+      "licence_file": "licenses/GPL-3.0.txt"
+    },
+    {
+      "path": "tv/ill-movie_night.png",
+      "from": "file",
+      "source": "ps5/assets/tv/ill-movie_night.png",
+      "used_by": [
+        "hdrezka"
+      ],
+      "title": "Illustration for the empty \"Досмотреть\" list",
+      "author": "HdRezka for PS5 contributors",
+      "licence": "GPL-3.0",
+      "url": "https://github.com/",
+      "changes": "generated for this project, kept as a PNG",
+      "licence_file": "licenses/GPL-3.0.txt"
+    },
+    {
+      "path": "tv/ill-online_video.png",
+      "from": "file",
+      "source": "ps5/assets/tv/ill-online_video.png",
+      "used_by": [
+        "hdrezka"
+      ],
+      "title": "Illustration for the title page when nothing loads",
+      "author": "HdRezka for PS5 contributors",
+      "licence": "GPL-3.0",
+      "url": "https://github.com/",
+      "changes": "generated for this project, kept as a PNG",
+      "licence_file": "licenses/GPL-3.0.txt"
+    },
+    {
+      "path": "tv/ill-quitting_time.png",
+      "from": "file",
+      "source": "ps5/assets/tv/ill-quitting_time.png",
+      "used_by": [
+        "hdrezka"
+      ],
+      "title": "Illustration for the exit dialog",
+      "author": "HdRezka for PS5 contributors",
+      "licence": "GPL-3.0",
+      "url": "https://github.com/",
+      "changes": "generated for this project, kept as a PNG",
+      "licence_file": "licenses/GPL-3.0.txt"
+    },
+    {
+      "path": "tv/ill-void.png",
+      "from": "file",
+      "source": "ps5/assets/tv/ill-void.png",
+      "used_by": [
+        "hdrezka"
+      ],
+      "title": "Illustration for an empty search result",
+      "author": "HdRezka for PS5 contributors",
+      "licence": "GPL-3.0",
+      "url": "https://github.com/",
+      "changes": "generated for this project, kept as a PNG",
+      "licence_file": "licenses/GPL-3.0.txt"
+    },
+    {
+      "path": "tv/ill-welcome_cats.png",
+      "from": "file",
+      "source": "ps5/assets/tv/ill-welcome_cats.png",
+      "used_by": [
+        "hdrezka"
+      ],
+      "title": "Illustration for the welcome of a signed-in profile",
+      "author": "HdRezka for PS5 contributors",
+      "licence": "GPL-3.0",
+      "url": "https://github.com/",
+      "changes": "generated for this project, kept as a PNG",
+      "licence_file": "licenses/GPL-3.0.txt"
     }
   ]
 }

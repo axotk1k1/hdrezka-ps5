@@ -205,6 +205,17 @@ public:
                           int episode_idx, double start_time = -1.0);
     void login_async(const std::string& email, const std::string& password);
     void refresh_account_async();
+    // Signs out on the site and forgets the session here.
+    void logout_async();
+    std::atomic<bool> login_busy{false};      // "Входим в аккаунт"
+    // The account's lists, loaded for the profile's screens. Guarded by
+    // catalog_mutex; account_version counts their changes.
+    std::vector<WatchLaterItem> watch_later;
+    std::vector<BookmarkFolder> bookmark_folders;
+    std::atomic<bool> account_lists_loading{false};
+    std::atomic<uint32_t> account_version{0};
+    void load_account_lists_async();
+    void remove_watch_later_async(const std::string &id);
     void stop_playback();
     void save_continue_progress();
     bool get_continue(const std::string &url, ContinueEntry &out);
