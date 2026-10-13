@@ -13,8 +13,13 @@ inline std::mutex &write_log_mutex()
 
 inline void write_log(const char* fmt, ...) {
     std::lock_guard<std::mutex> lock(write_log_mutex());
+#if defined(PS5_HOST_REFERENCE)
+    // The reference build on a PC: beside the run, in its title folder
+    FILE* f = fopen("debug.log", "a");
+#else
     FILE* f = fopen("/data/homebrew/PPSA99380/data/debug.log", "a");
     if (!f) f = fopen("/mnt/usb0/debug.log", "a");
+#endif
     if (!f) return;
     va_list args;
     va_start(args, fmt);

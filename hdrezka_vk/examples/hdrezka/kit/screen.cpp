@@ -46,6 +46,7 @@ struct pad &ps5_pad();
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -405,6 +406,23 @@ struct PageModel
     bool has_resume = false;
     rezka::ContinueEntry resume;
     std::string resume_voice; // the voice the resume point was saved with
+    // What HDrezkaTV's page shows besides
+    bool loaded = false;
+    bool is_series = false;
+    bool blocked = false;
+    bool pending = false; // "Ожидается": no video yet
+    std::string post_id;
+    std::string cover;      // the poster's address
+    std::string full_cover; // ... and the large one's, the backdrop
+    std::string year_url;
+    std::vector<std::string> country_urls;
+    std::vector<std::string> genre_urls;
+    int comments_count = 0;
+    std::string franchise_title;
+    std::vector<rezka::FranchisePart> franchises;
+    std::vector<rezka::CatalogItem> related;
+    std::vector<rezka::ScheduleSeason> schedule;
+    std::vector<rezka::VoiceStat> voice_stats;
 };
 
 // One fact row of the page: its kind (0 slogan, 1 release date, 2 country,
@@ -571,10 +589,144 @@ class Store final : public app::Concept
         app.player.seek(target);
     }
 
+    // ---- the player: HDrezkaTV's VideoPlayer screen ---------------------------
+    //
+    // The picture, and over it the app's controls: a scrim, "Сезон X Серия Y"
+    // and the title, the time on both sides of the progress line, and a row
+    // of round buttons (previous episode, play or pause, next episode; the
+    // quality on the right). They leave four seconds after the last press.
+    // Hidden, the pad is the app's remote: left and right jump ten seconds,
+    // up shows the controls, down toggles them, Cross pauses.
+
+    enum PlButton
+    {
+        kPlPrevious,
+        kPlPlay,
+        kPlNext,
+        kPlQuality,
+    };
+    static std::string pl_time(double seconds)
+    {
+        const int t = std::max(0, static_cast<int>(seconds));
+        char text[24];
+        if (t >= 3600)
+            std::snprintf(text, sizeof(text), "%d:%02d:%02d", t / 3600, (t / 60) % 60, t % 60);
+        else
+            std::snprintf(text, sizeof(text), "%02d:%02d", t / 60, t % 60);
+        return text;
+    }
+    // The episode before or after the one playing; false when there is none.
+    bool pl_episode(int delta, int &season, int &episode) const
+    {
+        auto &app = rezka::App::instance();
+        std::lock_guard<std::mutex> lock(app.catalog_mutex);
+        const int index = app.playing_movie_idx;
+        if (index < 0 || index >= static_cast<int>(app.movies.size()))
+            return false;
+        const rezka::VideoDetails &d = app.movies[static_cast<std::size_t>(index)].details;
+        if (!d.is_series || d.seasons.empty())
+            return false;
+        season = std::clamp(app.playing_season_idx, 0, static_cast<int>(d.seasons.size()) - 1);
+        episode = app.playing_episode_idx + delta;
+        if (episode < 0)
+        {
+            if (--season < 0)
+                return false;
+            episode = static_cast<int>(d.seasons[static_cast<std::size_t>(season)].episodes.size()) - 1;
+        }
+        else if (episode >= static_cast<int>(d.seasons[static_cast<std::size_t>(season)].episodes.size()))
+        {
+            if (++season >= static_cast<int>(d.seasons.size()))
+                return false;
+            episode = 0;
+        }
+        return episode >= 0;
+    }
+    // "Сезон 1 Серия 2" for a series, nothing for a film.
+    std::string pl_episode_line() const
+    {
+        auto &app = rezka::App::instance();
+        std::lock_guard<std::mutex> lock(app.catalog_mutex);
+        const int index = app.playing_movie_idx;
+        if (index < 0 || index >= static_cast<int>(app.movies.size()))
+            return {};
+        const rezka::VideoDetails &d = app.movies[static_cast<std::size_t>(index)].details;
+        if (!d.is_series || d.seasons.empty())
+            return {};
+        const int s = std::clamp(app.playing_season_idx, 0, static_cast<int>(d.seasons.size()) - 1);
+        const rezka::Season &season = d.seasons[static_cast<std::size_t>(s)];
+        const int e = std::clamp(app.playing_episode_idx, 0, std::max(0, static_cast<int>(season.episodes.size()) - 1));
+        return "Сезон " + season.id + " Серия " + (season.episodes.empty() ? std::to_string(e + 1) : season.episodes[static_cast<std::size_t>(e)].id);
+    }
+    std::vector<std::string> pl_qualities() const
+    {
+        std::vector<std::string> names;
+        auto &app = rezka::App::instance();
+        std::lock_guard<std::mutex> lock(app.catalog_mutex);
+        const int index = app.playing_movie_idx;
+        if (index >= 0 && index < static_cast<int>(app.movies.size()))
+            for (const rezka::StreamQuality &q : app.movies[static_cast<std::size_t>(index)].streams)
+                names.push_back(q.quality);
+        return names;
+    }
+    // The buttons the row has now, left to right.
+    std::vector<int> pl_buttons() const
+    {
+        std::vector<int> row;
+        int s = 0, e = 0;
+        if (pl_episode(-1, s, e))
+            row.push_back(kPlPrevious);
+        row.push_back(kPlPlay);
+        if (pl_episode(1, s, e))
+            row.push_back(kPlNext);
+        if (pl_qualities().size() > 1)
+            row.push_back(kPlQuality);
+        return row;
+    }
+    void pl_show(bool on)
+    {
+        pl_controls_ = on;
+        pl_timer_ = 4.0f;
+        if (on)
+        {
+            pl_focus_ = kPlPlay;
+            pl_scrub_ = false;
+        }
+    }
+    void pl_flash(int icon, const std::string &text, int side)
+    {
+        pl_flash_icon_ = icon;
+        pl_flash_text_ = text;
+        pl_flash_side_ = side;
+        pl_flash_left_ = 2.0f;
+    }
+    void pl_step_episode(int delta, app::Feedback &feedback)
+    {
+        auto &app = rezka::App::instance();
+        int season = 0, episode = 0;
+        if (!pl_episode(delta, season, episode))
+        {
+            tv_refuse(feedback, false);
+            return;
+        }
+        feedback.play(audio::Cue::select);
+        const int index = app.playing_movie_idx;
+        const int voice = app.playing_translator_idx;
+        const int quality = app.playing_quality_idx;
+        app.stop_playback();
+        app.play_title_async(index, voice, quality, season, episode);
+    }
+
     void update_player(const InputFrame &input, float dt, app::Feedback &feedback)
     {
         auto &app = rezka::App::instance();
         buffer_clock_ += dt;
+        pl_flash_left_ = std::max(0.0f, pl_flash_left_ - dt);
+        pl_bar_.target = pl_controls_ && pl_scrub_ ? 1.0f : 0.0f;
+        pl_bar_.update(dt, 18.0f);
+        pl_in_.target = pl_controls_ ? 1.0f : 0.0f;
+        pl_in_.update(dt, omega(14.0f));
+        app.osd_visible = false; // the controls keep their own time
 
         if (app.is_buffering && !app.is_playing)
         {
@@ -583,104 +735,166 @@ class Store final : public app::Concept
                 app.stop_playback();
                 feedback.play(audio::Cue::back);
             }
+            pl_controls_ = true;
+            pl_timer_ = 4.0f;
+            pl_quality_open_ = false;
+            return;
+        }
+        const double position = app.player.get_position();
+        const double duration = app.player.get_duration();
+
+        if (pl_quality_open_)
+        {
+            const std::vector<std::string> names = pl_qualities();
+            const int count = static_cast<int>(names.size());
+            if (input.is_pressed(Action::back) || input.nav == Direction::left)
+            {
+                pl_quality_open_ = false;
+                feedback.play(audio::Cue::modal_close);
+            }
+            else if (input.nav == Direction::up || input.nav == Direction::down)
+            {
+                const int next = pl_quality_focus_ + (input.nav == Direction::down ? 1 : -1);
+                if (next < 0 || next >= count)
+                    tv_refuse(feedback, input.nav_repeat);
+                else
+                {
+                    pl_quality_focus_ = next;
+                    tv_tick(feedback, kWidth * 0.8f);
+                }
+            }
+            else if (input.is_pressed(Action::confirm) && pl_quality_focus_ < count)
+            {
+                pl_quality_open_ = false;
+                feedback.play(audio::Cue::select);
+                if (pl_quality_focus_ != app.playing_quality_idx)
+                {
+                    // The same place in the other quality
+                    const int index = app.playing_movie_idx;
+                    const int voice = app.playing_translator_idx;
+                    const int season = app.playing_season_idx;
+                    const int episode = app.playing_episode_idx;
+                    app.stop_playback();
+                    app.play_title_async(index, voice, pl_quality_focus_, season, episode, position);
+                }
+            }
             return;
         }
 
-        const bool left_held =
-            input.is_held(Action::left) || input.stick_x < -0.55f;
-        const bool right_held =
-            input.is_held(Action::right) || input.stick_x > 0.55f;
-
-        if (input.is_pressed(Action::confirm) || input.is_pressed(Action::back) ||
-            input.is_pressed(Action::west) || input.is_pressed(Action::north) ||
-            input.nav != Direction::none || left_held || right_held)
+        if (!pl_controls_)
         {
-            app.osd_timer = 4.0f;
-            app.osd_visible = true;
+            if (input.is_pressed(Action::back))
+            {
+                app.stop_playback();
+                feedback.play(audio::Cue::back);
+            }
+            else if (input.is_pressed(Action::confirm))
+            {
+                app.player.toggle_pause();
+                pl_flash(app.player.is_playing() ? kTvIconPlayArrow : kTvIconPause, "", 0);
+            }
+            else if (input.nav == Direction::left || input.nav == Direction::right)
+            {
+                // The app's default step, ten seconds either way
+                const int dir = input.nav == Direction::left ? -1 : 1;
+                seek_player_to(app, position + 10.0 * dir);
+                pl_flash(dir < 0 ? kTvIconFastRewind : kTvIconFastForward,
+                         std::string(dir < 0 ? "-" : "+") + "10 сек. (" + pl_time(seek_cursor_) + ")", dir);
+            }
+            else if (input.nav == Direction::up || input.nav == Direction::down)
+                pl_show(true);
+            return;
         }
 
+        // The controls are up
+        if (input.pressed != 0 || input.nav != Direction::none)
+            pl_timer_ = 4.0f;
+        if (!pl_scrub_)
+        {
+            pl_timer_ -= dt;
+            if (pl_timer_ <= 0.0f)
+            {
+                pl_controls_ = false;
+                return;
+            }
+        }
+        const std::vector<int> row = pl_buttons();
+        if (pl_scrub_)
+        {
+            // On the line: left and right move a preview 5% a press, Cross goes there
+            if (input.nav == Direction::left || input.nav == Direction::right)
+                pl_fraction_ = std::clamp(pl_fraction_ + (input.nav == Direction::left ? -0.05f : 0.05f), 0.0f, 1.0f);
+            else if (input.is_pressed(Action::confirm) && duration > 0.0)
+            {
+                seek_player_to(app, duration * static_cast<double>(pl_fraction_));
+                pl_scrub_ = false;
+                feedback.play(audio::Cue::select);
+            }
+            else if (input.is_pressed(Action::back) || input.nav == Direction::down)
+            {
+                pl_scrub_ = false;
+                pl_focus_ = kPlPlay;
+            }
+            return;
+        }
         if (input.is_pressed(Action::back))
         {
-            seek_dir_ = 0;
-            seek_hold_time_ = 0.0f;
             app.stop_playback();
             feedback.play(audio::Cue::back);
             return;
         }
-
-        if (input.is_pressed(Action::confirm))
+        int at = 0;
+        for (int i = 0; i < static_cast<int>(row.size()); ++i)
+            if (row[static_cast<std::size_t>(i)] == pl_focus_)
+                at = i;
+        if (input.nav == Direction::left || input.nav == Direction::right)
         {
-            app.player.toggle_pause();
-            feedback.play(audio::Cue::toggle);
-        }
-
-        // Tap: ±15 sec. Hold: scrub a virtual cursor; only push seeks to the
-        // decoder every ~250ms so network av_seek_frame cannot stall the loop.
-        seek_send_cooldown_ = std::max(0.0f, seek_send_cooldown_ - dt);
-        if ((input.nav == Direction::left || input.nav == Direction::right) && !input.nav_repeat)
-        {
-            seek_dir_ = (input.nav == Direction::left) ? -1 : 1;
-            seek_hold_time_ = 0.0f;
-            seek_cursor_ = app.player.get_position();
-            seek_player_to(app, seek_cursor_ + static_cast<double>(seek_dir_) * 15.0);
-            seek_send_cooldown_ = 0.2f;
-            feedback.play(audio::Cue::select);
-        }
-
-        if (left_held || right_held)
-        {
-            const int dir = left_held ? -1 : 1;
-            if (seek_dir_ == 0) {
-                seek_dir_ = dir;
-                seek_hold_time_ = 0.0f;
-                seek_cursor_ = app.player.get_position();
-            }
-            seek_hold_time_ += dt;
-            if (seek_hold_time_ > 0.35f) {
-                float rate = 12.0f; // video-seconds per real second
-                if (seek_hold_time_ > 1.0f)
-                    rate = 45.0f;
-                if (seek_hold_time_ > 2.0f)
-                    rate = 120.0f;
-                if (seek_hold_time_ > 4.0f)
-                    rate = 300.0f;
-                seek_cursor_ += static_cast<double>(dir) * static_cast<double>(rate) *
-                                static_cast<double>(dt);
-                const double dur = app.player.get_duration();
-                if (dur > 0.0)
-                    seek_cursor_ = std::clamp(seek_cursor_, 0.0, dur);
-                else
-                    seek_cursor_ = std::max(0.0, seek_cursor_);
-                if (seek_send_cooldown_ <= 0.0f) {
-                    app.player.seek(seek_cursor_);
-                    seek_send_cooldown_ = 0.25f;
-                }
+            const int next = at + (input.nav == Direction::right ? 1 : -1);
+            if (next < 0 || next >= static_cast<int>(row.size()))
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                pl_focus_ = row[static_cast<std::size_t>(next)];
+                tv_tick(feedback, kWidth * 0.5f);
             }
         }
-        else
+        else if (input.nav == Direction::up)
         {
-            if (seek_dir_ != 0 && seek_hold_time_ > 0.35f)
-                app.player.seek(seek_cursor_);
-            seek_dir_ = 0;
-            seek_hold_time_ = 0.0f;
-            seek_send_cooldown_ = 0.0f;
+            pl_scrub_ = true;
+            pl_fraction_ = duration > 0.0 ? static_cast<float>(std::clamp(position / duration, 0.0, 1.0)) : 0.0f;
+        }
+        else if (input.nav == Direction::down)
+            pl_controls_ = false;
+        else if (input.is_pressed(Action::confirm))
+        {
+            switch (pl_focus_)
+            {
+            case kPlPrevious:
+                pl_step_episode(-1, feedback);
+                break;
+            case kPlNext:
+                pl_step_episode(1, feedback);
+                break;
+            case kPlQuality:
+                pl_controls_ = false;
+                pl_quality_open_ = true;
+                pl_quality_focus_ = std::clamp(app.playing_quality_idx, 0, std::max(0, static_cast<int>(pl_qualities().size()) - 1));
+                feedback.play(audio::Cue::modal_open);
+                break;
+            default:
+                app.player.toggle_pause();
+                feedback.play(audio::Cue::toggle);
+                break;
+            }
         }
     }
 
-    void draw_buffering_spinner(gfx::DrawList &list, float cx, float cy) const
+    // The app's waiting ring: a black disc and three quarters of a turning circle.
+    void pl_spinner(gfx::DrawList &list) const
     {
-        constexpr int kDots = 12;
-        constexpr float kRadius = 42.0f;
-        const float spin = buffer_clock_ * 2.6f;
-        for (int i = 0; i < kDots; ++i)
-        {
-            const float a = spin + static_cast<float>(i) * (6.2831853f / static_cast<float>(kDots));
-            const float fade = 0.18f + 0.82f * (static_cast<float>(i) / static_cast<float>(kDots));
-            const float r = 4.0f + 2.5f * fade;
-            list.circle(cx + std::cos(a) * kRadius, cy + std::sin(a) * kRadius, r,
-                        kAccent.with_alpha(fade));
-        }
-        list.circle(cx, cy, 10.0f, kAccent.with_alpha(0.35f));
+        const float dp = kTvDp;
+        list.circle(kWidth * 0.5f, kHeight * 0.5f, 44.0f * dp, kBlack.with_alpha(0.6f));
+        list.arc(kWidth * 0.5f, kHeight * 0.5f, 20.0f * dp, 8.0f, buffer_clock_ * 5.0f, 4.4f, tv_primary());
     }
 
     void draw_player(app::Frame &frame) const
@@ -690,98 +904,121 @@ class Store final : public app::Concept
         frame.overlay.clear();
         frame.glass = false;
         frame.backdrop.mode = gfx::BackdropMode::none;
+        const float dp = kTvDp;
+        gfx::DrawList &list = frame.overlay;
 
+        frame.scene.rounded_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, kBlack);
         const bool has_frame = app.video_texture.hui_handle != 0 && !app.is_buffering;
-        if (has_frame)
+        if (!has_frame)
         {
-            frame.scene.image(app.video_texture.hui_handle, {0.0f, 0.0f, kWidth, kHeight},
-                              gfx::kFullUv, kWhite, 0.0f);
-        }
-        else
-        {
-            frame.scene.rounded_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, kCoal);
-            draw_buffering_spinner(frame.scene, kWidth * 0.5f, kHeight * 0.5f - 28.0f);
-            ui::text(frame.scene, context_.fonts.semibold, "Буферизация...", kWidth * 0.5f,
-                     kHeight * 0.5f + 48.0f, 28, kInk, gfx::Align::center);
-            if (!app.playing_title.empty())
-                ui::text(frame.scene, context_.fonts.regular, app.playing_title.c_str(),
-                         kWidth * 0.5f, kHeight * 0.5f + 86.0f, 22, kInk.with_alpha(0.65f),
-                         gfx::Align::center);
-            const ui::GlyphStyle glyphs = ui::GlyphStyle::dark();
-            const ui::Hint hints[] = {{ui::Button::circle, "Отмена"}};
-            ui::draw_hints(frame.overlay, context_.fonts, glyphs, hints, 1, kWidth - 72.0f, true);
+            pl_spinner(frame.scene);
             return;
         }
+        frame.scene.image(app.video_texture.hui_handle, {0.0f, 0.0f, kWidth, kHeight}, gfx::kFullUv, kWhite, 0.0f);
 
-        if (app.osd_visible)
+        const float shown = pl_in_.value;
+        if (shown > 0.01f)
         {
-            gfx::DrawList &list = frame.overlay;
-            const ui::Fonts &fonts = context_.fonts;
+            list.push_opacity(tween::clamp01(shown));
+            list.gradient_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, kBlack.with_alpha(0.1f), kBlack.with_alpha(0.8f));
+            // The column slides up from the bottom edge: 56 dp from the sides, 32 from the bottom
+            list.push_transform(1.0f, 0.0f, 0.0f, 0.0f, (1.0f - shown) * 80.0f * dp);
+            const float left = 56.0f * dp, right = kWidth - 56.0f * dp;
+            const float buttons_y = kHeight - (32.0f + 40.0f) * dp;
+            const float seek_y = buttons_y - (16.0f + 24.0f) * dp; // a 24 dp row
+            const float title_y = seek_y - (16.0f + 36.0f) * dp;
+            const std::string episode = pl_episode_line();
+            tv_text(list, tv_regular(), episode, left, title_y - 28.0f * dp, 16.0f * dp, 24.0f * dp, tv_on_surface(), gfx::Align::left, 0.5f * dp);
+            // The title alone: the episode has its own line above
+            std::string title = item_title(app.playing_movie_idx);
+            if (title.empty())
+                title = app.playing_title;
+            tv_text(list, tv_regular(), tv_regular().font->fit(title, 28.0f * dp, right - left), left, title_y, 28.0f * dp, 36.0f * dp,
+                    tv_on_surface());
 
-            list.gradient_rect({0.0f, 0.0f, kWidth, 160.0f}, 0.0f,
-                               Color::rgb(0x000000, 0.88f), Color::rgb(0x000000, 0.0f));
+            const double duration = app.player.get_duration();
+            const double position = app.player.get_position();
+            const float played = duration > 1.0 ? static_cast<float>(std::clamp(position / duration, 0.0, 1.0)) : 0.0f;
+            const float fraction = pl_scrub_ ? pl_fraction_ : played;
+            const std::string now = pl_time(pl_scrub_ ? duration * static_cast<double>(pl_fraction_) : position);
+            const std::string total = pl_time(duration);
+            const float now_w = tv_medium().measure(now, 16.0f * dp, 0.5f * dp) + 24.0f * dp;
+            const float total_w = tv_medium().measure(total, 16.0f * dp, 0.5f * dp) + 24.0f * dp;
+            tv_text(list, tv_medium(), now, left + 12.0f * dp, seek_y, 16.0f * dp, 24.0f * dp, tv_on_surface(), gfx::Align::left, 0.5f * dp);
+            tv_text(list, tv_medium(), total, right - 12.0f * dp, seek_y, 16.0f * dp, 24.0f * dp, tv_on_surface(), gfx::Align::right, 0.5f * dp);
+            // The line: 4 dp, 10 while the focus is on it, with a thumb then
+            const float h = (4.0f + 6.0f * pl_bar_.value) * dp;
+            const Rect bar{left + now_w + 4.0f * dp, seek_y + 12.0f * dp - h * 0.5f, right - total_w - left - now_w - 8.0f * dp, h};
+            list.rounded_rect(bar, h * 0.5f, tv_on_surface().with_alpha(0.2f));
+            if (fraction > 0.001f)
+                list.gradient_rect_h({bar.x, bar.y, bar.w * fraction, bar.h}, h * 0.5f, tv_primary(), tv_inverse_primary());
+            if (pl_bar_.value > 0.05f)
+                list.circle(bar.x + bar.w * fraction, bar.cy(), 1.05f * h * pl_bar_.value, tv_primary());
 
-            ui::text(list, fonts.semibold, app.playing_title.c_str(), 96.0f, 60.0f, 32, kWhite);
-
-            std::string sub = app.playing_voice + "  •  " +
-                              (app.playing_quality.empty() ? "HD" : app.playing_quality);
-            ui::text(list, fonts.regular, sub.c_str(), 96.0f, 100.0f, 22, kAccent);
-
-            list.gradient_rect({0.0f, kHeight - 180.0f, kWidth, 180.0f}, 0.0f,
-                               Color::rgb(0x000000, 0.0f), Color::rgb(0x000000, 0.92f));
-
-            double pos = (seek_dir_ != 0) ? seek_cursor_ : app.player.get_position();
-            double dur = app.player.get_duration();
-            float prog = (dur > 1.0) ? static_cast<float>(pos / dur) : 0.0f;
-            prog = std::clamp(prog, 0.0f, 1.0f);
-
-            const float bar_x = 96.0f;
-            const float bar_y = kHeight - 100.0f;
-            const float bar_w = kWidth - 192.0f;
-            const float bar_h = 8.0f;
-
-            list.rounded_rect({bar_x, bar_y, bar_w, bar_h}, 4.0f, Color::rgb(0xffffff, 0.22f));
-            if (prog > 0.001f) {
-                list.rounded_rect({bar_x, bar_y, bar_w * prog, bar_h}, 4.0f, kAccent);
-                list.circle(bar_x + bar_w * prog, bar_y + bar_h * 0.5f, 9.0f, kWhite);
+            const std::vector<int> row = pl_buttons();
+            float x = left;
+            for (const int button : row)
+            {
+                const bool trailing = button == kPlQuality;
+                const float bx = trailing ? right - 40.0f * dp : x;
+                if (!trailing)
+                    x += 52.0f * dp;
+                const bool focused = !pl_scrub_ && pl_controls_ && button == pl_focus_;
+                const Rect r = scaled({bx, buttons_y, 40.0f * dp, 40.0f * dp}, focused ? 1.2f : 1.0f);
+                list.circle(r.cx(), r.cy(), r.w * 0.5f, focused ? tv_on_surface() : tv_on_surface().with_alpha(0.2f));
+                const int icon = button == kPlPrevious ? kTvIconSkipPrevious : button == kPlNext ? kTvIconSkipNext
+                                 : button == kPlQuality ? kTvIconHighQuality : app.player.is_playing() ? kTvIconPause : kTvIconPlayArrow;
+                const float size = 24.0f * dp * (focused ? 1.2f : 1.0f);
+                tv_icon(list, icon, r.cx() - size * 0.5f, r.cy() - size * 0.5f, size, focused ? tv_inverse_on_surface() : tv_on_surface());
             }
+            list.pop_transform();
+            list.pop_opacity();
+        }
 
-            int cur_s = static_cast<int>(pos);
-            int tot_s = static_cast<int>(dur);
-            char time_buf[64];
-            std::snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d / %02d:%02d:%02d",
-                          cur_s / 3600, (cur_s % 3600) / 60, cur_s % 60,
-                          tot_s / 3600, (tot_s % 3600) / 60, tot_s % 60);
-            const float row_cy = kHeight - 48.0f;
-            const float time_w =
-                ui::text(list, fonts.mono, time_buf, bar_x, kHeight - 58.0f, 20, kInk);
-
-            bool playing = app.player.is_playing();
-            const char *status_str = playing ? "ИГРАЕТ" : "ПАУЗА";
-            Color status_col = playing ? kOwned : kAccent;
-            const float status_x = bar_x + time_w + 28.0f;
-            if (playing) {
-                list.triangle({status_x, row_cy - 9.0f, 16.0f, 18.0f}, status_col, 0.0f, 1.5707963f);
-            } else {
-                list.rounded_rect({status_x, row_cy - 8.0f, 5.0f, 16.0f}, 1.5f, status_col);
-                list.rounded_rect({status_x + 9.0f, row_cy - 8.0f, 5.0f, 16.0f}, 1.5f, status_col);
+        // What a press did, for two seconds: a disc for play and pause, a pill for a jump
+        if (pl_flash_left_ > 0.0f)
+        {
+            list.push_opacity(tween::clamp01(pl_flash_left_ * 4.0f));
+            if (pl_flash_text_.empty())
+            {
+                list.circle(kWidth * 0.5f, kHeight * 0.5f, 44.0f * dp, kBlack.with_alpha(0.6f));
+                tv_icon(list, pl_flash_icon_, kWidth * 0.5f - 24.0f * dp, kHeight * 0.5f - 24.0f * dp, 48.0f * dp, kWhite);
             }
-            ui::text(list, fonts.semibold, status_str, status_x + 26.0f, kHeight - 58.0f, 20,
-                     status_col);
+            else
+            {
+                const float text_w = tv_medium().measure(pl_flash_text_, 16.0f * dp, 0.5f * dp);
+                const float w = (20.0f + 36.0f + 16.0f + 20.0f) * dp + text_w;
+                const float cx = kWidth * (pl_flash_side_ < 0 ? 0.25f : 0.75f);
+                const Rect pill{cx - w * 0.5f, kHeight * 0.5f - 38.0f * dp, w, 76.0f * dp};
+                list.rounded_rect(pill, pill.h * 0.5f, kBlack.with_alpha(0.6f));
+                tv_icon(list, pl_flash_icon_, pill.x + 20.0f * dp, pill.cy() - 18.0f * dp, 36.0f * dp, kWhite);
+                tv_text(list, tv_medium(), pl_flash_text_, pill.x + 72.0f * dp, pill.cy() - 12.0f * dp, 16.0f * dp, 24.0f * dp, kWhite,
+                        gfx::Align::left, 0.5f * dp);
+            }
+            list.pop_opacity();
+        }
 
-            // Button hints stay on the right -- never overlap status.
-            const ui::GlyphStyle glyphs = ui::GlyphStyle::dark();
-            const ui::Hint hints[] = {
-                {ui::Button::cross, playing ? "Пауза" : "Пуск"},
-                {ui::Button::dpad, "±15с / удерж."},
-                {ui::Button::circle, "Выход"},
-            };
-            ui::HintLayout hint_layout;
-            hint_layout.size = 30.0f;
-            hint_layout.text_size = 20.0f;
-            hint_layout.cy = row_cy;
-            hint_layout.item_gap = 32.0f;
-            ui::draw_hints(list, fonts, glyphs, hints, 3, kWidth - 72.0f, true, hint_layout);
+        if (pl_quality_open_)
+        {
+            // The app's side sheet: on the right, half see-through
+            const std::vector<std::string> names = pl_qualities();
+            const float w = 320.0f * dp;
+            const float h = std::min(kHeight - 48.0f * dp, (20.0f + 28.0f + 16.0f + 20.0f) * dp + static_cast<float>(names.size()) * 52.0f * dp);
+            const Rect card{kWidth - 24.0f * dp - w, (kHeight - h) * 0.5f, w, h};
+            list.bordered_rect(card, 28.0f * dp, tv_surface().with_alpha(0.5f), 1.0f * dp, tv_border_variant().with_alpha(0.5f));
+            tv_text(list, tv_regular(), "Качество", card.cx(), card.y + 20.0f * dp, 22.0f * dp, 28.0f * dp, tv_on_surface(), gfx::Align::center);
+            for (int i = 0; i < static_cast<int>(names.size()); ++i)
+            {
+                const Rect r{card.x + 20.0f * dp, card.y + 64.0f * dp + static_cast<float>(i) * 52.0f * dp, w - 40.0f * dp, 48.0f * dp};
+                const bool focused = i == pl_quality_focus_;
+                if (focused)
+                    list.rounded_rect(r, 8.0f * dp, tv_on_surface());
+                const Color content = focused ? tv_inverse_on_surface() : tv_on_surface();
+                tv_text(list, tv_medium(), names[static_cast<std::size_t>(i)], r.x + 16.0f * dp, r.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp, content,
+                        gfx::Align::left, 0.1f * dp);
+                if (i == app.playing_quality_idx)
+                    tv_icon(list, kTvIconCheck, r.x + r.w - 32.0f * dp, r.cy() - 8.0f * dp, 16.0f * dp, content);
+            }
         }
     }
 
@@ -862,11 +1099,11 @@ class Store final : public app::Concept
         else if (qr_open_)
             update_qr(input, feedback);
         else if (dialog_open_)
-            update_dialog(input, feedback);
+            wd_update(input, feedback);
         else if (drawer_open_)
             update_drawer(input, feedback);
         else if (page_open_)
-            update_page(input, feedback);
+            dp_update(input, feedback);
         else
             update_home(input, feedback);
         animate(dt, feedback);
@@ -905,17 +1142,18 @@ class Store final : public app::Concept
         const auto arriving = [](float value) { return tween::clamp01((value - 0.4f) / 0.6f); };
 
         gfx::DrawList &overlay = frame.overlay;
-        frame.glass = page > 0.004f || dialog > 0.004f || toast_.value > 0.01f || qr_.value > 0.01f ||
-                      person_open_;
-        draw_page(overlay, frame.glass_texture);
+        frame.glass = false;
+        (void)arriving;
+        (void)dialog;
+        dp_draw(overlay);
+        cm_draw(overlay);
+        dp_draw_dialog(overlay);
         draw_person(overlay);
         draw_qr(overlay);
         draw_search(overlay);
         draw_profile(overlay);
-        draw_dialog(overlay, frame.glass_texture);
+        wd_draw(overlay);
         draw_toast(overlay, frame.glass_texture);
-        draw_hints(overlay, 1, arriving(page) * (person_open_ ? 0.0f : 1.0f));
-        draw_hints(overlay, 3, arriving(dialog));
     }
 
     std::span<const app::TourStep> tour() const override
@@ -1797,6 +2035,7 @@ class Store final : public app::Concept
         tv_tab_delay_ = -1.0f;
         tv_scroll_.snap(0.0f);
         tv_cards_.clear();
+        tv_list_title_.clear();
         home_layout_ = false;
         {
             auto &app = rezka::App::instance();
@@ -2291,6 +2530,12 @@ class Store final : public app::Concept
             tv_icons_ = app.renderer->create_texture(w, h, rgba);
         if (rgba)
             rezka::TextureLoader::free_decoded_image(rgba);
+        // The trailer tile's badge keeps its own colours
+        rgba = rezka::TextureLoader::load_file_rgba(VK_EXAMPLE_ASSETS_DIR "tv/youtube.png", &w, &h);
+        if (rgba && w > 0 && h > 0)
+            tv_youtube_ = app.renderer->create_texture(w, h, rgba);
+        if (rgba)
+            rezka::TextureLoader::free_decoded_image(rgba);
     }
 
     // The Material icons of the strip, in its order.
@@ -2304,6 +2549,32 @@ class Store final : public app::Concept
         kTvIconCampaign,
         kTvIconSettings,
         kTvIconCheck,
+        kTvIconPlayArrow,
+        kTvIconAccessTime,
+        kTvIconBlock,
+        kTvIconBookmark,
+        kTvIconBookmarkBorder,
+        kTvIconStackedBarChart,
+        kTvIconQrCode2,
+        kTvIconSchedule,
+        kTvIconCalendarMonth,
+        kTvIconStarRate,
+        kTvIconInfoOutlined,
+        kTvIconThumbUpAltOutlined,
+        kTvIconThumbUpAlt,
+        kTvIconOpenInNew,
+        kTvIconLockOutlined,
+        kTvIconLinkOutlined,
+        kTvIconKeyboardArrowRight,
+        kTvIconPause,
+        kTvIconSkipPrevious,
+        kTvIconSkipNext,
+        kTvIconSubtitles,
+        kTvIconSpeed,
+        kTvIconHighQuality,
+        kTvIconFullscreen,
+        kTvIconFastRewind,
+        kTvIconFastForward,
         kTvIconCount,
     };
     void tv_icon(gfx::DrawList &list, int icon, float x, float y, float size, Color color) const
@@ -2733,7 +3004,8 @@ class Store final : public app::Concept
         if (!home_layout_ || tv_kind_ != 0)
         {
             // Other lists are headed by their name where the tabs would be.
-            const char *title = !home_layout_ ? "Поиск" : tv_kind_ == 1 ? "Новинки" : "Анонсы";
+            const char *title = !home_layout_ ? (tv_list_title_.empty() ? "Поиск" : tv_list_title_.c_str())
+                                : tv_kind_ == 1 ? "Новинки" : "Анонсы";
             tv_text(list, tv_regular(), title, kTvPad, kTvTabsY, 24.0f * kTvDp, kTvTabH,
                     tv_on_surface());
             return;
@@ -2955,6 +3227,1843 @@ class Store final : public app::Concept
         list.pop_transform();
         tv_draw_clock(list);
         tv_draw_drawer(list);
+    }
+
+    // ---- a title's page: HDrezkaTV's "MovieDetails" screen -------------------
+    //
+    // One scrolling column, as in the app (its LazyColumn, 24 dp around and
+    // 12 dp between items): the hero (the large poster as a backdrop fading
+    // into the surface, the poster card, the buttons, the title), the row of
+    // rating and fact tiles, the tagline and release date, the country, genre,
+    // list and collection links, the description beside the trailer, the cast,
+    // the release schedule, the franchise and "Смотрите также". Sizes are the
+    // app's dp, two pixels each.
+
+    enum class DpWhat : std::uint8_t
+    {
+        poster,
+        watch,
+        resume,
+        bookmark,
+        stats,
+        qr,
+        chip,      // a: 0 КиноПоиск 1 IMDb 2 HDrezka 3 runtime 4 age 5 year 6 comments
+        link,      // a: 0 countries 1 genres 2 lists 3 collections; b: which
+        link_all,  // a collapsed row of links: opens the list of them
+        desc,
+        trailer,
+        cast,
+        schedule,
+        franchise,
+        related,
+    };
+    struct DpItem
+    {
+        DpWhat what = DpWhat::watch;
+        int a = 0;
+        int b = 0;
+        Rect r{}; // on the unscrolled page
+    };
+    // A band of the page the focus moves along sideways. A wide one scrolls.
+    struct DpRow
+    {
+        std::vector<DpItem> items;
+        bool hero = false;
+        bool scrolls = false;
+        float content_w = 0.0f; // from kDpLeft to the last item's right edge
+    };
+    struct DpLayout
+    {
+        std::vector<DpRow> rows;
+        Rect poster{};
+        float buttons_y = 0.0f, resume_y = 0.0f, title_y = 0.0f, original_y = 0.0f;
+        float chips_y = 0.0f, tagline_y = 0.0f, date_y = 0.0f;
+        float link_y[4] = {0, 0, 0, 0}; // each list's band, 0 when it has none
+        float link_h[4] = {0, 0, 0, 0};
+        float desc_y = 0.0f, cast_y = 0.0f, schedule_y = 0.0f, franchise_y = 0.0f, related_y = 0.0f;
+        float bottom = 0.0f;
+    };
+    enum class DpDialog : std::uint8_t
+    {
+        none,
+        text,     // the whole description, or a comment
+        stats,    // Статистика выбора озвучек
+        schedule, // Расписание выхода серий
+        links,    // all of a row's links
+        image,    // the poster, full screen
+    };
+
+    static constexpr float kDpEdge = 24.0f * kTvDp;  // the column's own padding
+    static constexpr float kDpLeft = 72.0f * kTvDp;  // ... plus an item's 48 dp
+    static constexpr float kDpWide = kWidth - 2.0f * kDpLeft;
+    static constexpr float kDpGap = 12.0f * kTvDp;
+    static constexpr float kDpHeroH = 0.85f * (kHeight - 2.0f * kDpEdge);
+    static constexpr float kDpCardW = 120.0f * kTvDp;
+    static constexpr float kDpCardH = 180.0f * kTvDp;
+    static constexpr float kDpTileW = (kDpWide - 20.0f * kTvDp) * 0.5f; // description and trailer
+    static constexpr float kDpTileH = kDpTileW * 9.0f / 16.0f;
+
+    static Color tv_primary() { return Color::rgb(0x70d2ff); }
+    static Color tv_inverse_primary() { return Color::rgb(0x00668a); }
+    static Color tv_border_variant() { return Color::rgb(0x40484c); }
+    static Color tv_error() { return Color::rgb(0xffb4ab); }
+    // The app's colour of a score: ten steps from red (below 1) to green (9 and up).
+    static Color tv_rating_color(float value)
+    {
+        static const std::uint32_t kScale[10] = {0xe01123, 0xec3c18, 0xf45f04, 0xfe8d04, 0xfeb101,
+                                                 0xf3cf00, 0xc3cb02, 0x8ec720, 0x4fc140, 0x01bb5e};
+        return Color::rgb(kScale[std::clamp(static_cast<int>(value), 0, 9)]);
+    }
+    // 1234567 -> "1 234 567", as the app groups a count.
+    static std::string dp_grouped(int value)
+    {
+        std::string digits = std::to_string(std::max(0, value));
+        for (int at = static_cast<int>(digits.size()) - 3; at > 0; at -= 3)
+            digits.insert(static_cast<std::size_t>(at), " ");
+        return digits;
+    }
+
+    const std::vector<std::string> &dp_link_names(int list) const
+    {
+        return list == 0 ? page_model_.countries : list == 1 ? page_model_.genres
+               : list == 2 ? dp_list_names_ : dp_collection_names_;
+    }
+    std::string dp_link_url(int list, int index) const
+    {
+        const PageModel &m = page_model_;
+        const std::size_t i = static_cast<std::size_t>(index);
+        if (list == 0)
+            return i < m.country_urls.size() ? m.country_urls[i] : std::string();
+        if (list == 1)
+            return i < m.genre_urls.size() ? m.genre_urls[i] : std::string();
+        if (list == 2)
+            return i < m.lists.size() ? m.lists[i].url : std::string();
+        return i < m.collections.size() ? m.collections[i].url : std::string();
+    }
+    static const char *dp_link_label(int list)
+    {
+        static const char *kLabels[4] = {"Страна:", "Жанр:", "Входит в списки:", "Из серии:"};
+        return kLabels[list];
+    }
+    // What a chip of the fact row says: its value and the label under it.
+    bool dp_chip_text(int chip, std::string &value, std::string &votes, const char *&label,
+                      Color &color) const
+    {
+        const PageModel &m = page_model_;
+        const rezka::RatingInfo *rating = chip == 0 ? &m.kinopoisk : chip == 1 ? &m.imdb : chip == 2 ? &m.hdrezka : nullptr;
+        votes.clear();
+        color = tv_on_surface();
+        if (rating)
+        {
+            if (!rating->valid)
+                return false;
+            char text[16];
+            // The app prints the double as it is: 7.9, 7.94, 8.0
+            std::snprintf(text, sizeof(text), "%.2f", rating->value);
+            value = text;
+            if (value.size() > 3 && value.back() == '0')
+                value.pop_back();
+            if (!rating->votes.empty())
+                votes = "(" + rating->votes + ")";
+            label = chip == 0 ? "КиноПоиск" : chip == 1 ? "IMDb" : "HDrezka";
+            color = tv_rating_color(rating->value);
+            return true;
+        }
+        if (chip == 3)
+            value = m.duration, label = "Длительность";
+        else if (chip == 4)
+            value = m.age, label = "Возраст";
+        else if (chip == 5)
+            value = m.year, label = "Год выхода";
+        else
+        {
+            value = m.comments_count > 0 ? dp_grouped(m.comments_count) : std::string();
+            label = "Комментарии";
+        }
+        return !value.empty();
+    }
+
+    // What does not change from frame to frame: the wrapped texts.
+    void dp_prepare()
+    {
+        const PageModel &m = page_model_;
+        const std::string key = m.url + "|" + m.title + "|" + std::to_string(m.description.size()) + "|" +
+                                std::to_string(m.lists.size() + m.collections.size() + m.cast.size());
+        if (key == dp_key_)
+            return;
+        dp_key_ = key;
+        const gfx::Font &regular = *tv_regular().font;
+        dp_title_lines_ = regular.wrap(m.title, 36.0f * kTvDp, kDpWide);
+        if (dp_title_lines_.size() > 2)
+        {
+            dp_title_lines_[1] = regular.fit(dp_title_lines_[1] + " " + dp_title_lines_[2], 36.0f * kTvDp, kDpWide);
+            dp_title_lines_.resize(2);
+        }
+        if (dp_title_lines_.empty())
+            dp_title_lines_.push_back("");
+        // The description tile holds eight lines; more ends in the app's hint.
+        dp_desc_lines_ = regular.wrap(m.description, 16.0f * kTvDp, kDpTileW - 32.0f * kTvDp);
+        dp_desc_more_ = dp_desc_lines_.size() > 8;
+        if (dp_desc_more_)
+        {
+            dp_desc_lines_.resize(8);
+            const float hint_w = tv_medium().measure("… Нажмите, чтобы развернуть", 16.0f * kTvDp);
+            std::string &last = dp_desc_lines_.back();
+            while (!last.empty() && regular.measure(last, 16.0f * kTvDp) + hint_w > kDpTileW - 32.0f * kTvDp)
+            {
+                last.pop_back();
+                while (!last.empty() && (static_cast<unsigned char>(last.back()) & 0xc0) == 0x80)
+                    last.pop_back();
+            }
+            while (!last.empty() && (last.back() == ' ' || last.back() == '.'))
+                last.pop_back();
+        }
+        dp_list_names_.clear();
+        for (const rezka::ListRef &ref : m.lists)
+            dp_list_names_.push_back(ref.place.empty() ? ref.title : ref.title + " " + ref.place);
+        dp_collection_names_.clear();
+        for (const rezka::ListRef &ref : m.collections)
+            dp_collection_names_.push_back(ref.title);
+        dp_cast_names_.clear();
+        for (const rezka::Person &p : m.cast)
+        {
+            std::string lines[2];
+            tv_two_lines(*tv_medium().font, p.name, 14.0f * kTvDp, kDpCardW, lines);
+            dp_cast_names_.push_back(lines[0]);
+            dp_cast_names_.push_back(lines[1]);
+        }
+        dp_related_lines_.clear();
+        for (const rezka::CatalogItem &item : m.related)
+        {
+            std::string lines[2];
+            tv_two_lines(*tv_medium().font, item.title, 14.0f * kTvDp, kDpCardW, lines);
+            dp_related_lines_.push_back(lines[0]);
+            dp_related_lines_.push_back(lines[1]);
+            tv_two_lines(regular, item.info, 12.0f * kTvDp, kDpCardW, lines);
+            dp_related_lines_.push_back(lines[0]);
+            dp_related_lines_.push_back(lines[1]);
+        }
+        auto &app = rezka::App::instance();
+        if (!m.full_cover.empty())
+            app.request_photo(m.full_cover);
+        if (!m.cover.empty())
+            app.request_photo(m.cover);
+        if (!m.trailer_id.empty())
+            app.request_photo("https://img.youtube.com/vi/" + m.trailer_id + "/hqdefault.jpg");
+        for (const rezka::CatalogItem &item : m.related)
+            app.request_photo(item.cover_url);
+    }
+
+    // The collapsed text of a row with more links than it shows: "A, B, C."
+    std::string dp_joined(int list) const
+    {
+        std::string all;
+        const std::vector<std::string> &names = dp_link_names(list);
+        for (std::size_t i = 0; i < names.size(); ++i)
+            all += names[i] + (i + 1 < names.size() ? ", " : ". ");
+        return all;
+    }
+
+    DpLayout dp_layout() const
+    {
+        const PageModel &m = page_model_;
+        DpLayout L;
+        const float dp = kTvDp;
+        // The hero's column is packed against its bottom edge, 8 dp apart.
+        float bottom = kDpEdge + kDpHeroH;
+        if (!m.original.empty())
+        {
+            L.original_y = bottom - 28.0f * dp;
+            bottom = L.original_y - 8.0f * dp;
+        }
+        L.title_y = bottom - 44.0f * dp * static_cast<float>(dp_title_lines_.size());
+        bottom = L.title_y - 8.0f * dp - 8.0f * dp - 8.0f * dp; // a spacer of 8 between two gaps
+        if (m.has_resume && !m.blocked)
+        {
+            L.resume_y = bottom - 16.0f * dp;
+            bottom = L.resume_y - 4.0f * dp - 8.0f * dp;
+        }
+        L.buttons_y = bottom - 40.0f * dp;
+        bottom = L.buttons_y - 8.0f * dp;
+        const float poster_h = std::max(60.0f, bottom - kDpEdge - 48.0f * dp);
+        L.poster = {kDpLeft, kDpEdge + 24.0f * dp, poster_h * 2.0f / 3.0f, poster_h};
+
+        DpRow poster;
+        poster.hero = true;
+        poster.items.push_back({DpWhat::poster, 0, 0, L.poster});
+        L.rows.push_back(poster);
+
+        if (!m.blocked)
+        {
+            DpRow row;
+            row.hero = true;
+            float x = kDpLeft;
+            const auto add = [&](DpWhat what, float w) {
+                row.items.push_back({what, 0, 0, {x, L.buttons_y, w, 40.0f * dp}});
+                x += w + 12.0f * dp;
+            };
+            const float label = 14.0f * dp;
+            add(DpWhat::watch, (16.0f + 20.0f + 8.0f + 16.0f) * dp +
+                                   tv_medium().measure(m.pending ? "Ожидается" : "Смотреть", label, 0.1f * dp));
+            if (m.has_resume)
+                add(DpWhat::resume, 32.0f * dp + tv_medium().measure("Продолжить *", label, 0.1f * dp));
+            add(DpWhat::bookmark, 40.0f * dp);
+            if (!m.voice_stats.empty())
+                add(DpWhat::stats, 40.0f * dp);
+            add(DpWhat::qr, 40.0f * dp);
+            L.rows.push_back(row);
+        }
+
+        float y = kDpEdge + kDpHeroH + kDpGap;
+        // The fact tiles
+        {
+            DpRow row;
+            row.scrolls = true;
+            float x = kDpLeft;
+            for (int chip = 0; chip < 7; ++chip)
+            {
+                std::string value, votes;
+                const char *label = "";
+                Color color;
+                if (!dp_chip_text(chip, value, votes, label, color))
+                    continue;
+                float top = tv_medium().measure(value, 24.0f * dp);
+                if (!votes.empty())
+                    top += 4.0f * dp + tv_regular().measure(votes, 12.0f * dp);
+                const float w = std::max(80.0f * dp, std::max(top, tv_regular().measure(label, 14.0f * dp)) + 32.0f * dp);
+                row.items.push_back({DpWhat::chip, chip, 0, {x, y, w, 62.0f * dp}});
+                x += w + 8.0f * dp;
+            }
+            if (!row.items.empty())
+            {
+                row.content_w = x - 8.0f * dp - kDpLeft;
+                L.chips_y = y;
+                L.rows.push_back(row);
+                y += 62.0f * dp + kDpGap;
+            }
+        }
+        const float line18 = 22.0f * dp; // an 18 sp line
+        if (!m.slogan.empty())
+        {
+            L.tagline_y = y;
+            y += 16.0f * dp + line18 + kDpGap;
+        }
+        if (!m.release_date.empty())
+        {
+            L.date_y = y;
+            y += 16.0f * dp + line18 + kDpGap;
+        }
+        static const int kShown[4] = {5, 5, 1, 2};
+        for (int list = 0; list < 4; ++list)
+        {
+            const std::vector<std::string> &names = dp_link_names(list);
+            if (names.empty())
+                continue;
+            DpRow row;
+            L.link_y[list] = y;
+            const float size = 18.0f * dp;
+            if (static_cast<int>(names.size()) > kShown[list])
+            {
+                // One plate with the names in a sentence and the hint to open it
+                const float text_w = kWidth - 2.0f * (kDpEdge + 32.0f * dp) - 32.0f * dp;
+                const std::string all = std::string(dp_link_label(list)) + " " + dp_joined(list) + "Нажмите, чтобы развернуть";
+                const float lines = static_cast<float>(tv_regular().font->wrap(all, size, text_w).size());
+                L.link_h[list] = 32.0f * dp + std::max(1.0f, lines) * line18;
+                row.items.push_back({DpWhat::link_all, list, 0,
+                                     {kDpEdge + 32.0f * dp, y, kWidth - 2.0f * (kDpEdge + 32.0f * dp), L.link_h[list]}});
+            }
+            else
+            {
+                // The label, then a bordered chip a name, wrapping as a flow row does
+                float x = kDpLeft + tv_medium().measure(dp_link_label(list), size) + 8.0f * dp;
+                float row_y = y + 4.0f * dp;
+                const float chip_h = 16.0f * dp + line18;
+                for (int i = 0; i < static_cast<int>(names.size()); ++i)
+                {
+                    const float w = tv_regular().measure(names[static_cast<std::size_t>(i)], size) + 32.0f * dp;
+                    if (x + w > kDpLeft + kDpWide && x > kDpLeft)
+                    {
+                        x = kDpLeft;
+                        row_y += chip_h + 8.0f * dp;
+                    }
+                    row.items.push_back({DpWhat::link, list, i, {x, row_y, w, chip_h}});
+                    x += w + 8.0f * dp;
+                }
+                L.link_h[list] = row_y + chip_h + 4.0f * dp - y;
+            }
+            L.rows.push_back(row);
+            y += L.link_h[list] + kDpGap;
+        }
+        // The description, and the trailer beside it
+        {
+            L.desc_y = y;
+            DpRow row;
+            const float tile_y = y + (16.0f + 28.0f + 16.0f) * dp;
+            row.items.push_back({DpWhat::desc, 0, 0, {kDpLeft, tile_y, kDpTileW, kDpTileH}});
+            if (!m.trailer_id.empty())
+                row.items.push_back({DpWhat::trailer, 0, 0, {kDpLeft + kDpTileW + 20.0f * dp, tile_y, kDpTileW, kDpTileH}});
+            L.rows.push_back(row);
+            y = tile_y + kDpTileH + kDpGap;
+        }
+        const float heading = (16.0f + 28.0f + 16.0f) * dp; // 16 above a titleLarge line, 16 under
+        if (!m.cast.empty())
+        {
+            L.cast_y = y;
+            DpRow row;
+            row.scrolls = true;
+            for (int i = 0; i < static_cast<int>(m.cast.size()); ++i)
+                row.items.push_back({DpWhat::cast, i, 0,
+                                     {kDpLeft + static_cast<float>(i) * (kDpCardW + 12.0f * dp), y + heading, kDpCardW, kDpCardH}});
+            row.content_w = static_cast<float>(m.cast.size()) * (kDpCardW + 12.0f * dp) - 12.0f * dp;
+            L.rows.push_back(row);
+            y += heading + kDpCardH + (12.0f + 28.0f + 4.0f + 24.0f) * dp + kDpGap;
+        }
+        if (!m.schedule.empty())
+        {
+            L.schedule_y = y;
+            const int shown = std::min<int>(5, static_cast<int>(m.schedule.front().rows.size()));
+            const float h = (16.0f + static_cast<float>(shown) * 44.0f + static_cast<float>(shown) * 8.0f + 8.0f + 20.0f + 16.0f) * dp;
+            DpRow row;
+            row.items.push_back({DpWhat::schedule, 0, 0, {kDpLeft, y + (16.0f + 28.0f) * dp + kDpGap, kDpWide, h}});
+            L.rows.push_back(row);
+            y = row.items[0].r.y + h + kDpGap;
+        }
+        if (!m.franchises.empty())
+        {
+            L.franchise_y = y;
+            y += (16.0f + 28.0f) * dp + kDpGap;
+            for (int i = 0; i < static_cast<int>(m.franchises.size()); ++i)
+            {
+                DpRow row;
+                row.items.push_back({DpWhat::franchise, i, 0, {kDpLeft, y, kDpWide, 64.0f * dp}});
+                L.rows.push_back(row);
+                y += 64.0f * dp + kDpGap;
+            }
+        }
+        if (!m.related.empty())
+        {
+            L.related_y = y;
+            DpRow row;
+            row.scrolls = true;
+            for (int i = 0; i < static_cast<int>(m.related.size()); ++i)
+                row.items.push_back({DpWhat::related, i, 0,
+                                     {kDpLeft + static_cast<float>(i) * (kDpCardW + 12.0f * dp), y + heading, kDpCardW, kDpCardH}});
+            row.content_w = static_cast<float>(m.related.size()) * (kDpCardW + 12.0f * dp) - 12.0f * dp;
+            L.rows.push_back(row);
+            y += heading + kDpCardH + (12.0f + 28.0f + 4.0f + 24.0f) * dp + kDpGap;
+        }
+        L.bottom = y - kDpGap + kDpEdge;
+        return L;
+    }
+
+    // Where the focus is, kept inside the layout as it changes under it.
+    const DpItem *dp_focused(const DpLayout &L) const
+    {
+        if (L.rows.empty())
+            return nullptr;
+        const int row = std::clamp(dp_row_, 0, static_cast<int>(L.rows.size()) - 1);
+        const DpRow &r = L.rows[static_cast<std::size_t>(row)];
+        if (r.items.empty())
+            return nullptr;
+        return &r.items[static_cast<std::size_t>(std::clamp(dp_col_, 0, static_cast<int>(r.items.size()) - 1))];
+    }
+    // A wide row's offset: Compose rests the focused item 30% in from the left.
+    static float dp_row_offset(const DpRow &row, int col)
+    {
+        if (!row.scrolls || row.items.empty())
+            return 0.0f;
+        const DpItem &item = row.items[static_cast<std::size_t>(std::clamp(col, 0, static_cast<int>(row.items.size()) - 1))];
+        const float view = kWidth - 2.0f * kDpEdge;
+        const float content = row.content_w + 2.0f * (kDpLeft - kDpEdge);
+        return std::clamp(item.r.x - kDpEdge - 0.3f * view, 0.0f, std::max(0.0f, content - view));
+    }
+    int dp_row_of(const DpLayout &L, DpWhat what) const
+    {
+        for (int i = 0; i < static_cast<int>(L.rows.size()); ++i)
+            if (!L.rows[static_cast<std::size_t>(i)].items.empty() && L.rows[static_cast<std::size_t>(i)].items[0].what == what)
+                return i;
+        return -1;
+    }
+
+    void dp_open_dialog(DpDialog dialog, app::Feedback &feedback)
+    {
+        dp_dialog_ = dialog;
+        dp_dialog_focus_ = 0;
+        dp_dialog_scroll_.snap(0.0f);
+        feedback.play(audio::Cue::modal_open);
+    }
+    // A list of the site by its address, in the grid the search results use.
+    void dp_open_list(const std::string &title, const std::string &url, app::Feedback &feedback)
+    {
+        if (url.empty())
+        {
+            tv_refuse(feedback, false);
+            return;
+        }
+        tv_list_title_ = title;
+        page_open_ = false;
+        dp_stack_.clear();
+        dp_dialog_ = DpDialog::none;
+        tv_zone_ = TvZone::grid;
+        tv_focus_ = 0;
+        tv_tab_delay_ = -1.0f;
+        tv_scroll_.snap(0.0f);
+        tv_cards_.clear();
+        home_layout_ = false;
+        rezka::App::instance().list_async([url](rezka::Client &client) { return client.get_list_at(url); }, title);
+        feedback.play(audio::Cue::select);
+    }
+    // Another title's page over this one; Circle comes back.
+    void dp_open_title(const rezka::CatalogItem &item, app::Feedback &feedback)
+    {
+        const int index = rezka::App::instance().adopt_catalog_item(item);
+        if (index < 0 || index == page_item_)
+        {
+            tv_refuse(feedback, false);
+            return;
+        }
+        std::vector<int> stack = dp_stack_;
+        stack.push_back(page_item_);
+        open_page(index, false, feedback);
+        dp_stack_ = std::move(stack);
+    }
+
+    void dp_update_dialog(const InputFrame &input, app::Feedback &feedback)
+    {
+        const PageModel &m = page_model_;
+        if (input.is_pressed(Action::back) || (dp_dialog_ != DpDialog::links && (input.is_pressed(Action::confirm) || input.nav == Direction::left)))
+        {
+            dp_dialog_ = DpDialog::none;
+            feedback.play(audio::Cue::modal_close);
+            return;
+        }
+        if (dp_dialog_ == DpDialog::links)
+        {
+            const int count = static_cast<int>(dp_link_names(dp_dialog_list_).size());
+            if (input.nav == Direction::up || input.nav == Direction::down)
+            {
+                const int next = dp_dialog_focus_ + (input.nav == Direction::down ? 1 : -1);
+                if (next < 0 || next >= count)
+                    tv_refuse(feedback, input.nav_repeat);
+                else
+                {
+                    dp_dialog_focus_ = next;
+                    tv_tick(feedback, kWidth * 0.5f);
+                }
+            }
+            if (input.is_pressed(Action::confirm) && dp_dialog_focus_ < count)
+                dp_open_list(dp_link_names(dp_dialog_list_)[static_cast<std::size_t>(dp_dialog_focus_)],
+                             dp_link_url(dp_dialog_list_, dp_dialog_focus_), feedback);
+            return;
+        }
+        // The other dialogs scroll, 150 px a press as the app's description does
+        (void)m;
+        if (input.nav == Direction::down)
+            dp_dialog_scroll_.target = std::min(dp_dialog_scroll_.target + 150.0f, std::max(0.0f, dp_dialog_content_ - dp_dialog_view_));
+        else if (input.nav == Direction::up)
+            dp_dialog_scroll_.target = std::max(0.0f, dp_dialog_scroll_.target - 150.0f);
+    }
+
+    void dp_update(const InputFrame &input, app::Feedback &feedback)
+    {
+        if (dp_dialog_ != DpDialog::none)
+        {
+            dp_update_dialog(input, feedback);
+            return;
+        }
+        if (comments_open_)
+        {
+            cm_update(input, feedback);
+            return;
+        }
+        if (input.is_pressed(Action::back))
+        {
+            if (!dp_stack_.empty())
+            {
+                const int index = dp_stack_.back();
+                std::vector<int> stack(dp_stack_.begin(), dp_stack_.end() - 1);
+                open_page(index, false, feedback);
+                dp_stack_ = std::move(stack);
+            }
+            else
+                page_open_ = false;
+            feedback.play(audio::Cue::back);
+            return;
+        }
+        const DpLayout L = dp_layout();
+        const int rows = static_cast<int>(L.rows.size());
+        if (rows == 0)
+            return;
+        dp_row_ = std::clamp(dp_row_, 0, rows - 1);
+        dp_cols_.resize(static_cast<std::size_t>(rows), -1);
+        const DpRow &row = L.rows[static_cast<std::size_t>(dp_row_)];
+        dp_col_ = std::clamp(dp_col_, 0, std::max(0, static_cast<int>(row.items.size()) - 1));
+        const DpItem here = row.items[static_cast<std::size_t>(dp_col_)];
+
+        if (input.nav == Direction::left || input.nav == Direction::right)
+        {
+            // Along the row; a link row that wrapped is still one run of chips
+            const int next = dp_col_ + (input.nav == Direction::right ? 1 : -1);
+            if (next < 0 || next >= static_cast<int>(row.items.size()))
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                dp_col_ = next;
+                dp_lift_ = 0.0f;
+                tv_tick(feedback, row.items[static_cast<std::size_t>(next)].r.cx());
+            }
+        }
+        else if (input.nav == Direction::up || input.nav == Direction::down)
+        {
+            const int next = dp_row_ + (input.nav == Direction::down ? 1 : -1);
+            if (next < 0 || next >= rows)
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                dp_cols_[static_cast<std::size_t>(dp_row_)] = dp_col_;
+                const DpRow &to = L.rows[static_cast<std::size_t>(next)];
+                int col = dp_cols_[static_cast<std::size_t>(next)];
+                if (col < 0 || col >= static_cast<int>(to.items.size()))
+                {
+                    // A row not visited yet: the item nearest on screen
+                    const float from_x = here.r.cx() - dp_row_offset(row, dp_col_);
+                    float best = 1e9f;
+                    col = 0;
+                    for (int i = 0; i < static_cast<int>(to.items.size()); ++i)
+                    {
+                        const float d = std::fabs(to.items[static_cast<std::size_t>(i)].r.cx() - from_x);
+                        if (d < best)
+                            best = d, col = i;
+                    }
+                    if (to.scrolls)
+                        col = 0;
+                }
+                dp_row_ = next;
+                dp_col_ = col;
+                dp_lift_ = 0.0f;
+                tv_tick(feedback, to.items[static_cast<std::size_t>(col)].r.cx());
+            }
+        }
+        if (!input.is_pressed(Action::confirm))
+            return;
+        const PageModel &m = page_model_;
+        switch (here.what)
+        {
+        case DpWhat::poster:
+            dp_open_dialog(DpDialog::image, feedback);
+            break;
+        case DpWhat::watch:
+            if (m.pending || !m.loaded)
+                tv_refuse(feedback, false);
+            else
+                wd_open(false, feedback);
+            break;
+        case DpWhat::resume:
+            if (m.has_resume)
+            {
+                const rezka::ContinueEntry &e = m.resume;
+                translator_idx_ = e.translator_idx;
+                quality_idx_ = e.quality_idx;
+                season_idx_ = e.season_idx;
+                episode_idx_ = e.episode_idx;
+                feedback.play(audio::Cue::select);
+                rezka::App::instance().play_title_async(page_item_, translator_idx_, quality_idx_, season_idx_,
+                                                        episode_idx_, e.t);
+            }
+            break;
+        case DpWhat::bookmark:
+            toggle_bookmark(feedback);
+            break;
+        case DpWhat::stats:
+            dp_open_dialog(DpDialog::stats, feedback);
+            break;
+        case DpWhat::qr:
+            open_qr(m.url, m.title, feedback);
+            break;
+        case DpWhat::chip:
+            if (here.a == 5)
+                dp_open_list(m.year, m.year_url, feedback);
+            else if (here.a == 6)
+                cm_open(feedback);
+            else
+                feedback.play(audio::Cue::select);
+            break;
+        case DpWhat::link:
+            dp_open_list(dp_link_names(here.a)[static_cast<std::size_t>(here.b)], dp_link_url(here.a, here.b), feedback);
+            break;
+        case DpWhat::link_all:
+            dp_dialog_list_ = here.a;
+            dp_open_dialog(DpDialog::links, feedback);
+            break;
+        case DpWhat::desc:
+            if (dp_desc_more_)
+            {
+                dp_dialog_title_ = "Описание";
+                dp_dialog_text_ = m.description;
+                dp_open_dialog(DpDialog::text, feedback);
+            }
+            break;
+        case DpWhat::trailer:
+            // The app hands the address to YouTube; a console hands it to a phone.
+            open_qr("https://www.youtube.com/watch?v=" + m.trailer_id, "Трейлер на YouTube", feedback);
+            break;
+        case DpWhat::cast:
+            if (here.a < static_cast<int>(m.cast.size()))
+                open_filmography(m.cast[static_cast<std::size_t>(here.a)].url, m.cast[static_cast<std::size_t>(here.a)].name, feedback);
+            break;
+        case DpWhat::schedule:
+            dp_open_dialog(DpDialog::schedule, feedback);
+            break;
+        case DpWhat::franchise:
+            if (here.a < static_cast<int>(m.franchises.size()) && !m.franchises[static_cast<std::size_t>(here.a)].current)
+            {
+                rezka::CatalogItem item;
+                item.url = m.franchises[static_cast<std::size_t>(here.a)].url;
+                item.title = m.franchises[static_cast<std::size_t>(here.a)].title;
+                dp_open_title(item, feedback);
+            }
+            break;
+        case DpWhat::related:
+            if (here.a < static_cast<int>(m.related.size()))
+                dp_open_title(m.related[static_cast<std::size_t>(here.a)], feedback);
+            break;
+        }
+    }
+
+    void dp_animate(float dt)
+    {
+        dp_lift_ += (1.0f - dp_lift_) * std::min(1.0f, dt * 14.0f);
+        dp_dialog_in_.target = dp_dialog_ != DpDialog::none ? 1.0f : 0.0f;
+        dp_dialog_in_.update(dt, omega(16.0f));
+        dp_dialog_scroll_.update(dt, omega(14.0f));
+        if (!page_open_)
+            return;
+        const DpLayout L = dp_layout();
+        if (L.rows.empty())
+            return;
+        dp_row_ = std::clamp(dp_row_, 0, static_cast<int>(L.rows.size()) - 1);
+        const DpRow &row = L.rows[static_cast<std::size_t>(dp_row_)];
+        const DpItem *item = dp_focused(L);
+        // The hero keeps itself whole on screen; below it the focus rests 30% down.
+        float target = 0.0f;
+        if (item && !row.hero)
+            target = std::clamp(item->r.y - 0.3f * kHeight, 0.0f, std::max(0.0f, L.bottom - kHeight));
+        dp_scroll_.target = target;
+        dp_scroll_.update(dt, omega(12.0f));
+        dp_row_x_.resize(L.rows.size());
+        for (std::size_t i = 0; i < L.rows.size(); ++i)
+        {
+            const int col = static_cast<int>(i) == dp_row_ ? dp_col_ : (i < dp_cols_.size() ? std::max(0, dp_cols_[i]) : 0);
+            dp_row_x_[i].target = dp_row_offset(L.rows[i], col);
+            dp_row_x_[i].update(dt, omega(12.0f));
+        }
+    }
+
+    // ---- drawing -----------------------------------------------------------
+
+    // A tv-material Surface: the plate, and the colour its content takes.
+    // `lift` is how far the focus has arrived on it (0 without it).
+    Color dp_surface(gfx::DrawList &list, const Rect &r, float radius, float lift, float scale, Color rest_fill,
+                     Color rest_content, float rest_border = 0.0f, Color border = {}, float focus_border = 0.0f,
+                     Color focus_fill = tv_on_surface(), Color focus_content = tv_inverse_on_surface()) const
+    {
+        const Rect grown = scaled(r, 1.0f + (scale - 1.0f) * lift);
+        const Color fill = mix(rest_fill, focus_fill, lift);
+        const float width = rest_border + (focus_border - rest_border) * lift;
+        if (width > 0.05f)
+            list.bordered_rect(grown, radius, fill, width, border);
+        else if (fill.a > 0.004f)
+            list.rounded_rect(grown, radius, fill);
+        return mix(rest_content, focus_content, lift);
+    }
+    // An image cropped to fill r, as ContentScale.Crop does, from the photo cache.
+    bool dp_photo(gfx::DrawList &list, const std::string &url, const Rect &r, float radius, Color tint = kWhite,
+                  float aspect = 2.0f / 3.0f) const
+    {
+        const std::uint32_t texture = url.empty() ? 0 : rezka::App::instance().photo_texture(url);
+        if (texture == 0)
+            return false;
+        const float want = r.w / r.h;
+        Rect uv = gfx::kFullUv;
+        if (want > aspect)
+            uv = {0.0f, (1.0f - aspect / want) * 0.5f, 1.0f, aspect / want};
+        else
+            uv = {(1.0f - want / aspect) * 0.5f, 0.0f, want / aspect, 1.0f};
+        list.image(texture, r, uv, tint, radius);
+        return true;
+    }
+    void dp_heading(gfx::DrawList &list, const char *text, float y) const
+    {
+        tv_text(list, tv_regular(), text, kDpLeft, y + 16.0f * kTvDp, 22.0f * kTvDp, 28.0f * kTvDp, tv_on_surface());
+    }
+    // A bold label and its value on one 18 sp line (Слоган, Дата выхода).
+    void dp_fact(gfx::DrawList &list, const char *label, const std::string &value, float y) const
+    {
+        const float size = 18.0f * kTvDp;
+        const float x = kDpLeft + tv_text(list, tv_medium(), label, kDpLeft, y + 8.0f * kTvDp, size, 22.0f * kTvDp,
+                                          tv_on_surface());
+        tv_text(list, tv_regular(), tv_regular().font->fit(value, size, kDpWide - (x - kDpLeft) - 8.0f * kTvDp),
+                x + 8.0f, y + 8.0f * kTvDp, size, 22.0f * kTvDp, tv_on_surface().with_alpha(0.8f));
+    }
+
+    void dp_draw_item(gfx::DrawList &list, const DpItem &item, float lift) const
+    {
+        const PageModel &m = page_model_;
+        const float dp = kTvDp;
+        const Rect &r = item.r;
+        switch (item.what)
+        {
+        case DpWhat::poster:
+        {
+            const Rect grown = scaled(r, 1.0f + 0.1f * lift);
+            if (!dp_photo(list, m.cover, grown, 12.0f * dp))
+            {
+                const std::uint32_t cover = item_cover(page_item_);
+                if (cover != 0)
+                    list.image(cover, grown, cover_uv(grown), kWhite, 12.0f * dp);
+                else
+                    list.rounded_rect(grown, 12.0f * dp, tv_surface_variant());
+            }
+            if (lift > 0.01f)
+                list.bordered_rect(grown, 12.0f * dp, kClear, 2.0f * dp, tv_border().with_alpha(lift));
+            break;
+        }
+        case DpWhat::watch:
+        {
+            // The one filled button: primary at rest, the focus turns it light
+            const Color content = dp_surface(list, r, r.h * 0.5f, lift, 1.1f,
+                                             m.pending ? tv_surface_variant().with_alpha(0.4f) : tv_primary(),
+                                             m.pending ? tv_on_surface().with_alpha(0.4f) : tv_on_primary());
+            const Rect g = scaled(r, 1.0f + 0.1f * lift);
+            tv_icon(list, m.pending ? kTvIconAccessTime : kTvIconPlayArrow, g.x + 16.0f * dp, g.cy() - 10.0f * dp, 20.0f * dp, content);
+            tv_text(list, tv_medium(), m.pending ? "Ожидается" : "Смотреть", g.x + 44.0f * dp, g.cy() - 10.0f * dp,
+                    14.0f * dp, 20.0f * dp, content, gfx::Align::left, 0.1f * dp);
+            break;
+        }
+        case DpWhat::resume:
+        {
+            const Color content = dp_surface(list, r, r.h * 0.5f, lift, 1.1f, kClear, tv_on_surface().with_alpha(0.8f),
+                                             1.5f * dp, mix(tv_on_surface_variant().with_alpha(0.4f), tv_on_surface_variant(), lift),
+                                             1.65f * dp);
+            tv_text(list, tv_medium(), "Продолжить *", r.cx(), r.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp, content,
+                    gfx::Align::center, 0.1f * dp);
+            break;
+        }
+        case DpWhat::bookmark:
+        case DpWhat::stats:
+        case DpWhat::qr:
+        {
+            const Color content = dp_surface(list, r, r.h * 0.5f, lift, 1.1f, kClear, tv_on_surface(), 2.0f * dp,
+                                             mix(tv_on_surface_variant().with_alpha(0.4f), tv_on_surface(), lift), 2.0f * dp);
+            const int icon = item.what == DpWhat::qr ? kTvIconQrCode2 : item.what == DpWhat::stats ? kTvIconStackedBarChart
+                             : rezka::App::instance().is_favorite(m.url) ? kTvIconBookmark : kTvIconBookmarkBorder;
+            tv_icon(list, icon, r.cx() - 10.0f * dp, r.cy() - 10.0f * dp, 20.0f * dp, content);
+            break;
+        }
+        case DpWhat::chip:
+        {
+            std::string value, votes;
+            const char *label = "";
+            Color color;
+            dp_chip_text(item.a, value, votes, label, color);
+            const Color content = dp_surface(list, r, 12.0f * dp, lift, 1.1f, tv_surface(), tv_on_surface());
+            const Rect g = scaled(r, 1.0f + 0.1f * lift);
+            float top = tv_medium().measure(value, 24.0f * dp);
+            if (!votes.empty())
+                top += 4.0f * dp + tv_regular().measure(votes, 12.0f * dp);
+            float x = g.cx() - top * 0.5f;
+            x += tv_text(list, tv_medium(), value, x, g.cy() - 23.0f * dp, 24.0f * dp, 24.0f * dp, mix(color, content, lift));
+            if (!votes.empty())
+                tv_text(list, tv_regular(), votes, x + 4.0f * dp, g.cy() - 13.0f * dp, 12.0f * dp, 14.0f * dp,
+                        content.with_alpha(0.6f));
+            tv_text(list, tv_regular(), label, g.cx(), g.cy() + 9.0f * dp, 14.0f * dp, 14.0f * dp, content.with_alpha(0.6f),
+                    gfx::Align::center);
+            break;
+        }
+        case DpWhat::link:
+        {
+            const Color content = dp_surface(list, r, 8.0f * dp, lift, 1.0f, kClear, tv_on_surface_variant(), 1.0f * dp,
+                                             tv_border().with_alpha(1.0f - lift), 0.0f);
+            tv_text(list, tv_regular(), dp_link_names(item.a)[static_cast<std::size_t>(item.b)], r.x + 16.0f * dp,
+                    r.y + 8.0f * dp, 18.0f * dp, 22.0f * dp, content);
+            break;
+        }
+        case DpWhat::link_all:
+        {
+            const Color content = dp_surface(list, r, 12.0f * dp, lift, 1.0f, tv_surface(), tv_on_surface());
+            const float size = 18.0f * dp;
+            const std::string label = dp_link_label(item.a);
+            const std::string hint = "Нажмите, чтобы развернуть";
+            const std::vector<std::string> lines =
+                tv_regular().font->wrap(label + " " + dp_joined(item.a) + hint, size, r.w - 32.0f * dp);
+            float y = r.y + 16.0f * dp;
+            for (std::size_t i = 0; i < lines.size(); ++i, y += 22.0f * dp)
+            {
+                std::string line = lines[i];
+                float x = r.x + 16.0f * dp;
+                if (i == 0 && line.rfind(label, 0) == 0)
+                {
+                    x += tv_text(list, tv_medium(), label, x, y, size, 22.0f * dp, content);
+                    line.erase(0, label.size());
+                }
+                // The hint closes the sentence in the accent colour
+                const std::size_t at = i + 1 == lines.size() ? line.rfind(hint) : std::string::npos;
+                if (at != std::string::npos)
+                {
+                    x += tv_text(list, tv_regular(), line.substr(0, at), x, y, size, 22.0f * dp, content.with_alpha(0.8f));
+                    tv_text(list, tv_medium(), hint, x, y, size, 22.0f * dp, mix(tv_primary(), tv_inverse_primary(), lift));
+                }
+                else
+                    tv_text(list, tv_regular(), line, x, y, size, 22.0f * dp, content.with_alpha(0.8f));
+            }
+            break;
+        }
+        case DpWhat::desc:
+        {
+            const Color content = dp_surface(list, r, 16.0f * dp, lift, 1.05f, tv_surface(), tv_on_surface(), 1.0f * dp,
+                                             tv_border().with_alpha(1.0f - lift), 0.0f);
+            const Rect g = scaled(r, 1.0f + 0.05f * lift);
+            float y = g.y + 12.0f * dp;
+            for (std::size_t i = 0; i < dp_desc_lines_.size(); ++i, y += 24.0f * dp)
+            {
+                const float w = tv_text(list, tv_regular(), dp_desc_lines_[i], g.x + 16.0f * dp, y, 16.0f * dp, 24.0f * dp,
+                                        content, gfx::Align::left, 0.5f * dp * 0.0f);
+                if (dp_desc_more_ && i + 1 == dp_desc_lines_.size())
+                {
+                    const float x = g.x + 16.0f * dp + w;
+                    const float dots = tv_text(list, tv_regular(), "… ", x, y, 16.0f * dp, 24.0f * dp, content);
+                    tv_text(list, tv_medium(), "Нажмите, чтобы развернуть", x + dots, y, 16.0f * dp, 24.0f * dp,
+                            mix(tv_primary(), tv_inverse_primary(), lift));
+                }
+            }
+            break;
+        }
+        case DpWhat::trailer:
+        {
+            const Rect g = scaled(r, 1.0f + 0.05f * lift);
+            if (!dp_photo(list, "https://img.youtube.com/vi/" + m.trailer_id + "/hqdefault.jpg", g, 16.0f * dp, kWhite, 4.0f / 3.0f))
+                list.rounded_rect(g, 16.0f * dp, tv_surface_variant());
+            list.gradient_rect(g, 16.0f * dp, tv_surface().with_alpha(0.5f), tv_surface().with_alpha(0.0f));
+            if (tv_youtube_ != 0)
+                list.image(tv_youtube_, {g.cx() - 32.0f * dp, g.cy() - 32.0f * dp, 64.0f * dp, 64.0f * dp}, gfx::kFullUv, kWhite);
+            list.bordered_rect(g, 16.0f * dp, kClear, (1.0f + lift) * dp, tv_border());
+            break;
+        }
+        case DpWhat::cast:
+        case DpWhat::related:
+        {
+            const Rect grown = scaled(r, 1.0f + 0.1f * lift);
+            const bool cast = item.what == DpWhat::cast;
+            const std::size_t i = static_cast<std::size_t>(item.a);
+            const std::string &url = cast ? m.cast[i].photo : m.related[i].cover_url;
+            if (!dp_photo(list, url, grown, 8.0f * dp * (1.0f + 0.1f * lift)))
+                list.rounded_rect(grown, 8.0f * dp, tv_surface_variant());
+            if (lift > 0.01f)
+                list.bordered_rect(grown, 8.0f * dp * 1.1f, kClear, 3.0f * dp, tv_border().with_alpha(lift));
+            float y = r.y + r.h + 12.0f * dp;
+            if (cast)
+            {
+                // The name and the job are centred under the photo
+                for (int k = 0; k < 2; ++k, y += 14.0f * dp)
+                    if (!dp_cast_names_[i * 2 + static_cast<std::size_t>(k)].empty())
+                        tv_text(list, tv_medium(), dp_cast_names_[i * 2 + static_cast<std::size_t>(k)], r.cx(), y, 14.0f * dp,
+                                14.0f * dp, tv_on_surface(), gfx::Align::center);
+                if (!m.cast[i].job.empty())
+                    tv_text(list, tv_regular(), tv_regular().font->fit(m.cast[i].job, 12.0f * dp, r.w), r.cx(), y + 4.0f * dp,
+                            12.0f * dp, 12.0f * dp, tv_on_surface().with_alpha(0.6f), gfx::Align::center);
+            }
+            else
+            {
+                for (int k = 0; k < 2; ++k, y += 14.0f * dp)
+                    if (!dp_related_lines_[i * 4 + static_cast<std::size_t>(k)].empty())
+                        tv_text(list, tv_medium(), dp_related_lines_[i * 4 + static_cast<std::size_t>(k)], r.x, y, 14.0f * dp,
+                                14.0f * dp, tv_on_surface());
+                y += 4.0f * dp;
+                for (int k = 2; k < 4; ++k, y += 12.0f * dp)
+                    if (!dp_related_lines_[i * 4 + static_cast<std::size_t>(k)].empty())
+                        tv_text(list, tv_regular(), dp_related_lines_[i * 4 + static_cast<std::size_t>(k)], r.x, y, 12.0f * dp,
+                                12.0f * dp, tv_on_surface().with_alpha(0.6f));
+            }
+            break;
+        }
+        case DpWhat::schedule:
+        {
+            const Color content = dp_surface(list, r, 12.0f * dp, lift, 1.0f, tv_surface(), tv_on_surface());
+            float y = r.y + 16.0f * dp;
+            const std::vector<rezka::ScheduleRow> &rows = m.schedule.front().rows;
+            for (std::size_t i = 0; i < rows.size() && i < 5; ++i, y += 52.0f * dp)
+                dp_schedule_row(list, rows[i], r.x + 16.0f * dp, y, r.w - 32.0f * dp, content);
+            y += 8.0f * dp;
+            const Color accent = mix(tv_primary(), tv_inverse_primary(), lift);
+            tv_icon(list, kTvIconCalendarMonth, r.x + 16.0f * dp, y, 20.0f * dp, accent);
+            tv_text(list, tv_medium(), "Нажмите \"ОК\", чтобы посмотреть полное расписание", r.x + 52.0f * dp, y, 14.0f * dp,
+                    20.0f * dp, accent, gfx::Align::left, 0.1f * dp);
+            break;
+        }
+        case DpWhat::franchise:
+        {
+            const rezka::FranchisePart &part = m.franchises[static_cast<std::size_t>(item.a)];
+            const Color content = dp_surface(list, r, 8.0f * dp, lift, 1.0f,
+                                             part.current ? tv_secondary_container().with_alpha(0.4f) : kClear,
+                                             part.current ? tv_on_secondary_container() : tv_on_surface());
+            const float number_w = tv_text(list, tv_medium(), std::to_string(part.number), r.x + 16.0f * dp, r.cy() - 14.0f * dp,
+                                           22.0f * dp, 28.0f * dp, content);
+            const float x = r.x + 16.0f * dp + std::max(number_w, 24.0f * dp) + 16.0f * dp;
+            tv_text(list, tv_medium(), part.year, x, r.y + 12.0f * dp, 12.0f * dp, 16.0f * dp, content.with_alpha(0.8f), gfx::Align::left,
+                    0.5f * dp);
+            tv_text(list, tv_medium(), tv_medium().font->fit(part.title, 16.0f * dp, r.w - (x - r.x) - 96.0f * dp), x,
+                    r.y + 30.0f * dp, 16.0f * dp, 20.0f * dp, content, gfx::Align::left, 0.2f * dp);
+            if (part.rating > 0.0f)
+            {
+                char text[16];
+                std::snprintf(text, sizeof(text), "%.2f", part.rating);
+                std::string value = text;
+                if (value.size() > 3 && value.back() == '0')
+                    value.pop_back();
+                const Color color = mix(tv_rating_color(part.rating), content, lift);
+                tv_icon(list, kTvIconStarRate, r.x + r.w - 16.0f * dp - 18.0f * dp, r.cy() - 9.0f * dp, 18.0f * dp, color);
+                tv_text(list, tv_medium(), value, r.x + r.w - 16.0f * dp - 20.0f * dp, r.cy() - 10.0f * dp, 16.0f * dp, 20.0f * dp,
+                        color, gfx::Align::right);
+            }
+            break;
+        }
+        }
+    }
+
+    // An episode of the schedule: whether it is out, its titles, its number and date.
+    void dp_schedule_row(gfx::DrawList &list, const rezka::ScheduleRow &row, float x, float y, float w, Color content) const
+    {
+        const float dp = kTvDp;
+        tv_icon(list, row.exists ? kTvIconCheck : kTvIconSchedule, x, y + 12.0f * dp, 20.0f * dp, content);
+        const float text_w = w - 36.0f * dp - 200.0f * dp;
+        tv_text(list, tv_medium(), tv_medium().font->fit(row.title, 16.0f * dp, text_w), x + 36.0f * dp, y, 16.0f * dp, 20.0f * dp,
+                content, gfx::Align::left, 0.2f * dp);
+        tv_text(list, tv_regular(), tv_regular().font->fit(row.subtitle, 14.0f * dp, text_w), x + 36.0f * dp, y + 24.0f * dp,
+                14.0f * dp, 20.0f * dp, content.with_alpha(0.6f));
+        tv_text(list, tv_medium(), row.episode, x + w, y + 6.0f * dp, 12.0f * dp, 16.0f * dp, content, gfx::Align::right, 0.5f * dp);
+        tv_text(list, tv_medium(), row.date, x + w, y + 22.0f * dp, 12.0f * dp, 16.0f * dp, content, gfx::Align::right, 0.5f * dp);
+    }
+
+    void dp_draw(gfx::DrawList &list) const
+    {
+        const float shown = page_.value;
+        if (shown < 0.004f)
+            return;
+        const PageModel &m = page_model_;
+        const float dp = kTvDp;
+        const DpLayout L = dp_layout();
+        list.push_opacity(tween::clamp01(shown * 1.4f));
+        list.rounded_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, tv_surface());
+        list.push_clip({0.0f, 0.0f, kWidth, kHeight});
+        list.push_transform(1.0f, 0.0f, 0.0f, 0.0f, -dp_scroll_.value);
+
+        // The backdrop: the large poster from 200 dp in, under the app's two
+        // scrims (the surface from the left up to 450 px, gone by 1000; and
+        // rising from 600 px down to the hero's bottom edge).
+        const Rect hero{kDpEdge, kDpEdge, kWidth - 2.0f * kDpEdge, kDpHeroH};
+        const Rect art{hero.x + 200.0f * dp, hero.y, hero.w - 200.0f * dp, hero.h};
+        if (!dp_photo(list, m.full_cover, art, 0.0f) && !dp_photo(list, m.cover, art, 0.0f))
+        {
+            const std::uint32_t cover = item_cover(page_item_);
+            if (cover != 0)
+            {
+                const float h = (2.0f / 3.0f) / (art.w / art.h);
+                list.image(cover, art, {0.0f, (1.0f - h) * 0.5f, 1.0f, h}, kWhite);
+            }
+        }
+        list.rounded_rect({hero.x, hero.y, 450.0f, hero.h}, 0.0f, tv_surface());
+        list.gradient_rect_h({hero.x + 450.0f, hero.y, 550.0f, hero.h}, 0.0f, tv_surface(), tv_surface().with_alpha(0.0f));
+        list.gradient_rect({hero.x, hero.y + 600.0f, hero.w, hero.h - 600.0f + 1.0f}, 0.0f, tv_surface().with_alpha(0.0f), tv_surface());
+
+        // What is not focusable
+        if (m.blocked)
+        {
+            tv_icon(list, kTvIconBlock, kDpLeft, L.buttons_y + 8.0f * dp, 24.0f * dp, tv_on_surface());
+            tv_text(list, tv_regular(), "Видео недоступно в вашем регионе", kDpLeft + 32.0f * dp, L.buttons_y + 8.0f * dp, 16.0f * dp,
+                    24.0f * dp, tv_on_surface(), gfx::Align::left, 0.5f * dp);
+        }
+        if (L.resume_y > 0.0f)
+        {
+            // "* Продолжить смотреть сезон 1 серия 2 (voice) с 12:34", as much of it as is known
+            const rezka::ContinueEntry &e = m.resume;
+            char when[24];
+            const int t = static_cast<int>(e.t);
+            if (t >= 3600)
+                std::snprintf(when, sizeof(when), "%d:%02d:%02d", t / 3600, (t / 60) % 60, t % 60);
+            else
+                std::snprintf(when, sizeof(when), "%02d:%02d", t / 60, t % 60);
+            std::string line = "* Продолжить смотреть ";
+            if (m.is_series)
+                line += "сезон " + std::to_string(e.season_idx + 1) + " серия " + std::to_string(e.episode_idx + 1) + " ";
+            if (!m.resume_voice.empty())
+                line += m.is_series ? "(" + m.resume_voice + ") " : m.resume_voice + " ";
+            line += std::string("с ") + when;
+            tv_text(list, tv_regular(), line, kDpLeft, L.resume_y, 12.0f * dp, 16.0f * dp, tv_on_surface(), gfx::Align::left, 0.2f * dp);
+        }
+        float y = L.title_y;
+        for (const std::string &line : dp_title_lines_)
+        {
+            tv_text(list, tv_regular(), line, kDpLeft, y, 36.0f * dp, 44.0f * dp, tv_on_surface());
+            y += 44.0f * dp;
+        }
+        if (L.original_y > 0.0f)
+            tv_text(list, tv_regular(), tv_regular().font->fit(m.original, 22.0f * dp, kDpWide), kDpLeft, L.original_y, 22.0f * dp,
+                    28.0f * dp, tv_on_surface().with_alpha(0.6f));
+        if (L.tagline_y > 0.0f)
+            dp_fact(list, "Слоган:", m.slogan, L.tagline_y);
+        if (L.date_y > 0.0f)
+            dp_fact(list, "Дата выхода:", m.release_date, L.date_y);
+        for (int i = 0; i < 4; ++i)
+            if (L.link_y[i] > 0.0f && static_cast<int>(dp_link_names(i).size()) <= (i < 2 ? 5 : i == 2 ? 1 : 2))
+                tv_text(list, tv_medium(), dp_link_label(i), kDpLeft, L.link_y[i] + 12.0f * dp, 18.0f * dp, 22.0f * dp, tv_on_surface());
+        dp_heading(list, "Описание", L.desc_y);
+        if (!m.trailer_id.empty())
+            tv_text(list, tv_regular(), "Трейлер", kDpLeft + kDpTileW + 20.0f * dp, L.desc_y + 16.0f * dp, 22.0f * dp, 28.0f * dp,
+                    tv_on_surface());
+        if (L.cast_y > 0.0f)
+            dp_heading(list, "Актерский состав и съемочная группа", L.cast_y);
+        if (L.schedule_y > 0.0f)
+            dp_heading(list, "Расписание выхода серий", L.schedule_y);
+        if (L.franchise_y > 0.0f)
+            dp_heading(list, m.franchise_title.empty() ? "Все части франшизы" : m.franchise_title.c_str(), L.franchise_y);
+        if (L.related_y > 0.0f)
+            dp_heading(list, "Смотрите также", L.related_y);
+
+        // The rows, the focused item last in its row so that it lies over its neighbours
+        const int focus_row = dp_dialog_ == DpDialog::none && !comments_open_ ? std::clamp(dp_row_, 0, static_cast<int>(L.rows.size()) - 1) : -1;
+        for (int i = 0; i < static_cast<int>(L.rows.size()); ++i)
+        {
+            const DpRow &row = L.rows[static_cast<std::size_t>(i)];
+            const float offset = static_cast<std::size_t>(i) < dp_row_x_.size() ? dp_row_x_[static_cast<std::size_t>(i)].value : 0.0f;
+            const int focus = i == focus_row ? std::clamp(dp_col_, 0, static_cast<int>(row.items.size()) - 1) : -1;
+            list.push_transform(1.0f, 0.0f, 0.0f, -offset, 0.0f);
+            for (int k = 0; k < static_cast<int>(row.items.size()); ++k)
+                if (k != focus)
+                    dp_draw_item(list, row.items[static_cast<std::size_t>(k)], 0.0f);
+            if (focus >= 0)
+                dp_draw_item(list, row.items[static_cast<std::size_t>(focus)], dp_lift_);
+            list.pop_transform();
+        }
+        list.pop_transform();
+        list.pop_clip();
+        list.pop_opacity();
+    }
+
+    // The dialogs' common shell: the app's Card (28 dp corners, the surface,
+    // a 1 dp outline) over the dimmed page, with a title.
+    Rect dp_card(gfx::DrawList &list, float w, float h, const std::string &title, bool centred_title = false) const
+    {
+        const float dp = kTvDp;
+        const Rect card{(kWidth - w) * 0.5f, (kHeight - h) * 0.5f, w, h};
+        list.rounded_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, kBlack.with_alpha(0.6f));
+        list.bordered_rect(card, 28.0f * dp, tv_surface(), 1.0f * dp, tv_border_variant());
+        if (!title.empty())
+            tv_text(list, tv_regular(), tv_regular().font->fit(title, 22.0f * dp, w - 40.0f * dp),
+                    centred_title ? card.cx() : card.x + 20.0f * dp, card.y + 20.0f * dp, 22.0f * dp, 28.0f * dp, tv_on_surface(),
+                    centred_title ? gfx::Align::center : gfx::Align::left);
+        return card;
+    }
+
+    void dp_draw_dialog(gfx::DrawList &list) const
+    {
+        const float shown = dp_dialog_in_.value;
+        if (shown < 0.01f || dp_dialog_ == DpDialog::none)
+            return;
+        const PageModel &m = page_model_;
+        const float dp = kTvDp;
+        list.push_opacity(tween::clamp01(shown));
+        if (dp_dialog_ == DpDialog::image)
+        {
+            // The poster whole, over a dimmed copy of itself
+            list.rounded_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, tv_surface());
+            const std::string &url = m.full_cover.empty() ? m.cover : m.full_cover;
+            dp_photo(list, url, {0.0f, 0.0f, kWidth, kHeight}, 0.0f, kWhite.with_alpha(0.25f));
+            const float h = kHeight - 48.0f * dp;
+            dp_photo(list, url, {(kWidth - h * 2.0f / 3.0f) * 0.5f, 24.0f * dp, h * 2.0f / 3.0f, h}, 12.0f * dp);
+        }
+        else if (dp_dialog_ == DpDialog::text)
+        {
+            const float w = 640.0f * dp, h = kHeight - 48.0f * dp;
+            const Rect card = dp_card(list, w, h, dp_dialog_title_);
+            const std::vector<std::string> lines = tv_regular().font->wrap(dp_dialog_text_, 16.0f * dp, w - 80.0f * dp);
+            const Rect view{card.x, card.y + 64.0f * dp, w, h - 84.0f * dp};
+            dp_dialog_view_ = view.h;
+            dp_dialog_content_ = static_cast<float>(lines.size()) * 24.0f * dp + 40.0f * dp;
+            list.push_clip(view);
+            float y = view.y + 20.0f * dp - dp_dialog_scroll_.value;
+            for (const std::string &line : lines)
+            {
+                if (y > view.y - 48.0f && y < view.y + view.h)
+                    tv_text(list, tv_regular(), line, card.x + 40.0f * dp, y, 16.0f * dp, 24.0f * dp, tv_on_surface());
+                y += 24.0f * dp;
+            }
+            list.pop_clip();
+        }
+        else if (dp_dialog_ == DpDialog::stats)
+        {
+            const float w = 480.0f * dp;
+            const float h = std::min(kHeight - 48.0f * dp, (84.0f + static_cast<float>(m.voice_stats.size()) * 44.0f) * dp);
+            const Rect card = dp_card(list, w, h, "Статистика выбора озвучек");
+            const Rect view{card.x, card.y + 64.0f * dp, w, h - 80.0f * dp};
+            dp_dialog_view_ = view.h;
+            dp_dialog_content_ = static_cast<float>(m.voice_stats.size()) * 44.0f * dp;
+            list.push_clip(view);
+            float y = view.y - dp_dialog_scroll_.value;
+            for (const rezka::VoiceStat &stat : m.voice_stats)
+            {
+                char percent[16];
+                std::snprintf(percent, sizeof(percent), "%.2f%%", stat.percent);
+                tv_text(list, tv_regular(), tv_regular().font->fit(stat.title, 14.0f * dp, w - 130.0f * dp), card.x + 20.0f * dp, y,
+                        14.0f * dp, 20.0f * dp, tv_on_surface());
+                tv_text(list, tv_medium(), percent, card.x + w - 20.0f * dp, y, 14.0f * dp, 20.0f * dp, tv_on_surface(), gfx::Align::right);
+                const Rect track{card.x + 20.0f * dp, y + 26.0f * dp, w - 40.0f * dp, 4.0f * dp};
+                list.rounded_rect(track, 2.0f * dp, tv_surface_variant());
+                list.rounded_rect({track.x, track.y, std::max(4.0f * dp, track.w * stat.percent / 100.0f), track.h}, 2.0f * dp, tv_primary());
+                y += 44.0f * dp;
+            }
+            list.pop_clip();
+        }
+        else if (dp_dialog_ == DpDialog::schedule)
+        {
+            const float w = 640.0f * dp, h = kHeight - 48.0f * dp;
+            const Rect card = dp_card(list, w, h, "Расписание выхода серий");
+            const Rect view{card.x, card.y + 64.0f * dp, w, h - 84.0f * dp};
+            dp_dialog_view_ = view.h;
+            list.push_clip(view);
+            float y = view.y - dp_dialog_scroll_.value;
+            for (const rezka::ScheduleSeason &season : m.schedule)
+            {
+                tv_text(list, tv_medium(), tv_medium().font->fit(season.title, 16.0f * dp, w - 40.0f * dp), card.x + 20.0f * dp, y + 12.0f * dp,
+                        16.0f * dp, 20.0f * dp, tv_primary(), gfx::Align::left, 0.2f * dp);
+                y += 44.0f * dp;
+                for (const rezka::ScheduleRow &row : season.rows)
+                {
+                    if (y > view.y - 60.0f * dp && y < view.y + view.h)
+                        dp_schedule_row(list, row, card.x + 36.0f * dp, y, w - 72.0f * dp, tv_on_surface());
+                    y += 52.0f * dp;
+                }
+            }
+            dp_dialog_content_ = y + dp_dialog_scroll_.value - view.y;
+            list.pop_clip();
+        }
+        else if (dp_dialog_ == DpDialog::links)
+        {
+            const std::vector<std::string> &names = dp_link_names(dp_dialog_list_);
+            std::string title = dp_link_label(dp_dialog_list_);
+            if (!title.empty() && title.back() == ':')
+                title.pop_back();
+            const float w = 480.0f * dp;
+            const float item_h = 48.0f * dp;
+            const float h = std::min(kHeight - 48.0f * dp, (84.0f * dp) + static_cast<float>(names.size()) * (item_h + 4.0f * dp));
+            const Rect card = dp_card(list, w, h, title);
+            const Rect view{card.x, card.y + 64.0f * dp, w, h - 80.0f * dp};
+            const float focus_y = static_cast<float>(dp_dialog_focus_) * (item_h + 4.0f * dp);
+            const float scroll = std::clamp(focus_y - view.h * 0.4f, 0.0f,
+                                            std::max(0.0f, static_cast<float>(names.size()) * (item_h + 4.0f * dp) - view.h));
+            list.push_clip(view);
+            for (int i = 0; i < static_cast<int>(names.size()); ++i)
+            {
+                const Rect r{card.x + 20.0f * dp, view.y + static_cast<float>(i) * (item_h + 4.0f * dp) - scroll, w - 40.0f * dp, item_h};
+                const bool focused = i == dp_dialog_focus_;
+                if (focused)
+                    list.rounded_rect(r, 8.0f * dp, tv_on_surface());
+                tv_text(list, tv_medium(), tv_medium().font->fit(names[static_cast<std::size_t>(i)], 14.0f * dp, r.w - 32.0f * dp),
+                        r.x + 16.0f * dp, r.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp, focused ? tv_inverse_on_surface() : tv_on_surface(),
+                        gfx::Align::left, 0.1f * dp);
+            }
+            list.pop_clip();
+        }
+        list.pop_opacity();
+    }
+
+    // ---- the watch dialogs ---------------------------------------------------
+    //
+    // The app's SelectVoice(AndEpisode)Dialog: one card, 48 dp in from the
+    // sides, with a flow of chips a section (Выберите озвучку / сезон /
+    // серию), a hint and the Смотреть button; OK on a chip selects it, OK on
+    // the selected chip moves on to the next choice. Then SelectVideoQuality:
+    // a list of the qualities.
+
+    struct WdItem
+    {
+        int section = 0; // 0 voice, 1 season, 2 episode, 3 the Смотреть button
+        int index = 0;
+        Rect r{}; // in the card's scrolling content; the button's is on the card
+    };
+    struct WdLayout
+    {
+        std::vector<WdItem> items;
+        float header_y[3] = {-1.0f, -1.0f, -1.0f};
+        float content_h = 0.0f;
+        float view_h = 0.0f;
+        Rect card{};
+        bool hint = false;
+    };
+
+    void wd_open(bool, app::Feedback &feedback)
+    {
+        dialog_open_ = true;
+        wd_quality_ = false;
+        wd_focus_section_ = -1; // settled by the first layout
+        wd_scroll_.snap(0.0f);
+        feedback.play(audio::Cue::modal_open);
+    }
+    int wd_selected(int section) const
+    {
+        return section == 0 ? translator_idx_ : section == 1 ? season_idx_ : episode_idx_;
+    }
+    std::vector<std::string> wd_qualities() const
+    {
+        std::vector<std::string> names;
+        auto &app = rezka::App::instance();
+        std::lock_guard<std::mutex> lock(app.catalog_mutex);
+        if (page_item_ >= 0 && page_item_ < static_cast<int>(app.movies.size()))
+            for (const rezka::StreamQuality &q : app.movies[static_cast<std::size_t>(page_item_)].streams)
+                names.push_back(q.quality);
+        if (names.empty())
+            names = {"1080p Ultra", "1080p", "720p", "480p", "360p"};
+        return names;
+    }
+    // The chips' labels by section, from the title's details.
+    void wd_labels(std::vector<std::string> out[3], std::vector<int> &premium) const
+    {
+        auto &app = rezka::App::instance();
+        std::lock_guard<std::mutex> lock(app.catalog_mutex);
+        if (page_item_ < 0 || page_item_ >= static_cast<int>(app.movies.size()))
+            return;
+        const rezka::VideoDetails &d = app.movies[static_cast<std::size_t>(page_item_)].details;
+        if (d.translators.size() > 1 || (d.translators.size() == 1 && !d.translators[0].name.empty()))
+            for (const rezka::Translator &t : d.translators)
+            {
+                out[0].push_back(t.name);
+                premium.push_back(t.is_premium ? 1 : 0);
+            }
+        if (!d.is_series)
+            return;
+        for (const rezka::Season &s : d.seasons)
+            out[1].push_back("Сезон " + s.id);
+        if (!d.seasons.empty())
+        {
+            const rezka::Season &season = d.seasons[static_cast<std::size_t>(std::clamp(season_idx_, 0, static_cast<int>(d.seasons.size()) - 1))];
+            for (const rezka::Episode &e : season.episodes)
+                out[2].push_back("Серия " + e.id);
+        }
+    }
+    WdLayout wd_layout(const std::vector<std::string> labels[3]) const
+    {
+        const float dp = kTvDp;
+        WdLayout L;
+        const float card_w = kWidth - 96.0f * dp;
+        const float inner_w = card_w - 32.0f * dp - 4.0f * dp;
+        float y = 0.0f;
+        int choices = 0;
+        for (int s = 0; s < 3; ++s)
+        {
+            if (labels[s].empty())
+                continue;
+            choices = std::max(choices, static_cast<int>(labels[s].size()));
+            if (y > 0.0f)
+                y += 12.0f * dp;
+            L.header_y[s] = y;
+            y += (24.0f + 20.0f + 8.0f + 12.0f + 2.0f) * dp;
+            float x = 0.0f;
+            for (int i = 0; i < static_cast<int>(labels[s].size()); ++i)
+            {
+                const float w = tv_medium().measure(labels[s][static_cast<std::size_t>(i)], 16.0f * dp, 0.5f * dp) + 32.0f * dp;
+                if (x + w > inner_w && x > 0.0f)
+                {
+                    x = 0.0f;
+                    y += 48.0f * dp;
+                }
+                L.items.push_back({s, i, {x, y, w, 40.0f * dp}});
+                x += w + 8.0f * dp;
+            }
+            y += 42.0f * dp;
+        }
+        L.content_h = y;
+        L.hint = choices > 1;
+        const float foot = (L.hint ? 36.0f : 0.0f) * dp + 72.0f * dp;
+        const float max_view = kHeight - 48.0f * dp - foot;
+        L.view_h = std::min(L.content_h, max_view);
+        const float card_h = L.view_h + foot;
+        L.card = {48.0f * dp, (kHeight - card_h) * 0.5f, card_w, card_h};
+        L.items.push_back({3, 0, {L.card.x + 16.0f * dp, L.card.y + card_h - 56.0f * dp, card_w - 32.0f * dp, 40.0f * dp}});
+        return L;
+    }
+    int wd_find(const WdLayout &L, int section, int index) const
+    {
+        for (int i = 0; i < static_cast<int>(L.items.size()); ++i)
+            if (L.items[static_cast<std::size_t>(i)].section == section && (section == 3 || L.items[static_cast<std::size_t>(i)].index == index))
+                return i;
+        return static_cast<int>(L.items.size()) - 1;
+    }
+
+    void wd_update(const InputFrame &input, app::Feedback &feedback)
+    {
+        if (wd_quality_)
+        {
+            const std::vector<std::string> names = wd_qualities();
+            const int count = static_cast<int>(names.size());
+            if (input.is_pressed(Action::back) || input.nav == Direction::left)
+            {
+                wd_quality_ = false;
+                feedback.play(audio::Cue::back);
+            }
+            else if (input.nav == Direction::up || input.nav == Direction::down)
+            {
+                const int next = wd_quality_focus_ + (input.nav == Direction::down ? 1 : -1);
+                if (next < 0 || next >= count)
+                    tv_refuse(feedback, input.nav_repeat);
+                else
+                {
+                    wd_quality_focus_ = next;
+                    tv_tick(feedback, kWidth * 0.5f);
+                }
+            }
+            else if (input.is_pressed(Action::confirm))
+            {
+                quality_idx_ = std::clamp(wd_quality_focus_, 0, count - 1);
+                dialog_open_ = false;
+                wd_quality_ = false;
+                start_watch(feedback);
+            }
+            return;
+        }
+        std::vector<std::string> labels[3];
+        std::vector<int> premium;
+        wd_labels(labels, premium);
+        const WdLayout L = wd_layout(labels);
+        if (wd_focus_section_ < 0)
+        {
+            // The app starts on the selected voice, else season, else episode, else the button
+            wd_focus_section_ = 3;
+            for (int s = 0; s < 3; ++s)
+                if (labels[s].size() > 1)
+                {
+                    wd_focus_section_ = s;
+                    break;
+                }
+            wd_focus_index_ = wd_focus_section_ < 3 ? std::clamp(wd_selected(wd_focus_section_), 0, static_cast<int>(labels[wd_focus_section_].size()) - 1) : 0;
+        }
+        int at = wd_find(L, wd_focus_section_, wd_focus_index_);
+        const WdItem here = L.items[static_cast<std::size_t>(at)];
+        if (input.is_pressed(Action::back))
+        {
+            dialog_open_ = false;
+            feedback.play(audio::Cue::modal_close);
+            return;
+        }
+        // The button's place among the chips, for moving up and down
+        const auto place = [&L](const WdItem &item) {
+            Rect r = item.r;
+            if (item.section == 3)
+                r.y = L.content_h + 100.0f, r.x = 0.0f;
+            return r;
+        };
+        int next = at;
+        if (input.nav == Direction::left && at > 0 && L.items[static_cast<std::size_t>(at - 1)].r.y == here.r.y && here.section != 3)
+            next = at - 1;
+        else if (input.nav == Direction::right && at + 1 < static_cast<int>(L.items.size()) &&
+                 L.items[static_cast<std::size_t>(at + 1)].r.y == here.r.y && L.items[static_cast<std::size_t>(at + 1)].section != 3)
+            next = at + 1;
+        else if (input.nav == Direction::up || input.nav == Direction::down)
+        {
+            const Rect from = place(here);
+            const float sign = input.nav == Direction::down ? 1.0f : -1.0f;
+            float best_dy = 1e9f, best_dx = 1e9f;
+            for (int i = 0; i < static_cast<int>(L.items.size()); ++i)
+            {
+                const Rect r = place(L.items[static_cast<std::size_t>(i)]);
+                const float dy = (r.y - from.y) * sign;
+                if (dy < 1.0f)
+                    continue;
+                const float dx = std::fabs(r.x - from.x);
+                if (dy < best_dy - 1.0f || (std::fabs(dy - best_dy) <= 1.0f && dx < best_dx))
+                    best_dy = dy, best_dx = dx, next = i;
+            }
+        }
+        if (input.nav != Direction::none)
+        {
+            if (next == at)
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                wd_focus_section_ = L.items[static_cast<std::size_t>(next)].section;
+                wd_focus_index_ = L.items[static_cast<std::size_t>(next)].index;
+                tv_tick(feedback, kWidth * 0.5f);
+            }
+            return;
+        }
+        if (!input.is_pressed(Action::confirm))
+            return;
+        if (here.section == 3)
+        {
+            // The qualities next, as the app asks by default
+            wd_quality_ = true;
+            wd_quality_focus_ = 0;
+            feedback.play(audio::Cue::select);
+            return;
+        }
+        if (wd_selected(here.section) != here.index)
+        {
+            if (here.section == 0)
+                translator_idx_ = here.index;
+            else if (here.section == 1)
+            {
+                season_idx_ = here.index;
+                episode_idx_ = 0;
+            }
+            else
+                episode_idx_ = here.index;
+            feedback.play(audio::Cue::select);
+            return;
+        }
+        // The selected chip again: on to the next choice, or to the button
+        int to = 3;
+        for (int s = here.section + 1; s < 3; ++s)
+            if (!labels[s].empty())
+            {
+                to = s;
+                break;
+            }
+        wd_focus_section_ = to;
+        wd_focus_index_ = to < 3 ? std::clamp(wd_selected(to), 0, static_cast<int>(labels[to].size()) - 1) : 0;
+        tv_tick(feedback, kWidth * 0.5f);
+    }
+
+    void wd_animate(float dt)
+    {
+        if (!dialog_open_ || wd_quality_ || wd_focus_section_ < 0 || wd_focus_section_ == 3)
+        {
+            wd_scroll_.update(dt, omega(14.0f));
+            return;
+        }
+        std::vector<std::string> labels[3];
+        std::vector<int> premium;
+        wd_labels(labels, premium);
+        const WdLayout L = wd_layout(labels);
+        const WdItem &item = L.items[static_cast<std::size_t>(wd_find(L, wd_focus_section_, wd_focus_index_))];
+        float target = wd_scroll_.target;
+        if (item.r.y - 60.0f * kTvDp < target)
+            target = item.r.y - 60.0f * kTvDp;
+        if (item.r.y + item.r.h + 8.0f * kTvDp > target + L.view_h)
+            target = item.r.y + item.r.h + 8.0f * kTvDp - L.view_h;
+        wd_scroll_.target = std::clamp(target, 0.0f, std::max(0.0f, L.content_h - L.view_h));
+        wd_scroll_.update(dt, omega(14.0f));
+    }
+
+    void wd_draw(gfx::DrawList &list) const
+    {
+        const float shown = dialog_.value;
+        if (shown < 0.01f)
+            return;
+        const float dp = kTvDp;
+        list.push_opacity(tween::clamp01(shown));
+        list.rounded_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, kBlack.with_alpha(0.6f));
+        if (wd_quality_)
+        {
+            const std::vector<std::string> names = wd_qualities();
+            const float w = 420.0f * dp;
+            const float h = (20.0f + 28.0f + 16.0f + 20.0f) * dp + static_cast<float>(names.size()) * 52.0f * dp;
+            const Rect card{(kWidth - w) * 0.5f, (kHeight - h) * 0.5f, w, h};
+            list.bordered_rect(card, 28.0f * dp, tv_surface(), 1.0f * dp, tv_border_variant());
+            tv_text(list, tv_regular(), "Выберите качество", card.x + 20.0f * dp, card.y + 20.0f * dp, 22.0f * dp, 28.0f * dp, tv_on_surface());
+            for (int i = 0; i < static_cast<int>(names.size()); ++i)
+            {
+                const Rect r{card.x + 20.0f * dp, card.y + 64.0f * dp + static_cast<float>(i) * 52.0f * dp, w - 40.0f * dp, 48.0f * dp};
+                const bool focused = i == wd_quality_focus_;
+                if (focused)
+                    list.rounded_rect(r, 8.0f * dp, tv_on_surface());
+                tv_text(list, tv_medium(), names[static_cast<std::size_t>(i)], r.x + 16.0f * dp, r.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp,
+                        focused ? tv_inverse_on_surface() : tv_on_surface(), gfx::Align::left, 0.1f * dp);
+            }
+            list.pop_opacity();
+            return;
+        }
+        std::vector<std::string> labels[3];
+        std::vector<int> premium;
+        wd_labels(labels, premium);
+        const WdLayout L = wd_layout(labels);
+        const Rect &card = L.card;
+        list.bordered_rect(card, 28.0f * dp, tv_surface(), 1.0f * dp, tv_border_variant());
+        static const char *kHeaders[3] = {"Выберите озвучку", "Выберите сезон", "Выберите серию"};
+        const float left = card.x + 18.0f * dp;
+        const float scroll = wd_scroll_.value;
+        list.push_clip({card.x, card.y + 4.0f, card.w, L.view_h});
+        for (int s = 0; s < 3; ++s)
+            if (L.header_y[s] >= 0.0f)
+                tv_text(list, tv_medium(), kHeaders[s], left + 14.0f * dp, card.y + L.header_y[s] + 24.0f * dp - scroll, 16.0f * dp, 20.0f * dp,
+                        tv_on_surface(), gfx::Align::left, 0.2f * dp);
+        for (const WdItem &item : L.items)
+        {
+            if (item.section == 3)
+                continue;
+            const Rect r{left + item.r.x, card.y + item.r.y - scroll, item.r.w, item.r.h};
+            const bool focused = item.section == wd_focus_section_ && item.index == wd_focus_index_;
+            const bool selected = wd_selected(item.section) == item.index;
+            const bool prem = item.section == 0 && static_cast<std::size_t>(item.index) < premium.size() && premium[static_cast<std::size_t>(item.index)];
+            Color fill = kClear, content = prem ? Color::rgb(0xc8c2ea) : tv_on_surface_variant();
+            if (focused && selected)
+            {
+                fill = prem ? Color::rgb(0xe4dfff) : tv_on_primary_container();
+                content = prem ? Color::rgb(0x302d4c) : tv_on_primary();
+                list.rounded_rect(r, 8.0f * dp, fill);
+            }
+            else if (focused)
+            {
+                content = tv_inverse_on_surface();
+                list.rounded_rect(r, 8.0f * dp, tv_on_surface());
+            }
+            else if (selected)
+            {
+                content = prem ? Color::rgb(0xe4dfff) : tv_on_secondary_container();
+                list.bordered_rect(r, 8.0f * dp, (prem ? Color::rgb(0x464364) : tv_secondary_container()).with_alpha(0.4f), 2.0f * dp,
+                                   prem ? Color::rgb(0x7555a7) : tv_primary());
+            }
+            else
+                list.bordered_rect(r, 8.0f * dp, kClear, 1.0f * dp, prem ? Color::rgb(0x7555a7) : tv_border());
+            tv_text(list, tv_medium(), labels[item.section][static_cast<std::size_t>(item.index)], r.x + 16.0f * dp, r.y + 8.0f * dp,
+                    16.0f * dp, 24.0f * dp, content, gfx::Align::left, 0.5f * dp);
+        }
+        list.pop_clip();
+        float y = card.y + L.view_h;
+        if (L.hint)
+        {
+            tv_icon(list, kTvIconInfoOutlined, card.x + 16.0f * dp, y + 16.0f * dp, 20.0f * dp, tv_on_surface());
+            tv_text(list, tv_medium(),
+                    labels[1].empty() ? "Нажмите еще раз по уже выбранной озвучке, чтобы сразу перейти к кнопке \"Смотреть\""
+                                      : "Нажмите еще раз по уже выбранному элементу, чтобы сразу перейти к следующему выбору",
+                    card.x + 44.0f * dp, y + 18.0f * dp, 12.0f * dp, 16.0f * dp, tv_on_surface(), gfx::Align::left, 0.5f * dp);
+        }
+        const WdItem &button = L.items.back();
+        const bool focused = wd_focus_section_ == 3;
+        const Rect r = scaled(button.r, focused ? 1.02f : 1.0f);
+        list.rounded_rect(r, r.h * 0.5f, focused ? tv_on_surface() : tv_surface_variant().with_alpha(0.8f));
+        const Color content = focused ? tv_inverse_on_surface() : tv_on_surface().with_alpha(0.8f);
+        const float text_w = tv_medium().measure("Смотреть", 14.0f * dp, 0.1f * dp);
+        const float x = r.cx() - (28.0f * dp + text_w) * 0.5f;
+        tv_icon(list, kTvIconPlayArrow, x, r.cy() - 10.0f * dp, 20.0f * dp, content);
+        tv_text(list, tv_medium(), "Смотреть", x + 28.0f * dp, r.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp, content, gfx::Align::left, 0.1f * dp);
+        list.pop_opacity();
+    }
+
+    // ---- the comments: HDrezkaTV's Comments screen ---------------------------
+    //
+    // A full screen over the title's page: "Комментарии (N) • title", then a
+    // column of plates, a reply 20 dp further in a level: the avatar in a
+    // circle, the author, up to ten lines of text, the date and the likes.
+
+    struct CmItem
+    {
+        std::vector<std::string> lines; // the text as shown, ten lines at most
+        bool more = false;              // ... of a longer one: OK shows it whole
+        float y = 0.0f;
+        float h = 0.0f;
+    };
+
+    void cm_open(app::Feedback &feedback)
+    {
+        if (page_model_.post_id.empty())
+        {
+            tv_refuse(feedback, false);
+            return;
+        }
+        comments_open_ = true;
+        cm_focus_ = 0;
+        cm_scroll_.snap(0.0f);
+        cm_revealed_.clear();
+        cm_version_ = ~0u;
+        rezka::App::instance().load_comments_async(page_model_.post_id, false);
+        feedback.play(audio::Cue::open);
+    }
+    static float cm_text_width(int indent)
+    {
+        return kWidth - 2.0f * 48.0f * kTvDp - static_cast<float>(indent) * 20.0f * kTvDp - (16.0f + 60.0f + 16.0f + 16.0f) * kTvDp -
+               (indent > 0 ? 17.0f * kTvDp : 0.0f);
+    }
+    // Wraps the comments again when the list or what is revealed has changed.
+    void cm_rebuild()
+    {
+        auto &app = rezka::App::instance();
+        const std::uint32_t version = app.comments_version.load();
+        if (version == cm_version_)
+            return;
+        cm_version_ = version;
+        {
+            std::lock_guard<std::mutex> lock(app.catalog_mutex);
+            cm_list_ = app.comments;
+            cm_has_next_ = app.comments_has_next;
+        }
+        cm_items_.assign(cm_list_.size(), CmItem{});
+        float y = 0.0f;
+        const float dp = kTvDp;
+        for (std::size_t i = 0; i < cm_list_.size(); ++i)
+        {
+            const rezka::Comment &c = cm_list_[i];
+            CmItem &item = cm_items_[i];
+            app.request_photo(c.avatar);
+            if (c.spoiler && !cm_revealed_.count(c.id))
+                item.lines = {"Этот комментарий может содержать спойлеры!", "Нажмите \"Ок\", чтобы показать."};
+            else
+            {
+                const float width = cm_text_width(c.indent);
+                std::size_t start = 0;
+                while (start <= c.text.size())
+                {
+                    std::size_t end = c.text.find('\n', start);
+                    if (end == std::string::npos)
+                        end = c.text.size();
+                    for (std::string &line : tv_regular().font->wrap(c.text.substr(start, end - start), 14.0f * dp, width))
+                        item.lines.push_back(std::move(line));
+                    start = end + 1;
+                }
+                if (item.lines.size() > 10)
+                {
+                    item.lines.resize(10);
+                    item.more = true;
+                }
+            }
+            item.y = y;
+            item.h = 32.0f * dp + std::max(60.0f * dp, 20.0f * dp + 8.0f * dp + static_cast<float>(item.lines.size()) * 20.0f * dp + 8.0f * dp + 16.0f * dp);
+            y += item.h + 8.0f * dp;
+        }
+        cm_focus_ = std::clamp(cm_focus_, 0, std::max(0, static_cast<int>(cm_items_.size()) - 1));
+    }
+    void cm_update(const InputFrame &input, app::Feedback &feedback)
+    {
+        cm_rebuild();
+        const int count = static_cast<int>(cm_items_.size());
+        if (input.is_pressed(Action::back))
+        {
+            comments_open_ = false;
+            feedback.play(audio::Cue::back);
+            return;
+        }
+        if (input.nav == Direction::up || input.nav == Direction::down)
+        {
+            const int next = cm_focus_ + (input.nav == Direction::down ? 1 : -1);
+            if (next < 0 || next >= count)
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                cm_focus_ = next;
+                tv_tick(feedback, kWidth * 0.5f);
+            }
+            if (cm_has_next_ && cm_focus_ + 6 >= count)
+                rezka::App::instance().load_comments_async(page_model_.post_id, true);
+        }
+        if (input.is_pressed(Action::confirm) && cm_focus_ < count)
+        {
+            const rezka::Comment &c = cm_list_[static_cast<std::size_t>(cm_focus_)];
+            if (c.spoiler && !cm_revealed_.count(c.id))
+            {
+                cm_revealed_.insert(c.id);
+                cm_version_ = ~0u;
+                feedback.play(audio::Cue::select);
+            }
+            else if (cm_items_[static_cast<std::size_t>(cm_focus_)].more)
+            {
+                dp_dialog_title_ = c.author;
+                dp_dialog_text_ = c.text;
+                dp_open_dialog(DpDialog::text, feedback);
+            }
+        }
+    }
+    void cm_animate(float dt)
+    {
+        comments_in_.target = comments_open_ && page_open_ ? 1.0f : 0.0f;
+        comments_in_.update(dt, omega(14.0f));
+        if (!comments_open_)
+            return;
+        cm_rebuild();
+        if (!cm_items_.empty())
+        {
+            const CmItem &item = cm_items_[static_cast<std::size_t>(cm_focus_)];
+            const float view = kHeight - 72.0f * kTvDp;
+            const float total = cm_items_.back().y + cm_items_.back().h + 48.0f * kTvDp;
+            cm_scroll_.target = std::clamp(item.y + 24.0f * kTvDp - 0.3f * view, 0.0f, std::max(0.0f, total - view));
+        }
+        cm_scroll_.update(dt, omega(12.0f));
+    }
+    void cm_draw(gfx::DrawList &list) const
+    {
+        const float shown = comments_in_.value;
+        if (shown < 0.01f)
+            return;
+        const float dp = kTvDp;
+        const PageModel &m = page_model_;
+        list.push_opacity(tween::clamp01(shown));
+        list.rounded_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, tv_surface());
+        const std::string head = "Комментарии (" + std::to_string(m.comments_count) + ") • ";
+        const float head_w = tv_text(list, tv_regular(), head, 48.0f * dp, 24.0f * dp, 24.0f * dp, 32.0f * dp, tv_on_surface());
+        tv_text(list, tv_medium(), tv_medium().font->fit(m.title, 16.0f * dp, kWidth - 96.0f * dp - head_w), 48.0f * dp + head_w, 30.0f * dp,
+                16.0f * dp, 24.0f * dp, tv_on_surface());
+        const float top = 72.0f * dp;
+        list.push_clip({0.0f, top, kWidth, kHeight - top});
+        if (cm_items_.empty())
+        {
+            const bool loading = rezka::App::instance().comments_loading;
+            if (loading)
+                for (int i = 0; i < 3; ++i)
+                    list.bordered_rect({48.0f * dp, top + 24.0f * dp + static_cast<float>(i) * 168.0f * dp, kWidth - 96.0f * dp, 160.0f * dp}, 12.0f * dp,
+                                       tv_surface_variant().with_alpha(0.25f + 0.1f * std::sin(clock_ * 3.0f)), 1.0f * dp, tv_border_variant());
+            else
+                tv_text(list, tv_regular(), "Комментариев пока нет", kWidth * 0.5f, kHeight * 0.45f, 22.0f * dp, 28.0f * dp, tv_on_surface(),
+                        gfx::Align::center);
+        }
+        for (std::size_t i = 0; i < cm_items_.size(); ++i)
+        {
+            const CmItem &item = cm_items_[i];
+            const rezka::Comment &c = cm_list_[i];
+            const float y = top + 24.0f * dp + item.y - cm_scroll_.value;
+            if (y + item.h < top || y > kHeight)
+                continue;
+            const bool focused = static_cast<int>(i) == cm_focus_ && dp_dialog_ == DpDialog::none;
+            const float indent = static_cast<float>(c.indent) * 20.0f * dp;
+            const Rect r{48.0f * dp + indent, y, kWidth - 96.0f * dp - indent, item.h};
+            if (focused)
+                list.rounded_rect(r, 12.0f * dp, tv_on_surface());
+            const Color content = focused ? tv_inverse_on_surface() : tv_on_surface();
+            const Color accent = focused ? tv_inverse_primary() : tv_primary();
+            float x = r.x + 16.0f * dp;
+            if (c.indent > 0)
+            {
+                list.rounded_rect({x, r.y + 16.0f * dp, 1.0f * dp, r.h - 32.0f * dp}, 0.0f, content);
+                x += 17.0f * dp;
+            }
+            list.circle(x + 30.0f * dp, r.y + 46.0f * dp, 30.0f * dp, tv_secondary_container());
+            dp_photo(list, c.avatar, {x + 1.0f * dp, r.y + 17.0f * dp, 58.0f * dp, 58.0f * dp}, 29.0f * dp, kWhite, 1.0f);
+            x += 76.0f * dp;
+            float line_y = r.y + 16.0f * dp;
+            tv_text(list, tv_medium(), c.author, x, line_y, 16.0f * dp, 20.0f * dp, c.admin ? accent : content, gfx::Align::left, 0.2f * dp);
+            line_y += 28.0f * dp;
+            const bool hidden = c.spoiler && !cm_revealed_.count(c.id);
+            for (std::size_t k = 0; k < item.lines.size(); ++k, line_y += 20.0f * dp)
+            {
+                const bool last = item.more && k + 1 == item.lines.size();
+                const Color color = hidden ? (focused ? Color::rgb(0x690005) : tv_error()) : content;
+                const ui::FontRef &font = hidden && k == 1 ? tv_medium() : tv_regular();
+                if (last)
+                {
+                    // The tenth line gives way to the app's hint
+                    const char *hint = "… Нажмите \"ОК\", чтобы показать полный текст";
+                    const float room = cm_text_width(c.indent) - tv_medium().measure(hint, 14.0f * dp);
+                    const float w = tv_text(list, tv_regular(), tv_regular().font->fit(item.lines[k], 14.0f * dp, std::max(60.0f, room)), x,
+                                            line_y, 14.0f * dp, 20.0f * dp, content, gfx::Align::left, 0.2f * dp);
+                    tv_text(list, tv_medium(), hint, x + w, line_y, 14.0f * dp, 20.0f * dp, accent);
+                }
+                else
+                    tv_text(list, font, item.lines[k], x, line_y, 14.0f * dp, 20.0f * dp, color, gfx::Align::left, 0.2f * dp);
+            }
+            const float foot = r.y + r.h - 32.0f * dp;
+            tv_text(list, tv_medium(), c.date, x, foot, 11.0f * dp, 16.0f * dp, content, gfx::Align::left, 0.5f * dp);
+            const std::string likes = std::to_string(c.likes);
+            const float likes_w = tv_medium().measure(likes, 11.0f * dp, 0.5f * dp);
+            tv_text(list, tv_medium(), likes, r.x + r.w - 16.0f * dp, foot, 11.0f * dp, 16.0f * dp, content, gfx::Align::right, 0.5f * dp);
+            tv_icon(list, kTvIconThumbUpAltOutlined, r.x + r.w - 16.0f * dp - likes_w - 18.0f * dp, foot + 1.0f * dp, 14.0f * dp, content);
+        }
+        list.pop_clip();
+        list.pop_opacity();
     }
 
     void update_home(const InputFrame &input, app::Feedback &feedback)
@@ -3383,10 +5492,7 @@ class Store final : public app::Concept
                 m.url = movie.url;
                 m.title = d.name.empty() ? movie.title : d.name;
                 m.original = d.original_name;
-                if (!movie.details_loaded)
-                    m.description = "Загрузка…";
-                else
-                    m.description = d.description.empty() ? "Описание недоступно." : d.description;
+                m.description = d.description;
                 m.slogan = d.slogan;
                 m.release_date = d.release_date;
                 m.year = d.year;
@@ -3401,6 +5507,21 @@ class Store final : public app::Concept
                 m.hdrezka = d.rating_hdrezka;
                 m.has_trailer = d.has_trailer;
                 m.trailer_id = d.trailer_id;
+                m.loaded = movie.details_loaded;
+                m.is_series = d.is_series;
+                m.blocked = d.blocked;
+                m.post_id = d.id;
+                m.cover = d.cover_url.empty() ? movie.cover_url : d.cover_url;
+                m.full_cover = d.full_cover_url;
+                m.year_url = d.year_url;
+                m.country_urls = d.country_urls;
+                m.genre_urls = d.genre_urls;
+                m.comments_count = d.comments_count;
+                m.franchise_title = d.franchise_title;
+                m.franchises = d.franchises;
+                m.related = d.related;
+                m.schedule = d.schedule;
+                m.voice_stats = d.voice_stats;
             m.cast = d.people;
                 voices = d.translators;
             }
@@ -3422,6 +5543,7 @@ class Store final : public app::Concept
             m.description_lines = static_cast<int>(
                 context_.fonts.regular.font->wrap(m.description, 22, kPageTextW).size());
         page_model_ = m;
+        dp_prepare();
     }
 
     // Where everything sits. The buttons row is first; then the fact rows,
@@ -3547,6 +5669,17 @@ class Store final : public app::Concept
         page_ring_.snap(focus_plate(layout, page_focus_).inset(-6.0f));
         page_ring_radius_.snap(focus_radius(page_focus_) + 6.0f);
         page_scroll_.snap(0.0f);
+        // The app's page starts on the Смотреть button
+        dp_row_ = 1;
+        dp_col_ = 0;
+        dp_cols_.clear();
+        dp_lift_ = 1.0f;
+        dp_scroll_.snap(0.0f);
+        dp_row_x_.clear();
+        dp_stack_.clear();
+        dp_dialog_ = DpDialog::none;
+        comments_open_ = false;
+        dp_key_.clear();
         feedback.play(audio::Cue::open);
     }
 
@@ -4256,6 +6389,9 @@ class Store final : public app::Concept
             drift_previous_ += dt;
         }
         tv_animate(dt);
+        dp_animate(dt);
+        wd_animate(dt);
+        cm_animate(dt);
         banner_fade_.update(dt);
         banner_focus_.target = zone_ == Zone::banner ? 1.0f : 0.0f;
         banner_focus_.update(dt, 16.0f);
@@ -5997,6 +8133,65 @@ class Store final : public app::Concept
     bool tv_pill_set_ = false;
     std::uint32_t tv_icons_ = 0;
     bool tv_icons_tried_ = false;
+
+    std::string tv_list_title_;   // heads a list opened from a title's page
+    std::uint32_t tv_youtube_ = 0;
+
+    // A title's page (HDrezkaTV's MovieDetails screen).
+    int dp_row_ = 1;
+    int dp_col_ = 0;
+    std::vector<int> dp_cols_;    // the item each row was left on
+    float dp_lift_ = 1.0f;        // how far the focus has arrived
+    tween::Spring dp_scroll_;
+    std::vector<tween::Spring> dp_row_x_;
+    std::vector<int> dp_stack_;   // the titles under this one
+    std::string dp_key_;          // what the wrapped texts were made from
+    std::vector<std::string> dp_title_lines_;
+    std::vector<std::string> dp_desc_lines_;
+    bool dp_desc_more_ = false;
+    std::vector<std::string> dp_list_names_;
+    std::vector<std::string> dp_collection_names_;
+    std::vector<std::string> dp_cast_names_;    // two lines a person
+    std::vector<std::string> dp_related_lines_; // four lines a title
+    DpDialog dp_dialog_ = DpDialog::none;
+    tween::Spring dp_dialog_in_;
+    tween::Spring dp_dialog_scroll_;
+    mutable float dp_dialog_content_ = 0.0f; // measured as the dialog is drawn
+    mutable float dp_dialog_view_ = 0.0f;
+    int dp_dialog_focus_ = 0;
+    int dp_dialog_list_ = 0;
+    std::string dp_dialog_title_;
+    std::string dp_dialog_text_;
+    // The player's controls.
+    bool pl_controls_ = true;
+    float pl_timer_ = 4.0f;
+    int pl_focus_ = kPlPlay;
+    bool pl_scrub_ = false;       // the focus is on the progress line
+    float pl_fraction_ = 0.0f;    // where its preview is
+    tween::Spring pl_bar_;
+    tween::Spring pl_in_;
+    int pl_flash_icon_ = 0;       // what the last press did, shown for two seconds
+    std::string pl_flash_text_;
+    int pl_flash_side_ = 0;
+    float pl_flash_left_ = 0.0f;
+    bool pl_quality_open_ = false;
+    int pl_quality_focus_ = 0;
+    // The watch dialogs.
+    bool wd_quality_ = false;
+    int wd_quality_focus_ = 0;
+    int wd_focus_section_ = -1;
+    int wd_focus_index_ = 0;
+    tween::Spring wd_scroll_;
+    // The comments.
+    bool comments_open_ = false;
+    tween::Spring comments_in_;
+    std::vector<rezka::Comment> cm_list_;
+    std::vector<CmItem> cm_items_;
+    std::set<std::string> cm_revealed_;
+    bool cm_has_next_ = false;
+    std::uint32_t cm_version_ = ~0u;
+    int cm_focus_ = 0;
+    tween::Spring cm_scroll_;
 
     // The product page.
     bool page_open_ = false;

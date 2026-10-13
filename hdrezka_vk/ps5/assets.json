@@ -256,11 +256,25 @@
       "used_by": [
         "hdrezka"
       ],
-      "title": "Material Icons (Rounded): account_circle, search, home, new_releases, video_library, campaign, settings, check",
+      "title": "Material Icons (Rounded and Outlined): the drawer, the title page, the dialogs and the player",
       "author": "Google",
       "licence": "Apache-2.0",
       "url": "https://github.com/google/material-design-icons",
       "changes": "rasterised at 96 px, white on transparent, packed in one strip",
+      "licence_file": "licenses/Apache-2.0.txt"
+    },
+    {
+      "path": "tv/youtube.png",
+      "from": "file",
+      "source": "ps5/assets/tv/youtube.png",
+      "used_by": [
+        "hdrezka"
+      ],
+      "title": "YouTube play badge (Material Design Icons: youtube)",
+      "author": "Pictogrammers (Material Design Icons)",
+      "licence": "Apache-2.0",
+      "url": "https://pictogrammers.com/library/mdi/icon/youtube/",
+      "changes": "rasterised at 128 px in the red and white the trailer tile shows",
       "licence_file": "licenses/Apache-2.0.txt"
     }
   ]

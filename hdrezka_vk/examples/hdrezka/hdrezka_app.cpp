@@ -111,6 +111,9 @@ void App::init(vks::VulkanDevice *dev, VkQueue q, hui::gfx::VkRenderer *rend, hu
             "/download0/cookies.txt",
             "/data/homebrew/PPSA99380/data/cookies.txt",
             "/mnt/usb0/homebrew/PPSA99380/data/cookies.txt",
+#if defined(PS5_HOST_REFERENCE)
+            "cookies.txt", // the reference build: in its title folder
+#endif
         };
         for (const char *cp : writable) {
             FILE *f = fopen(cp, "ab");
@@ -476,6 +479,10 @@ static void queue_missing_posters(App *self, std::atomic<bool> &stop)
         }
         if (index < 0)
             break;
+        // One connection, one lock, and no queue at it: without this pause a
+        // title's page would wait for the whole list's posters.
+        while (self->urgent_requests > 0 && !stop)
+            usleep(20000);
         tried.insert(cover_url);
         std::vector<uint8_t> img_bytes;
         if (!self->client.http_get_binary(cover_url, img_bytes))
@@ -794,6 +801,61 @@ int App::adopt_person_film(int person_movie_idx)
 }
 
 // The address a photo is fetched from: relative paths go to the mirror.
+int App::adopt_catalog_item(const CatalogItem &item)
+{
+    if (item.url.empty())
+        return -1;
+    std::lock_guard<std::mutex> lock(catalog_mutex);
+    for (int i = 0; i < static_cast<int>(movies.size()); ++i) {
+        if (movies[static_cast<std::size_t>(i)].url == item.url)
+            return i;
+    }
+    movies.push_back(movie_from_catalog(item, ""));
+    catalog_version++;
+    return static_cast<int>(movies.size()) - 1;
+}
+
+void App::load_comments_async(const std::string &post_id, bool more)
+{
+    int page = 1;
+    {
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        if (more) {
+            if (comments_post != post_id || !comments_has_next)
+                return;
+            page = comments_page + 1;
+        } else {
+            comments.clear();
+            comments_post = post_id;
+            comments_page = 0;
+            comments_has_next = false;
+            comments_version++;
+        }
+    }
+    if (comments_loading.exchange(true))
+        return;
+    BigThread([this, post_id, page]() {
+        struct Urgent {
+            std::atomic<int> &n;
+            explicit Urgent(std::atomic<int> &count) : n(count) { ++n; }
+            ~Urgent() { --n; }
+        } urgent(urgent_requests);
+        std::vector<Comment> got;
+        bool has_next = false;
+        client.get_comments(post_id, page, got, &has_next);
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            if (comments_post == post_id) {
+                comments.insert(comments.end(), got.begin(), got.end());
+                comments_page = page;
+                comments_has_next = has_next && !got.empty();
+            }
+        }
+        comments_loading = false;
+        comments_version++;
+    }).detach();
+}
+
 static std::string photo_address(const std::string &raw, const std::string &mirror)
 {
     if (raw.empty())
@@ -942,6 +1004,11 @@ void App::load_details_async(int movie_idx)
         }
 
         write_log("[DEBUG] load_details_async start for movie_idx=%d url=%s\n", movie_idx, url.c_str());
+        struct Urgent {
+            std::atomic<int> &n;
+            explicit Urgent(std::atomic<int> &count) : n(count) { ++n; }
+            ~Urgent() { --n; }
+        } urgent(urgent_requests);
         VideoDetails det;
         if (client.get_details(url, det)) {
             if (det.is_series) {

@@ -16,6 +16,7 @@
 #endif
 
 #include "console_curl.h"
+#include <atomic>
 #include "logger.hpp"
 #include <openssl/sha.h>
 
@@ -79,6 +80,62 @@ std::string base64_decode(const std::string &in)
     return out;
 }
 
+// Named and numeric character references, as the site writes them.
+std::string decode_entities(const std::string &in)
+{
+    if (in.find('&') == std::string::npos) return in;
+    static const std::pair<const char *, const char *> kNamed[] = {
+        {"amp", "&"}, {"lt", "<"}, {"gt", ">"}, {"quot", "\""}, {"apos", "'"}, {"nbsp", " "},
+        {"laquo", "\xc2\xab"}, {"raquo", "\xc2\xbb"}, {"mdash", "\xe2\x80\x94"},
+        {"ndash", "\xe2\x80\x93"}, {"hellip", "\xe2\x80\xa6"}, {"copy", "\xc2\xa9"},
+        {"check", "\xe2\x9c\x93"}, {"bdquo", "\xe2\x80\x9e"}, {"ldquo", "\xe2\x80\x9c"},
+        {"rdquo", "\xe2\x80\x9d"}, {"lsquo", "\xe2\x80\x98"}, {"rsquo", "\xe2\x80\x99"},
+    };
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size();) {
+        const size_t semi = in[i] == '&' ? in.find(';', i) : std::string::npos;
+        if (semi == std::string::npos || semi - i > 9) {
+            out.push_back(in[i++]);
+            continue;
+        }
+        const std::string name = in.substr(i + 1, semi - i - 1);
+        std::string value;
+        if (name.size() > 1 && name[0] == '#') {
+            const bool hex = name[1] == 'x' || name[1] == 'X';
+            const unsigned long cp = std::strtoul(name.c_str() + (hex ? 2 : 1), nullptr, hex ? 16 : 10);
+            if (cp < 0x80) value.push_back(static_cast<char>(cp));
+            else if (cp < 0x800) {
+                value.push_back(static_cast<char>(0xc0 | (cp >> 6)));
+                value.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+            } else if (cp < 0x10000) {
+                value.push_back(static_cast<char>(0xe0 | (cp >> 12)));
+                value.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+                value.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+            } else {
+                value.push_back(static_cast<char>(0xf0 | (cp >> 18)));
+                value.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3f)));
+                value.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+                value.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+            }
+        } else {
+            for (const auto &entry : kNamed) {
+                if (name == entry.first) {
+                    value = entry.second;
+                    break;
+                }
+            }
+        }
+        if (value.empty()) {
+            out.push_back(in[i++]);
+            continue;
+        }
+        out += value;
+        i = semi + 1;
+    }
+    return out;
+}
+
 std::string strip_tags(const std::string &html)
 {
     std::string out;
@@ -102,11 +159,35 @@ std::string strip_tags(const std::string &html)
             prev_space = false;
         }
     }
+    clean = decode_entities(clean);
     // Trim
     size_t first = clean.find_first_not_of(' ');
     if (first == std::string::npos) return "";
     size_t last = clean.find_last_not_of(' ');
     return clean.substr(first, (last - first + 1));
+}
+
+// The text between the '>' that closes the tag at `from` and `close`.
+std::string inner_after(const std::string &html, size_t from, const char *close, size_t *end = nullptr)
+{
+    if (from == std::string::npos) return "";
+    const size_t gt = html.find('>', from);
+    if (gt == std::string::npos) return "";
+    const size_t stop = html.find(close, gt);
+    if (stop == std::string::npos) return "";
+    if (end) *end = stop;
+    return html.substr(gt + 1, stop - gt - 1);
+}
+
+// The value of attribute `name` in the tag text `tag`.
+std::string attr_of(const std::string &tag, const char *name)
+{
+    const std::string key = std::string(name) + "=\"";
+    const size_t at = tag.find(key);
+    if (at == std::string::npos) return "";
+    const size_t stop = tag.find('"', at + key.size());
+    if (stop == std::string::npos) return "";
+    return tag.substr(at + key.size(), stop - at - key.size());
 }
 
 // Lower case for ASCII and the Cyrillic letters of UTF-8 text, so that the
@@ -192,6 +273,7 @@ std::vector<RowCell> row_cells(const std::string &row)
 struct LinkRef {
     std::string text;
     std::string tail;
+    std::string href;
 };
 
 std::vector<LinkRef> links_of(const std::string &html)
@@ -209,6 +291,7 @@ std::vector<LinkRef> links_of(const std::string &html)
         if (gt == std::string::npos || end == std::string::npos) break;
         LinkRef ref;
         ref.text = strip_tags(html.substr(gt + 1, end - gt - 1));
+        ref.href = attr_of(html.substr(pos, gt - pos), "href");
         size_t tail_end = html.find('<', end + 4);
         if (tail_end == std::string::npos) tail_end = html.size();
         ref.tail = html.substr(end + 4, tail_end - (end + 4));
@@ -273,13 +356,27 @@ void Client::set_mirror(const std::string &mirror)
     }
 }
 
+// Some mirrors answer the app's own headers with a bare 403 on a title's page
+// (to those not signed in, from some countries) while a browser gets the
+// page behind the Anubis proof of work, which solve_anubis_challenge passes.
+// The first such 403 switches every later request to a browser's identity.
+static std::atomic<bool> g_browser_identity{false};
+static const char *const kBrowserAgent =
+    "Mozilla/5.0 (Linux; Android 12; BRAVIA 4K) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36";
+
 static void setup_curl_headers(CURL *curl, struct curl_slist **headers, const std::string &mirror, const std::string &cookie_file, bool is_post = false)
 {
     console_curl_setup(curl);
 
-    *headers = curl_slist_append(*headers, "User-Agent: okhttp/4.12.0");
-    *headers = curl_slist_append(*headers, "X-Hdrezka-Android-App-V2: 1");
-    *headers = curl_slist_append(*headers, "X-Hdrezka-Android-App-Version-V2: 0.9.15 \xce\xb2");
+    const bool browser = g_browser_identity.load();
+    if (browser) {
+        *headers = curl_slist_append(*headers, (std::string("User-Agent: ") + kBrowserAgent).c_str());
+    } else {
+        *headers = curl_slist_append(*headers, "User-Agent: okhttp/4.12.0");
+        *headers = curl_slist_append(*headers, "X-Hdrezka-Android-App-V2: 1");
+        *headers = curl_slist_append(*headers, "X-Hdrezka-Android-App-Version-V2: 0.9.15 \xce\xb2");
+    }
     *headers = curl_slist_append(*headers, "Accept-Language: ru-RU,ru;q=0.9,uk-UA,uk;q=0.8,en;q=0.7");
     *headers = curl_slist_append(*headers, "Accept: */*");
 
@@ -294,7 +391,7 @@ static void setup_curl_headers(CURL *curl, struct curl_slist **headers, const st
     }
 
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, *headers);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "okhttp/4.12.0");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, browser ? kBrowserAgent : "okhttp/4.12.0");
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
@@ -498,6 +595,11 @@ std::string Client::http_get(const std::string &url)
 
     if (res != CURLE_OK) return "";
 
+    if (http_code == 403 && !g_browser_identity.exchange(true)) {
+        write_log("[DEBUG] http_get 403 for the app's headers: asking as a browser from now on\n");
+        return http_get(url);
+    }
+
     // Check for Anubis challenge
     if (response.find("anubis_challenge") != std::string::npos) {
         if (solve_anubis_challenge(response, full_url)) {
@@ -562,10 +664,17 @@ std::string Client::http_post(const std::string &url, const std::map<std::string
     write_log("[DEBUG] http_post perform %s fields: %s\n", full_url.c_str(), post_data.c_str());
     write_log("[DEBUG] http_post before curl_easy_perform (post_len=%zu)\n", post_data.size());
     CURLcode res = curl_easy_perform(curl);
-    write_log("[DEBUG] http_post after curl_easy_perform rc=%d (%s) err='%s'\n",
-              (int)res, curl_easy_strerror(res), errbuf);
+    long post_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &post_code);
+    write_log("[DEBUG] http_post after curl_easy_perform rc=%d (%s) http=%ld err='%s'\n",
+              (int)res, curl_easy_strerror(res), post_code, errbuf);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
+
+    if (res == CURLE_OK && post_code == 403 && !g_browser_identity.exchange(true)) {
+        write_log("[DEBUG] http_post 403 for the app's headers: asking as a browser from now on\n");
+        return http_post(url, fields);
+    }
 
     write_log("[DEBUG] http_post done rc=%d bytes=%zu resp: %.200s\n", (int)res, response.size(), response.c_str());
 
@@ -950,6 +1059,11 @@ std::vector<CatalogItem> Client::get_movie_list(const std::string &filter, int g
         *has_next = nav && next != std::string::npos && !disabled;
     }
     return parse_catalog_html(html, "home", mirror_);
+}
+
+std::vector<CatalogItem> Client::get_list_at(const std::string &url)
+{
+    return parse_catalog_html(http_get(url), "list", mirror_);
 }
 
 Client::HomePage Client::get_home_page(const std::string &filter)
@@ -1574,16 +1688,22 @@ bool Client::get_details(const std::string &item_url, VideoDetails &out_details)
                 const std::string value = strip_tags(value_html);
 
                 if (label.find("слоган") != std::string::npos) {
-                    out_details.slogan = unquote(value);
+                    out_details.slogan = value;
                 } else if (label.find("дата выхода") != std::string::npos) {
                     out_details.release_date = value;
                     std::smatch ym;
                     std::regex date_year_re("(19|20)\\d{2}");
                     if (std::regex_search(value, ym, date_year_re)) out_details.year = ym[0].str();
+                    for (const LinkRef &ref : links_of(value_html))
+                        out_details.year_url = ref.href;
                 } else if (label.find("страна") != std::string::npos) {
                     out_details.countries = names_in(value_html);
+                    for (const LinkRef &ref : links_of(value_html))
+                        out_details.country_urls.push_back(ref.href);
                 } else if (label.find("жанр") != std::string::npos) {
                     out_details.genres = names_in(value_html);
+                    for (const LinkRef &ref : links_of(value_html))
+                        out_details.genre_urls.push_back(ref.href);
                 } else if (label.find("возраст") != std::string::npos) {
                     std::smatch am;
                     std::regex age_re("\\d+\\+");
@@ -1598,6 +1718,7 @@ bool Client::get_details(const std::string &item_url, VideoDetails &out_details)
                     for (const LinkRef &ref : links_of(value_html)) {
                         ListRef item;
                         item.title = ref.text;
+                        item.url = ref.href;
                         std::smatch pm;
                         if (std::regex_search(ref.tail, pm, place_re)) item.place = pm[1].str();
                         out_details.lists.push_back(item);
@@ -1606,6 +1727,7 @@ bool Client::get_details(const std::string &item_url, VideoDetails &out_details)
                     for (const LinkRef &ref : links_of(value_html)) {
                         ListRef item;
                         item.title = ref.text;
+                        item.url = ref.href;
                         out_details.collections.push_back(item);
                     }
                 }
@@ -1613,6 +1735,114 @@ bool Client::get_details(const std::string &item_url, VideoDetails &out_details)
         }
     }
     out_details.has_trailer = html.find("show-trailer") != std::string::npos;
+
+    // What the app's page shows besides: the large poster, the comments'
+    // count, the franchise, the schedule, the voices' statistics and the
+    // titles to watch next.
+    {
+        const size_t cover = html.find("b-sidecover");
+        if (cover != std::string::npos) {
+            const size_t a = html.find("<a ", cover);
+            const size_t img = html.find("<img", cover);
+            if (a != std::string::npos && img != std::string::npos && a < img)
+                out_details.full_cover_url = attr_of(html.substr(a, html.find('>', a) - a), "href");
+        }
+        const size_t reviews = html.find("b-sideactions__reviews");
+        if (reviews != std::string::npos) {
+            const size_t em = html.find("<em", reviews);
+            if (em != std::string::npos && em < reviews + 400)
+                out_details.comments_count = std::atoi(strip_tags(inner_after(html, em, "</em>")).c_str());
+        }
+        out_details.blocked = html.find("class=\"b-player__restricted") != std::string::npos;
+
+        const size_t ftitle = html.find("b-post__franchise_link_title");
+        if (ftitle != std::string::npos)
+            out_details.franchise_title = strip_tags(inner_after(html, ftitle, "</a>"));
+        const std::string part_mark = "b-post__partcontent_item";
+        for (size_t at = html.find(part_mark); at != std::string::npos;) {
+            const size_t next = html.find(part_mark, at + part_mark.size());
+            const size_t tag_open = html.rfind('<', at);
+            const size_t tag_close = html.find('>', at);
+            const std::string chunk = html.substr(at, (next == std::string::npos ? std::min(html.size(), at + 3000) : next) - at);
+            FranchisePart part;
+            if (tag_open != std::string::npos && tag_close != std::string::npos) {
+                const std::string tag = html.substr(tag_open, tag_close - tag_open);
+                part.url = attr_of(tag, "data-url");
+                part.current = tag.find("current") != std::string::npos;
+            }
+            const auto cell = [&chunk](const char *cls) {
+                const size_t c = chunk.find(cls);
+                return c == std::string::npos ? std::string() : strip_tags(inner_after(chunk, c, "</div>"));
+            };
+            part.number = std::max(1, std::atoi(cell("td num").c_str()));
+            part.title = cell("td title");
+            part.year = cell("td year");
+            part.rating = static_cast<float>(std::atof(cell("td rating").c_str()));
+            if (!part.title.empty())
+                out_details.franchises.push_back(part);
+            at = next;
+        }
+
+        const std::string block_mark = "class=\"b-post__schedule_block\"";
+        for (size_t at = html.find(block_mark); at != std::string::npos;) {
+            const size_t next = html.find(block_mark, at + block_mark.size());
+            const std::string block = html.substr(at, (next == std::string::npos ? html.find("b-post__rating_table", at) : next) - at);
+            ScheduleSeason season;
+            const size_t title = block.find("class=\"title\"");
+            if (title != std::string::npos)
+                season.title = strip_tags(inner_after(block, title, "</div>"));
+            for (size_t row = block.find("<tr"); row != std::string::npos; row = block.find("<tr", row + 3)) {
+                const size_t row_end = block.find("</tr>", row);
+                if (row_end == std::string::npos) break;
+                const std::string tr = block.substr(row, row_end - row);
+                if (tr.find("load-more") != std::string::npos) continue;
+                ScheduleRow r;
+                const size_t c1 = tr.find("td-1"), c2 = tr.find("td-2"), c4 = tr.find("td-4");
+                if (c1 == std::string::npos || c2 == std::string::npos) continue;
+                r.episode = strip_tags(inner_after(tr, c1, "</td>"));
+                const std::string names = inner_after(tr, c2, "</td>");
+                const size_t b = names.find("<b");
+                if (b != std::string::npos) r.title = strip_tags(inner_after(names, b, "</b>"));
+                const size_t sp = names.find("<span");
+                if (sp != std::string::npos) r.subtitle = strip_tags(inner_after(names, sp, "</span>"));
+                if (c4 != std::string::npos) r.date = strip_tags(inner_after(tr, c4, "</td>"));
+                r.exists = tr.find("exists-episode") != std::string::npos;
+                season.rows.push_back(r);
+            }
+            if (!season.rows.empty())
+                out_details.schedule.push_back(season);
+            at = next;
+        }
+
+        const size_t stats = html.find("b-rgstats__help");
+        if (stats != std::string::npos) {
+            // The tip is markup inside the attribute, with tags of its own: it
+            // runs from title=" to the quote that closes it.
+            std::string tip;
+            const size_t t0 = html.find("title=\"", stats);
+            const size_t t1 = t0 == std::string::npos ? t0 : html.find('"', t0 + 7);
+            if (t1 != std::string::npos && t0 < stats + 400)
+                tip = decode_entities(html.substr(t0 + 7, t1 - t0 - 7));
+            const std::string item_mark = "b-rgstats__list_item";
+            for (size_t at = tip.find(item_mark); at != std::string::npos; at = tip.find(item_mark, at + 1)) {
+                VoiceStat stat;
+                const size_t t = tip.find("class=\"title\"", at);
+                const size_t c = tip.find("class=\"count\"", at);
+                if (t == std::string::npos || c == std::string::npos) break;
+                stat.title = strip_tags(inner_after(tip, t, "</div>"));
+                std::string count = strip_tags(inner_after(tip, c, "</div>"));
+                for (char &ch : count)
+                    if (ch == ',') ch = '.';
+                stat.percent = static_cast<float>(std::atof(count.c_str()));
+                if (!stat.title.empty())
+                    out_details.voice_stats.push_back(stat);
+            }
+        }
+
+        const size_t side = html.find("class=\"b-sidelist\"");
+        if (side != std::string::npos)
+            out_details.related = parse_catalog_html(html.substr(side), "related", mirror_);
+    }
 
     // Year / genres from info table (best-effort).
     {
@@ -1622,12 +1852,137 @@ bool Client::get_details(const std::string &item_url, VideoDetails &out_details)
             out_details.year = ym[0].str().substr(1, 4);
     }
 
+    write_log("[DEBUG] get_details extras comments=%d franchise=%zu schedule=%zu stats=%zu related=%zu full_cover=%s\n",
+              out_details.comments_count, out_details.franchises.size(), out_details.schedule.size(),
+              out_details.voice_stats.size(), out_details.related.size(), out_details.full_cover_url.c_str());
     write_log("[DEBUG] get_details done id=%s is_series=%d favs=%s translators=%zu "
               "rating=%.1f people=%zu kp=%d imdb=%d\n",
               out_details.id.c_str(), (int)out_details.is_series, out_details.favs.c_str(),
               out_details.translators.size(), out_details.rating, out_details.people.size(),
               (int)out_details.rating_kinopoisk.valid, (int)out_details.rating_imdb.valid);
     return true;
+}
+
+// The value of a JSON string member, unescaped (\" \/ \n \uXXXX).
+static std::string json_string(const std::string &json, const char *key)
+{
+    const std::string mark = std::string("\"") + key + "\":\"";
+    const size_t at = json.find(mark);
+    if (at == std::string::npos) return "";
+    std::string out;
+    for (size_t i = at + mark.size(); i < json.size(); ++i) {
+        const char c = json[i];
+        if (c == '"') break;
+        if (c != '\\' || i + 1 >= json.size()) {
+            out.push_back(c);
+            continue;
+        }
+        const char e = json[++i];
+        if (e == 'n') out.push_back('\n');
+        else if (e == 't') out.push_back(' ');
+        else if (e == 'r') continue;
+        else if (e == 'u' && i + 4 < json.size()) {
+            unsigned long cp = std::strtoul(json.substr(i + 1, 4).c_str(), nullptr, 16);
+            i += 4;
+            if (cp >= 0xd800 && cp < 0xdc00 && i + 6 < json.size() && json[i + 1] == '\\' && json[i + 2] == 'u') {
+                const unsigned long low = std::strtoul(json.substr(i + 3, 4).c_str(), nullptr, 16);
+                cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                i += 6;
+            }
+            out += decode_entities("&#" + std::to_string(cp) + ";");
+        } else
+            out.push_back(e);
+    }
+    return out;
+}
+
+bool Client::get_comments(const std::string &post_id, int page, std::vector<Comment> &out, bool *has_next)
+{
+    out.clear();
+    if (has_next) *has_next = false;
+    if (post_id.empty()) return false;
+    const std::string json = http_get("/ajax/get_comments/?t=" + std::to_string(static_cast<long long>(time(nullptr)) * 1000) +
+                                      "&news_id=" + post_id + "&cstart=" + std::to_string(std::max(1, page)) +
+                                      "&type=0&comment_id=0&skin=hdrezka");
+    const std::string html = json_string(json, "comments");
+    const std::string nav = json_string(json, "navigation");
+    const std::string mark = "comments-tree-item";
+    for (size_t at = html.find(mark); at != std::string::npos;) {
+        const size_t next = html.find(mark, at + mark.size());
+        const size_t tag_open = html.rfind('<', at);
+        const size_t tag_close = html.find('>', at);
+        if (tag_open == std::string::npos || tag_close == std::string::npos) break;
+        const std::string tag = html.substr(tag_open, tag_close - tag_open);
+        // A reply's item is nested in its parent's: the chunk ends where the next item starts
+        const std::string chunk = html.substr(at, (next == std::string::npos ? html.size() : next) - at);
+        Comment c;
+        c.id = attr_of(tag, "data-id");
+        c.indent = std::atoi(attr_of(tag, "data-indent").c_str());
+        const size_t ava = chunk.find("class=\"ava\"");
+        if (ava != std::string::npos) {
+            const size_t img = chunk.find("<img", ava);
+            if (img != std::string::npos)
+                c.avatar = attr_of(chunk.substr(img, chunk.find('>', img) - img), "src");
+        }
+        const size_t name = chunk.find("class=\"name\"");
+        if (name != std::string::npos) c.author = strip_tags(inner_after(chunk, name, "</span>"));
+        const size_t date = chunk.find("class=\"date\"");
+        if (date != std::string::npos) {
+            c.date = strip_tags(inner_after(chunk, date, "</span>"));
+            const std::string left = "\xd0\xbe\xd1\x81\xd1\x82\xd0\xb0\xd0\xb2\xd0\xbb\xd0\xb5\xd0\xbd"; // "оставлен"
+            const size_t l = c.date.find(left);
+            if (l != std::string::npos) c.date.erase(l, left.size());
+            while (!c.date.empty() && c.date.front() == ' ') c.date.erase(0, 1);
+        }
+        const size_t likes = chunk.find("b-comment__likes_count");
+        if (likes != std::string::npos) {
+            const size_t i = chunk.find("<i", likes);
+            if (i != std::string::npos) c.likes = std::atoi(strip_tags(inner_after(chunk, i, "</i>")).c_str());
+        }
+        c.admin = chunk.find("b-comment__admin") != std::string::npos;
+        c.spoiler = chunk.find("text_spoiler") != std::string::npos;
+        const size_t text = chunk.find("class=\"text\"");
+        if (text != std::string::npos) {
+            const size_t inner = chunk.find("<div", text);
+            size_t stop = chunk.find("class=\"actions\"", text);
+            if (stop == std::string::npos) stop = chunk.find("b-comment__likes", text);
+            if (inner != std::string::npos) {
+                std::string body = chunk.substr(inner, (stop == std::string::npos ? chunk.size() : stop) - inner);
+                // Line breaks survive the tag stripping as a marker
+                for (size_t br = body.find("<br"); br != std::string::npos; br = body.find("<br", br + 1)) {
+                    const size_t gt = body.find('>', br);
+                    if (gt == std::string::npos) break;
+                    body.replace(br, gt - br + 1, " \x01 ");
+                }
+                body = strip_tags(body);
+                std::string lines;
+                for (size_t i = 0; i < body.size(); ++i) {
+                    if (body[i] != '\x01') {
+                        lines.push_back(body[i]);
+                        continue;
+                    }
+                    while (!lines.empty() && lines.back() == ' ') lines.pop_back();
+                    lines.push_back('\n');
+                    while (i + 1 < body.size() && body[i + 1] == ' ') ++i;
+                }
+                c.text = lines;
+            }
+        }
+        if (!c.author.empty() || !c.text.empty())
+            out.push_back(c);
+        at = next;
+    }
+    if (has_next && nav.find("b-navigation") != std::string::npos) {
+        const size_t next = nav.find("b-navigation__next");
+        bool disabled = false;
+        if (next != std::string::npos) {
+            const size_t no_page = nav.rfind("no-page", next);
+            disabled = no_page != std::string::npos && no_page + 160 >= next;
+        }
+        *has_next = next != std::string::npos && !disabled;
+    }
+    write_log("[DEBUG] get_comments post=%s page=%d -> %zu\n", post_id.c_str(), page, out.size());
+    return !out.empty();
 }
 
 bool Client::get_trailer(const std::string &post_id, std::string &youtube_id)

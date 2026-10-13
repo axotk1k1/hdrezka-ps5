@@ -110,6 +110,54 @@ struct ListRef
 {
     std::string title;
     std::string place;
+    std::string url;
+};
+
+// A part of the franchise a title belongs to ("Все части франшизы").
+struct FranchisePart
+{
+    int number = 1;
+    std::string title;
+    std::string year;
+    std::string url;
+    float rating = 0.0f; // 0 when the site gives none
+    bool current = false; // the title whose page this is
+};
+
+// One episode of a season's release schedule ("Расписание выхода серий").
+struct ScheduleRow
+{
+    std::string episode;  // "1 сезон 8 серия"
+    std::string title;
+    std::string subtitle; // the original title
+    std::string date;
+    bool exists = false;  // already on the site
+};
+
+struct ScheduleSeason
+{
+    std::string title;
+    std::vector<ScheduleRow> rows;
+};
+
+// How often a voice-over is chosen for the title ("Статистика выбора озвучек").
+struct VoiceStat
+{
+    std::string title;
+    float percent = 0.0f;
+};
+
+struct Comment
+{
+    std::string id;
+    int indent = 0; // the depth of a reply
+    std::string author;
+    std::string avatar;
+    std::string date;
+    std::string text; // line breaks kept as '\n'
+    int likes = 0;
+    bool spoiler = false;
+    bool admin = false;
 };
 
 struct VideoDetails
@@ -134,6 +182,17 @@ struct VideoDetails
     std::vector<Person> people;
     std::vector<ListRef> lists;
     std::vector<ListRef> collections;
+    std::string year_url;                  // the site's list of the year's titles
+    std::vector<std::string> country_urls; // beside countries, when they are links
+    std::vector<std::string> genre_urls;   // beside genres
+    std::string full_cover_url; // the large poster the page's cover links to
+    int comments_count = 0;
+    std::string franchise_title;
+    std::vector<FranchisePart> franchises;
+    std::vector<CatalogItem> related; // "Смотрите также"
+    std::vector<ScheduleSeason> schedule;
+    std::vector<VoiceStat> voice_stats;
+    bool blocked = false; // "Видео недоступно в вашем регионе"
     bool has_trailer = false;
     std::string trailer_id; // YouTube id, filled by Client::get_trailer
     bool is_series = false;
@@ -176,6 +235,10 @@ public:
                                             bool *has_next = nullptr,
                                             const std::string &prefix = "");
 
+    // The titles of any list page of the site (a genre, a country, a year,
+    // a collection), by its address.
+    std::vector<CatalogItem> get_list_at(const std::string &url);
+
     // Home discover rows: hero from newest slider + films/series/cartoons for filter.
     struct HomePage {
         std::vector<CatalogItem> hero;
@@ -195,6 +258,11 @@ public:
 
     // Get item details
     bool get_details(const std::string &item_url, VideoDetails &out_details);
+
+    // One page of a title's comments (pages count from 1), as the app reads
+    // them: /ajax/get_comments/?news_id=<post id>&cstart=<page>.
+    bool get_comments(const std::string &post_id, int page, std::vector<Comment> &out,
+                      bool *has_next = nullptr);
 
     // The YouTube id of the trailer of a title (its post id), empty when none.
     bool get_trailer(const std::string &post_id, std::string &youtube_id);

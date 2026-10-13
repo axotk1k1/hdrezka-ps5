@@ -41,6 +41,12 @@ design's; holding OPTIONS for a second ends the title.
   Material icons it needs are in `ps5/assets/`. `ps5/tools/host-reference.sh` draws
   it on a PC; `HDREZKA_HOST_KEYS="3:down,3.5:right,4:confirm"` presses buttons
   there, each at its second.
+- **A title's page** is the app's too (`dp_*`): the hero with the large poster as a
+  backdrop, the buttons, the rating and fact tiles, the link rows, the description
+  beside the trailer, the cast, the schedule, the franchise and "Смотрите также";
+  with the voice, season and episode dialog and the quality list (`wd_*`), the
+  comments screen (`cm_*`) and the player's controls (`pl_*`, in `update_player` and
+  `draw_player`).
 - **The program** around it, `examples/hdrezka/hdrezka.cpp`, owns the frame: input, sound,
   the light bar, the layers. A 3D scene goes under the screen as in the template's
   `uioverlay` sample (`kit.renderer.import_texture`).

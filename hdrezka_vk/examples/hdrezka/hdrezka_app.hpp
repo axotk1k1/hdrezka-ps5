@@ -165,6 +165,9 @@ public:
     int list_page = 0;                     // pages in movies[]; guarded by catalog_mutex
     bool list_has_next = false;            // guarded by catalog_mutex
     std::atomic<bool> list_more_loading{false};
+    // Requests the player is waiting on (a title's page, its streams) while
+    // this is above zero: the poster worker lets them have the connection.
+    std::atomic<int> urgent_requests{0};
     std::atomic<int> poster_hint{0};       // the list's posters are fetched from this index on
     void search_async(const std::string &query);
     // Fills the catalogue with what the fetch returns; genre_label names it.
@@ -179,6 +182,18 @@ public:
     std::string person_status;
     void person_async(const std::string &url, const std::string &name);
     void person_select_career(int career_idx);
+    // Inserts (or finds) a title met on another title's page (its franchise,
+    // "Смотрите также") in movies[] so its own page can open; -1 without a url.
+    int adopt_catalog_item(const CatalogItem &item);
+    // A title's comments, a page at a time (the app's Comments screen). The
+    // first page replaces the list, later ones are appended.
+    std::vector<Comment> comments;          // guarded by catalog_mutex
+    std::string comments_post;              // the post id they belong to
+    int comments_page = 0;
+    bool comments_has_next = false;
+    std::atomic<bool> comments_loading{false};
+    std::atomic<uint32_t> comments_version{0};
+    void load_comments_async(const std::string &post_id, bool more);
     // Inserts (or finds) a person film in movies[] so the product page can open it.
     int adopt_person_film(int person_movie_idx);
     // Legacy name: loads the actor page (does not replace the home catalogue).
