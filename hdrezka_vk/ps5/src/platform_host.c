@@ -150,3 +150,35 @@ keyboard_poll(char *out, size_t size)
    (void)size;
    return -1;
 }
+
+/* The reference build has no microphone. */
+bool
+mic_start_recording(void)
+{
+   return false;
+}
+
+void
+mic_stop_recording(void)
+{
+}
+
+bool
+mic_is_recording(void)
+{
+   return false;
+}
+
+size_t
+mic_get_samples(int16_t *out, size_t max_samples)
+{
+   (void)out;
+   (void)max_samples;
+   return 0;
+}
+
+int
+mic_sample_rate(void)
+{
+   return 16000;
+}

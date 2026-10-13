@@ -607,3 +607,140 @@ keyboard_poll(char *out, size_t size)
    utf16_to_utf8(ime.text, out, size);
    return 1;
 }
+
+/* The microphone (the DualSense's, or a headset's). libSceAudioIn is, like the
+ * IME dialog, not among the modules a title starts with: it is loaded when
+ * first asked for and its calls are looked up by name, so a console without it
+ * costs a false. A thread of its own reads grains of 16 kHz mono 16-bit
+ * samples into a buffer of MIC_MAX_SECONDS; mic_get_samples copies it out.
+ * The call set is the PS4/PS5 one: sceAudioInOpen(user, type, index, grain,
+ * freq, param), sceAudioInInput(port, dest) (blocks for one grain) and
+ * sceAudioInClose. "sceAudioInRead" is tried as a second name for the read. */
+#define MIC_RATE 16000
+#define MIC_GRAIN 256
+#define MIC_MAX_SECONDS 20
+#define MIC_MAX_SAMPLES (MIC_RATE * MIC_MAX_SECONDS)
+
+static struct {
+   bool looked_up, available;
+   int (*open)(int32_t user, uint32_t type, uint32_t index, uint32_t grain, uint32_t freq, uint32_t param);
+   int (*input)(int32_t port, void *dest);
+   int (*close)(int32_t port);
+   int32_t port;
+   pthread_t thread;
+   bool running_thread;
+   atomic_bool recording;
+   atomic_uint count;
+} mic = { .port = -1 };
+static int16_t mic_buffer[MIC_MAX_SAMPLES];
+
+static bool
+mic_look_up(void)
+{
+   if (mic.looked_up)
+      return mic.available;
+   mic.looked_up = true;
+   const int module = sceKernelLoadStartModule("/system/common/lib/libSceAudioIn.sprx", 0, NULL, 0, NULL, NULL);
+   if (module < 0) {
+      say("mic: no libSceAudioIn (0x%08x)", (unsigned)module);
+      return false;
+   }
+   void *open = NULL, *input = NULL, *close = NULL;
+   if (sceKernelDlsym(module, "sceAudioInOpen", &open) < 0 || !open ||
+       sceKernelDlsym(module, "sceAudioInClose", &close) < 0 || !close) {
+      say("mic: libSceAudioIn has no Open/Close");
+      return false;
+   }
+   if ((sceKernelDlsym(module, "sceAudioInInput", &input) < 0 || !input) &&
+       (sceKernelDlsym(module, "sceAudioInRead", &input) < 0 || !input)) {
+      say("mic: libSceAudioIn has no sceAudioInInput / sceAudioInRead");
+      return false;
+   }
+   mic.open = (int (*)(int32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))open;
+   mic.input = (int (*)(int32_t, void *))input;
+   mic.close = (int (*)(int32_t))close;
+   mic.available = true;
+   return true;
+}
+
+static void *
+mic_main(void *unused)
+{
+   (void)unused;
+   static int16_t grain[MIC_GRAIN] __attribute__((aligned(64)));
+   while (atomic_load(&mic.recording)) {
+      if (mic.input(mic.port, grain) < 0) {
+         say("mic: read failed");
+         break;
+      }
+      unsigned at = atomic_load(&mic.count);
+      if (at + MIC_GRAIN > MIC_MAX_SAMPLES)
+         break; /* the buffer is full: what there is, is kept */
+      memcpy(&mic_buffer[at], grain, sizeof(grain));
+      atomic_store(&mic.count, at + MIC_GRAIN);
+   }
+   atomic_store(&mic.recording, false);
+   return NULL;
+}
+
+bool
+mic_start_recording(void)
+{
+   if (mic.running_thread || !mic_look_up())
+      return false;
+   int32_t user = 0;
+   if (sceUserServiceGetInitialUser(&user) < 0)
+      return false;
+   /* type 0: voice chat (the pad's microphone), index 0, S16 mono (param 0) */
+   mic.port = mic.open(user, 0, 0, MIC_GRAIN, MIC_RATE, 0);
+   if (mic.port < 0) {
+      say("mic: sceAudioInOpen 0x%08x", (unsigned)mic.port);
+      mic.port = -1;
+      return false;
+   }
+   atomic_store(&mic.count, 0);
+   atomic_store(&mic.recording, true);
+   if (pthread_create(&mic.thread, NULL, mic_main, NULL) != 0) {
+      atomic_store(&mic.recording, false);
+      (void)mic.close(mic.port);
+      mic.port = -1;
+      return false;
+   }
+   mic.running_thread = true;
+   return true;
+}
+
+void
+mic_stop_recording(void)
+{
+   if (!mic.running_thread)
+      return;
+   atomic_store(&mic.recording, false);
+   pthread_join(mic.thread, NULL);
+   mic.running_thread = false;
+   (void)mic.close(mic.port);
+   mic.port = -1;
+}
+
+bool
+mic_is_recording(void)
+{
+   return mic.running_thread && atomic_load(&mic.recording);
+}
+
+size_t
+mic_get_samples(int16_t *out, size_t max_samples)
+{
+   const size_t have = atomic_load(&mic.count);
+   if (out && max_samples) {
+      const size_t n = have < max_samples ? have : max_samples;
+      memcpy(out, mic_buffer, n * sizeof(int16_t));
+   }
+   return have;
+}
+
+int
+mic_sample_rate(void)
+{
+   return MIC_RATE;
+}

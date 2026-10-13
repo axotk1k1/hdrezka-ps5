@@ -170,6 +170,26 @@ public:
     std::atomic<int> urgent_requests{0};
     std::atomic<int> poster_hint{0};       // the list's posters are fetched from this index on
     void search_async(const std::string &query);
+    // The search box: live suggestions for what is typed (suggest_version
+    // counts their changes), and the history of the queries sent.
+    std::vector<CatalogItem> search_suggestions; // guarded by catalog_mutex
+    std::atomic<uint32_t> suggest_version{0};
+    std::atomic<bool> suggest_loading{false};
+    void suggest_async(const std::string &query);
+    std::vector<std::string> get_search_history();
+    void add_search_history(const std::string &query);
+    void clear_search_history();
+    // Voice search: the microphone records, the clip goes to the speech-to-text
+    // endpoint (HDREZKA_STT_URL, or the first line of data/stt.txt). Without an
+    // endpoint voice_available is false and the caller falls back on the
+    // console's dictation. voice_state: 0 idle, 1 recording, 2 recognising,
+    // 3 a text is ready in take_voice_text, 4 it failed.
+    bool voice_available();
+    bool voice_start();
+    void voice_finish_async();
+    void voice_cancel();
+    std::string take_voice_text();
+    std::atomic<int> voice_state{0};
     // Fills the catalogue with what the fetch returns; genre_label names it.
     void list_async(std::function<std::vector<CatalogItem>(Client &)> fetch, const std::string &genre_label);
     // Actor page (separate from the home catalogue).
@@ -236,6 +256,12 @@ private:
     void load_favorites();
     void persist_favorites();
     std::mutex favorites_mutex_;
+    std::mutex history_mutex_;
+    std::vector<std::string> search_history_; // newest first
+    std::string voice_text_;
+    std::atomic<uint32_t> suggest_serial_{0};
+    void load_search_history();
+    void persist_search_history();
     std::map<std::string, std::string> favorites_; // url -> title
 
     BigThread worker_thread_;

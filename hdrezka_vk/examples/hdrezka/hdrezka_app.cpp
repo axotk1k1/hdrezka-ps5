@@ -8,6 +8,7 @@
 #include <curl/curl.h>
 
 #include "logger.hpp"
+#include "platform.h"
 
 namespace
 {
@@ -34,6 +35,13 @@ std::string data_file_path(const std::string &cookie_file, const std::string &na
     }
     return name;
 }
+
+// A request the player is waiting on: the poster worker stands aside for it.
+struct UrgentRequest {
+    std::atomic<int> &n;
+    explicit UrgentRequest(std::atomic<int> &count) : n(count) { ++n; }
+    ~UrgentRequest() { --n; }
+};
 } // namespace
 
 extern "C" void console_write_log(const char* fmt, ...) {
@@ -88,6 +96,7 @@ void App::init(vks::VulkanDevice *dev, VkQueue q, hui::gfx::VkRenderer *rend, hu
     player.set_audio_ring(&audio_ring);
     load_continue_map();
     load_favorites();
+    load_search_history();
 
     {
         CURLcode gi = curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -635,6 +644,188 @@ void App::search_async(const std::string &query)
     list_async([query](Client &c) { return c.search(query); }, "Поиск");
 }
 
+void App::suggest_async(const std::string &query)
+{
+    const uint32_t serial = ++suggest_serial_;
+    if (query.empty()) {
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        search_suggestions.clear();
+        suggest_version++;
+        suggest_loading = false;
+        return;
+    }
+    suggest_loading = true;
+    BigThread([this, query, serial]() {
+        UrgentRequest urgent(urgent_requests);
+        std::vector<CatalogItem> found = client.search_suggest(query);
+        if (serial != suggest_serial_.load())
+            return; // a newer query is on its way
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            search_suggestions = std::move(found);
+            suggest_version++;
+        }
+        suggest_loading = false;
+    }).detach();
+}
+
+std::vector<std::string> App::get_search_history()
+{
+    std::lock_guard<std::mutex> lock(history_mutex_);
+    return search_history_;
+}
+
+void App::load_search_history()
+{
+    const std::string path = data_file_path(client.get_cookie_file(), "search_history.txt");
+    FILE *f = fopen(path.c_str(), "r");
+    if (!f)
+        return;
+    char line[512];
+    std::lock_guard<std::mutex> lock(history_mutex_);
+    search_history_.clear();
+    while (fgets(line, sizeof(line), f)) {
+        std::string text(line);
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+            text.pop_back();
+        if (!text.empty())
+            search_history_.push_back(text);
+    }
+    fclose(f);
+}
+
+void App::persist_search_history()
+{
+    const std::string path = data_file_path(client.get_cookie_file(), "search_history.txt");
+    FILE *f = fopen(path.c_str(), "w");
+    if (!f)
+        return;
+    std::lock_guard<std::mutex> lock(history_mutex_);
+    for (const std::string &q : search_history_)
+        std::fprintf(f, "%s\n", q.c_str());
+    fclose(f);
+}
+
+void App::add_search_history(const std::string &query)
+{
+    if (query.empty())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(history_mutex_);
+        search_history_.erase(std::remove(search_history_.begin(), search_history_.end(), query),
+                              search_history_.end());
+        search_history_.insert(search_history_.begin(), query);
+        if (search_history_.size() > 30)
+            search_history_.resize(30);
+    }
+    persist_search_history();
+}
+
+void App::clear_search_history()
+{
+    {
+        std::lock_guard<std::mutex> lock(history_mutex_);
+        search_history_.clear();
+    }
+    persist_search_history();
+}
+
+namespace
+{
+// The speech-to-text address: HDREZKA_STT_URL, or the first line of data/stt.txt.
+std::string stt_address(const std::string &cookie_file)
+{
+    if (const char *env = std::getenv("HDREZKA_STT_URL"))
+        if (*env)
+            return env;
+    const std::string path = data_file_path(cookie_file, "stt.txt");
+    FILE *f = fopen(path.c_str(), "r");
+    if (!f)
+        return "";
+    char line[512] = "";
+    if (!fgets(line, sizeof(line), f))
+        line[0] = 0;
+    fclose(f);
+    std::string text(line);
+    while (!text.empty() && isspace(static_cast<unsigned char>(text.back())))
+        text.pop_back();
+    return text;
+}
+
+// A 16-bit mono WAV of the samples.
+std::vector<unsigned char> wav_of(const std::vector<int16_t> &samples, int rate)
+{
+    std::vector<unsigned char> out;
+    auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) out.push_back(static_cast<unsigned char>(v >> (8 * i))); };
+    auto u16 = [&](uint16_t v) { out.push_back(static_cast<unsigned char>(v)); out.push_back(static_cast<unsigned char>(v >> 8)); };
+    const uint32_t bytes = static_cast<uint32_t>(samples.size() * 2);
+    out.insert(out.end(), {'R', 'I', 'F', 'F'});
+    u32(36 + bytes);
+    out.insert(out.end(), {'W', 'A', 'V', 'E', 'f', 'm', 't', ' '});
+    u32(16); u16(1); u16(1); u32(static_cast<uint32_t>(rate)); u32(static_cast<uint32_t>(rate) * 2); u16(2); u16(16);
+    out.insert(out.end(), {'d', 'a', 't', 'a'});
+    u32(bytes);
+    for (int16_t v : samples)
+        u16(static_cast<uint16_t>(v));
+    return out;
+}
+} // namespace
+
+bool App::voice_available()
+{
+    return !stt_address(client.get_cookie_file()).empty();
+}
+
+bool App::voice_start()
+{
+    if (voice_state.load() == 1 || voice_state.load() == 2)
+        return false;
+    if (!voice_available() || !mic_start_recording())
+        return false;
+    voice_state = 1;
+    return true;
+}
+
+void App::voice_cancel()
+{
+    if (voice_state.load() == 1)
+        mic_stop_recording();
+    voice_state = 0;
+}
+
+void App::voice_finish_async()
+{
+    if (voice_state.exchange(2) != 1)
+        return;
+    BigThread([this]() {
+        UrgentRequest urgent(urgent_requests);
+        mic_stop_recording();
+        const size_t total = mic_get_samples(nullptr, 0);
+        std::vector<int16_t> samples(total);
+        mic_get_samples(samples.data(), samples.size());
+        std::string text;
+        // Under a third of a second is no speech
+        if (total > static_cast<size_t>(mic_sample_rate() / 3))
+            text = client.stt_recognize(stt_address(client.get_cookie_file()), wav_of(samples, mic_sample_rate()));
+        {
+            std::lock_guard<std::mutex> lock(history_mutex_);
+            voice_text_ = text;
+        }
+        voice_state = text.empty() ? 4 : 3;
+    }).detach();
+}
+
+std::string App::take_voice_text()
+{
+    std::string text;
+    {
+        std::lock_guard<std::mutex> lock(history_mutex_);
+        text.swap(voice_text_);
+    }
+    voice_state = 0;
+    return text;
+}
+
 void App::person_select_career(int career_idx)
 {
     uint32_t ver = 0;
@@ -1071,15 +1262,6 @@ void App::load_details_async(int movie_idx)
         }
     }).detach();
 }
-
-namespace {
-// A request the player is waiting on: the poster worker stands aside for it.
-struct UrgentRequest {
-    std::atomic<int> &n;
-    explicit UrgentRequest(std::atomic<int> &count) : n(count) { ++n; }
-    ~UrgentRequest() { --n; }
-};
-} // namespace
 
 void App::login_async(const std::string &email, const std::string &password)
 {

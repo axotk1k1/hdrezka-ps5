@@ -1563,6 +1563,122 @@ std::vector<CatalogItem> Client::search(const std::string &query)
     return parse_catalog_html(html, "search", mirror_);
 }
 
+std::vector<CatalogItem> Client::search_suggest(const std::string &query)
+{
+    std::vector<CatalogItem> out;
+    if (query.empty())
+        return out;
+    const std::string html = http_post("/engine/ajax/search.php", {{"q", query}});
+    // One <li> a title: <a href><span class="enty">Фильм</span> Name <span class="rating">7.1</span></a>
+    for (size_t at = html.find("<li"); at != std::string::npos;) {
+        const size_t next = html.find("<li", at + 3);
+        const std::string chunk = html.substr(at, (next == std::string::npos ? html.size() : next) - at);
+        at = next;
+        const size_t a = chunk.find("<a");
+        const size_t a_end = a == std::string::npos ? a : chunk.find('>', a);
+        if (a_end == std::string::npos)
+            continue;
+        CatalogItem item;
+        item.url = attr_of(chunk.substr(a, a_end - a), "href");
+        // The last row is the site's "show all results" link, not a title
+        if (item.url.find(".html") == std::string::npos)
+            continue;
+        std::string inner = inner_after(chunk, a, "</a>");
+        const size_t enty = find_class(inner, "enty");
+        if (enty != std::string::npos) {
+            item.entity = strip_tags(inner_after(inner, enty, "</span>"));
+            const size_t open = inner.rfind("<span", enty);
+            const size_t close = inner.find("</span>", enty);
+            if (open != std::string::npos && close != std::string::npos)
+                inner.erase(open, close + 7 - open);
+        }
+        const size_t rating = find_class(inner, "rating");
+        if (rating != std::string::npos) {
+            const std::string text = strip_tags(inner_after(inner, rating, "</span>"));
+            item.rating = static_cast<float>(atof(text.c_str()));
+            const size_t open = inner.rfind("<span", rating);
+            const size_t close = inner.find("</span>", rating);
+            if (open != std::string::npos && close != std::string::npos)
+                inner.erase(open, close + 7 - open);
+        }
+        item.title = strip_tags(inner);
+        if (item.title.empty())
+            continue;
+        if (item.url.rfind("http", 0) != 0)
+            item.url = mirror_ + (item.url[0] == '/' ? "" : "/") + item.url;
+        // "Name (2021)" or "Name (Original, 2021)": the year is the last number in brackets
+        const size_t open = item.title.rfind('(');
+        if (open != std::string::npos && item.title.back() == ')') {
+            const std::string tail = item.title.substr(open + 1, item.title.size() - open - 2);
+            const size_t comma = tail.rfind(',');
+            const std::string year = comma == std::string::npos ? tail : tail.substr(comma + 1);
+            item.year = atoi(year.c_str());
+            item.info = strip_tags(year);
+        }
+        out.push_back(std::move(item));
+    }
+    return out;
+}
+
+std::string Client::stt_recognize(const std::string &endpoint, const std::vector<unsigned char> &wav)
+{
+    if (endpoint.empty() || wav.empty())
+        return "";
+    CURL *curl = curl_easy_init();
+    if (!curl)
+        return "";
+    struct curl_slist *headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: audio/wav");
+    std::string response;
+    curl_easy_setopt(curl, CURLOPT_URL, endpoint.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, reinterpret_cast<const char *>(wav.data()));
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(wav.size()));
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    const CURLcode res = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    if (res != CURLE_OK || code < 200 || code >= 300)
+        return "";
+    // {"text": "..."}: the value of the first "text" key; otherwise the body is the text
+    const size_t key = response.find("\"text\"");
+    if (key != std::string::npos) {
+        const size_t colon = response.find(':', key);
+        const size_t open = colon == std::string::npos ? colon : response.find('"', colon);
+        if (open == std::string::npos)
+            return "";
+        std::string text;
+        for (size_t i = open + 1; i < response.size() && response[i] != '"'; ++i) {
+            if (response[i] == '\\' && i + 1 < response.size()) {
+                const char e = response[++i];
+                if (e == 'n' || e == 't') text.push_back(' ');
+                else if (e == 'u' && i + 4 < response.size()) {
+                    const unsigned cp = static_cast<unsigned>(strtoul(response.substr(i + 1, 4).c_str(), nullptr, 16));
+                    i += 4;
+                    if (cp < 0x80) text.push_back(static_cast<char>(cp));
+                    else if (cp < 0x800) {
+                        text.push_back(static_cast<char>(0xc0 | (cp >> 6)));
+                        text.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+                    } else {
+                        text.push_back(static_cast<char>(0xe0 | (cp >> 12)));
+                        text.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+                        text.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+                    }
+                } else text.push_back(e);
+            } else
+                text.push_back(response[i]);
+        }
+        return strip_tags(text);
+    }
+    return strip_tags(response);
+}
+
 bool Client::get_details(const std::string &item_url, VideoDetails &out_details)
 {
     std::string html = http_get(item_url);

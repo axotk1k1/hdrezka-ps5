@@ -114,6 +114,19 @@ void audio_stop(void);
 bool keyboard_open(const char *title, const char *text, bool password, int max_chars);
 int keyboard_poll(char *out, size_t size);
 
+/* The microphone, as 16 kHz mono 16-bit samples (the DualSense's own, or a
+ * headset's). mic_start_recording opens it and starts a thread that fills a
+ * buffer of twenty seconds; false when the console offers none (the host
+ * reference build never does). mic_get_samples copies up to max_samples of
+ * what has been recorded since the start into out (which may be NULL) and
+ * returns how many there are in all. mic_stop_recording ends the thread and
+ * closes the input; the samples stay readable until the next start. */
+bool mic_start_recording(void);
+void mic_stop_recording(void);
+bool mic_is_recording(void);
+size_t mic_get_samples(int16_t *out, size_t max_samples);
+int mic_sample_rate(void);
+
 #ifdef __cplusplus
 }
 #endif

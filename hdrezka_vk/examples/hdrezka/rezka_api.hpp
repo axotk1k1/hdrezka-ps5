@@ -287,6 +287,13 @@ public:
 
     // Quick search or full search
     std::vector<CatalogItem> search(const std::string &query);
+    // The live suggestions of the search box (POST /engine/ajax/search.php):
+    // a few titles with their kind, rating and year, as HDrezkaTV shows them
+    // under the field. Each carries url, title, entity, rating and info.
+    std::vector<CatalogItem> search_suggest(const std::string &query);
+    // Speech to text: the WAV (16-bit mono PCM) is POSTed to `endpoint`; the
+    // answer is plain text or {"text": "..."}. Empty when it fails.
+    std::string stt_recognize(const std::string &endpoint, const std::vector<unsigned char> &wav);
 
     // Actor page: careers + filmography (HDrezkaTV / browser .b-person__career).
     bool get_person(const std::string &person_url, PersonDetails &out);

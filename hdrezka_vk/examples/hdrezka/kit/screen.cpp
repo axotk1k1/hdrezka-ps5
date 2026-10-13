@@ -1094,12 +1094,13 @@ class Store final : public app::Concept
         clock_ += dt;
         if (page_open_)
             rebuild_page_model();
+        search_tick(dt, feedback);
         // The console's keyboard (or the sheet of keys) takes the pad while it is up.
         if (kb_active())
             kb_update(input, feedback);
         // The topmost layer takes the input; the layers under it only animate.
         else if (search_open_)
-            update_search(input, feedback);
+            update_search(input, dt, feedback);
         else if (profile_open_)
             update_profile(input, feedback);
         else if (person_open_)
@@ -2050,115 +2051,479 @@ class Store final : public app::Concept
             std::lock_guard<std::mutex> lock(app.catalog_mutex);
             app.catalog_status = "Поиск: " + search_query_;
         }
+        rezka::App::instance().add_search_history(search_query_);
         rezka::App::instance().search_async(search_query_);
         feedback.play(audio::Cue::select);
     }
 
-    void update_search(const InputFrame &input, app::Feedback &feedback)
+    // ---- the search: HDrezkaTV's search screen -------------------------------
+    //
+    // The field on top with the keyboard, microphone and clear buttons; under
+    // it the history of queries ("История поиска", "Очистить все") while the
+    // field is empty, and the live suggestions of the site with "Показать все
+    // результаты" once something is typed. A field press opens the console's
+    // keyboard (kb_begin; a PC gets the sheet of keys). The microphone records
+    // for the speech-to-text endpoint when one is set (App::voice_start) and
+    // otherwise opens the keyboard titled "Голосовой поиск", whose dictation
+    // takes the pad's microphone.
+
+    enum SearchZone : int
     {
+        kSearchField,
+        kSearchKeyboard,
+        kSearchMic,
+        kSearchClear,
+        kSearchList,
+    };
+    enum SearchRowKind : int
+    {
+        kRowHistory,
+        kRowClearAll,
+        kRowSuggest,
+        kRowShowAll,
+    };
+    struct SearchRow
+    {
+        int kind = kRowHistory;
+        std::string text;
+        std::string sub;
+        float rating = 0.0f;
+        int index = 0; // into the history or the suggestions
+    };
+
+    static constexpr float kVoiceSeconds = 8.0f;
+
+    std::vector<SearchRow> search_rows(const std::vector<std::string> &history,
+                                       const std::vector<rezka::CatalogItem> &suggestions) const
+    {
+        std::vector<SearchRow> rows;
+        if (search_query_.empty())
+        {
+            for (std::size_t i = 0; i < history.size(); ++i)
+                rows.push_back({kRowHistory, history[i], "", 0.0f, static_cast<int>(i)});
+            if (!history.empty())
+                rows.push_back({kRowClearAll, "Очистить все", "", 0.0f, 0});
+            return rows;
+        }
+        for (std::size_t i = 0; i < suggestions.size(); ++i)
+        {
+            const auto &s = suggestions[i];
+            std::string sub = s.entity;
+            if (!s.info.empty())
+                sub += sub.empty() ? s.info : " · " + s.info;
+            rows.push_back({kRowSuggest, s.title, sub, s.rating, static_cast<int>(i)});
+        }
+        rows.push_back({kRowShowAll, "Показать все результаты", "", 0.0f, 0});
+        return rows;
+    }
+
+    void search_text_entry(const char *title, app::Feedback &feedback)
+    {
+        search_kb_pending_ = true;
+        search_kb_before_ = search_query_;
+        kb_begin(&search_query_, title, false, feedback);
+    }
+
+    void search_voice(app::Feedback &feedback)
+    {
+        auto &app = rezka::App::instance();
+        if (app.voice_start())
+        {
+            search_voice_timer_ = 0.0f;
+            feedback.play(audio::Cue::modal_open);
+            return;
+        }
+        show_message(app.voice_available() ? "Микрофон недоступен — открываю диктовку клавиатуры"
+                                           : "Распознавание речи не настроено — открываю диктовку клавиатуры");
+        search_text_entry("Голосовой поиск", feedback);
+    }
+
+    // Edges and timers that run whatever layer has the pad.
+    void search_tick(float dt, app::Feedback &feedback)
+    {
+        auto &app = rezka::App::instance();
+        if (search_kb_pending_ && !kb_active())
+        {
+            search_kb_pending_ = false;
+            // What was typed or dictated is searched, as the app does on the IME's "done"
+            if (search_open_ && !search_query_.empty() && search_query_ != search_kb_before_)
+                submit_search(feedback);
+        }
+        if (search_open_ != search_was_open_)
+        {
+            search_was_open_ = search_open_;
+            if (search_open_)
+            {
+                search_zone_ = kSearchField;
+                search_row_ = 0;
+                search_suggested_ = search_query_;
+                search_debounce_ = 0.0f;
+                app.suggest_async(search_query_);
+            }
+            else
+                app.voice_cancel();
+        }
+        if (search_open_ && search_query_ != search_suggested_)
+        {
+            search_debounce_ += dt;
+            if (search_debounce_ > 0.3f)
+            {
+                search_suggested_ = search_query_;
+                search_debounce_ = 0.0f;
+                search_row_ = 0;
+                app.suggest_async(search_query_);
+            }
+        }
+    }
+
+    // The microphone's turns: recording, recognising, and what comes of it.
+    // true while the voice layer has the pad.
+    bool update_voice(const InputFrame &input, float dt, app::Feedback &feedback)
+    {
+        auto &app = rezka::App::instance();
+        switch (app.voice_state.load())
+        {
+        case 1:
+            search_voice_timer_ += dt;
+            if (input.is_pressed(Action::back))
+            {
+                app.voice_cancel();
+                feedback.play(audio::Cue::modal_close);
+            }
+            else if (input.is_pressed(Action::confirm) || search_voice_timer_ > kVoiceSeconds)
+            {
+                app.voice_finish_async();
+                feedback.play(audio::Cue::select);
+            }
+            return true;
+        case 2:
+            return true;
+        case 3:
+            search_query_ = app.take_voice_text();
+            submit_search(feedback);
+            return true;
+        case 4:
+            app.take_voice_text();
+            show_message("Не удалось распознать речь — открываю диктовку клавиатуры");
+            search_text_entry("Голосовой поиск", feedback);
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    void update_search(const InputFrame &input, float dt, app::Feedback &feedback)
+    {
+        auto &app = rezka::App::instance();
+        if (update_voice(input, dt, feedback))
+            return;
+        std::vector<rezka::CatalogItem> suggestions;
+        {
+            std::lock_guard<std::mutex> lock(app.catalog_mutex);
+            suggestions = app.search_suggestions;
+        }
+        const std::vector<SearchRow> rows = search_rows(app.get_search_history(), suggestions);
+        const int count = static_cast<int>(rows.size());
+        search_row_ = std::clamp(search_row_, 0, std::max(0, count - 1));
+
         if (input.is_pressed(Action::back))
         {
             search_open_ = false;
             feedback.play(audio::Cue::back);
             return;
         }
-        if (input.is_pressed(Action::west))
+        if (input.is_pressed(Action::west) && !search_query_.empty())
         {
             erase_from(search_query_);
             feedback.play(audio::Cue::toggle);
             return;
         }
-        if (input.is_pressed(Action::north) || input.is_pressed(Action::menu) || ((ps5_pad().pressed & PAD_TRIANGLE) != 0))
+        if (input.is_pressed(Action::north) || input.is_pressed(Action::menu) ||
+            ((ps5_pad().pressed & PAD_TRIANGLE) != 0))
         {
             submit_search(feedback);
             return;
         }
-        navigate_key_grid(input, feedback);
 
-        if (!input.is_pressed(Action::confirm))
+        const int last_top = search_query_.empty() ? kSearchMic : kSearchClear;
+        if (search_zone_ != kSearchList)
+        {
+            if (input.nav == Direction::left || input.nav == Direction::right)
+            {
+                const int next = std::clamp(search_zone_ + (input.nav == Direction::right ? 1 : -1), 0, last_top);
+                if (next == search_zone_)
+                    tv_refuse(feedback, input.nav_repeat);
+                else
+                {
+                    search_zone_ = next;
+                    feedback.play(audio::Cue::focus);
+                }
+                return;
+            }
+            if (input.nav == Direction::down)
+            {
+                if (count == 0)
+                    tv_refuse(feedback, input.nav_repeat);
+                else
+                {
+                    search_zone_ = kSearchList;
+                    search_row_ = 0;
+                    feedback.play(audio::Cue::focus);
+                }
+                return;
+            }
+            if (!input.is_pressed(Action::confirm))
+                return;
+            switch (search_zone_)
+            {
+            case kSearchField:
+                search_text_entry("Поиск фильмов и сериалов", feedback);
+                break;
+            case kSearchKeyboard:
+                search_text_entry("Поиск фильмов и сериалов", feedback);
+                break;
+            case kSearchMic:
+                search_voice(feedback);
+                break;
+            default:
+                search_query_.clear();
+                search_zone_ = kSearchField;
+                feedback.play(audio::Cue::toggle);
+                break;
+            }
             return;
-
-        if (key_row_ < 4)
-        {
-            const char **cur_keys = keys_for_lang(key_lang_);
-            const int idx = key_row_ * kKeyCols + key_col_;
-            if (idx >= 0 && idx < 48) {
-                search_query_ += cur_keys[idx];
-                if (search_query_.size() > 64) search_query_.resize(64);
-                feedback.play(audio::Cue::select);
-            }
         }
-        else
+
+        if (input.nav == Direction::up || input.nav == Direction::down)
         {
-            if (key_col_ <= 2)
+            if (input.nav == Direction::up && search_row_ == 0)
             {
-                cycle_key_lang();
-                feedback.play(audio::Cue::toggle);
+                search_zone_ = kSearchField;
+                feedback.play(audio::Cue::focus);
+                return;
             }
-            else if (key_col_ >= 3 && key_col_ <= 6)
-            {
-                search_query_.push_back(' ');
-                feedback.play(audio::Cue::select);
-            }
-            else if (key_col_ >= 7 && key_col_ <= 8)
-            {
-                erase_from(search_query_);
-                feedback.play(audio::Cue::toggle);
-            }
+            const int next = std::clamp(search_row_ + (input.nav == Direction::down ? 1 : -1), 0, count - 1);
+            if (next == search_row_)
+                tv_refuse(feedback, input.nav_repeat);
             else
             {
-                submit_search(feedback);
+                search_row_ = next;
+                feedback.play(audio::Cue::focus);
             }
+            return;
         }
+        if (count == 0 || !input.is_pressed(Action::confirm))
+            return;
+        const SearchRow &row = rows[static_cast<std::size_t>(search_row_)];
+        switch (row.kind)
+        {
+        case kRowHistory:
+            search_query_ = row.text;
+            submit_search(feedback);
+            break;
+        case kRowClearAll:
+            app.clear_search_history();
+            search_zone_ = kSearchField;
+            feedback.play(audio::Cue::toggle);
+            break;
+        case kRowShowAll:
+            submit_search(feedback);
+            break;
+        default:
+        {
+            const rezka::CatalogItem &item = suggestions[static_cast<std::size_t>(row.index)];
+            const int index = app.adopt_catalog_item(item);
+            if (index < 0)
+            {
+                tv_refuse(feedback, false);
+                break;
+            }
+            app.add_search_history(search_query_);
+            search_open_ = false;
+            dp_stack_.clear();
+            open_page(index, false, feedback);
+            break;
+        }
+        }
+    }
+
+    // A circle button of the field row.
+    void draw_search_button(gfx::DrawList &list, float cx, float cy, bool focused, int what) const
+    {
+        const float dp = kTvDp;
+        const float r = 24.0f * dp;
+        list.circle(cx, cy, r, focused ? tv_primary() : tv_surface_variant().with_alpha(0.4f));
+        const Color ink = focused ? tv_on_primary() : tv_on_surface();
+        if (what == kSearchMic)
+            draw_mic_icon(list, cx, cy, 1.0f, ink);
+        else if (what == kSearchKeyboard)
+        {
+            list.bordered_rect({cx - 12.0f * dp, cy - 8.0f * dp, 24.0f * dp, 16.0f * dp}, 3.0f * dp, kClear, 1.5f * dp,
+                               ink);
+            for (int row = 0; row < 2; ++row)
+                for (int col = 0; col < 4; ++col)
+                    list.rounded_rect({cx - 8.5f * dp + static_cast<float>(col) * 4.5f * dp,
+                                       cy - 5.0f * dp + static_cast<float>(row) * 4.0f * dp, 2.5f * dp, 2.0f * dp},
+                                      0.5f * dp, ink);
+            list.rounded_rect({cx - 6.0f * dp, cy + 3.0f * dp, 12.0f * dp, 2.0f * dp}, 0.5f * dp, ink);
+        }
+        else
+            tv_text(list, tv_medium(), "×", cx, cy - 16.0f * dp, 28.0f * dp, 32.0f * dp, ink, gfx::Align::center);
+    }
+
+    // The microphone, drawn: a capsule, the cup round it, a stem and a foot.
+    void draw_mic_icon(gfx::DrawList &list, float cx, float cy, float scale, Color ink) const
+    {
+        const float u = kTvDp * scale;
+        list.rounded_rect({cx - 4.5f * u, cy - 11.0f * u, 9.0f * u, 14.0f * u}, 4.5f * u, ink);
+        list.bordered_rect({cx - 8.0f * u, cy - 5.0f * u, 16.0f * u, 14.0f * u}, 8.0f * u, kClear, 1.6f * u, ink);
+        list.rounded_rect({cx - 0.8f * u, cy + 9.0f * u, 1.6f * u, 3.0f * u}, 0.0f, ink);
+        list.rounded_rect({cx - 4.0f * u, cy + 11.5f * u, 8.0f * u, 1.6f * u}, 0.8f * u, ink);
     }
 
     void draw_search(gfx::DrawList &list) const
     {
         if (!search_open_)
             return;
-        const ui::Fonts &fonts = context_.fonts;
-        list.rounded_rect({0, 0, kWidth, kHeight}, 0, Color::rgb(0x000000, 0.78f));
-        const Rect panel{260.0f, 100.0f, 1400.0f, 880.0f};
-        list.rounded_rect(panel, 28.0f, kCoal);
-        list.bordered_rect(panel, 28.0f, kClear, 2.0f, kAccent);
-        ui::text(list, fonts.semibold, "ПОИСК HDREZKA", panel.x + 48.0f, panel.y + 54.0f, 26, kAccent, gfx::Align::left, 2.0f);
-
-        const Rect field{panel.x + 48.0f, panel.y + 78.0f, panel.w - 96.0f, 64.0f};
-        list.rounded_rect(field, 14.0f, kPanel);
-        list.bordered_rect(field, 14.0f, kClear, 1.5f, kAccent.with_alpha(0.7f));
-        std::string shown = search_query_.empty() ? std::string("Введите название фильма или сериала...") : search_query_;
-        if (!search_query_.empty()) shown += " |";
-        ui::text(list, fonts.regular, shown.c_str(), field.x + 22.0f, centred(field.cy(), 26), 26,
-                 search_query_.empty() ? kInk.with_alpha(0.45f) : kInk);
-
-        constexpr float kCell = 82.0f;
-        constexpr float kGap = 12.0f;
-        const float grid_w = kKeyCols * kCell + (kKeyCols - 1) * kGap;
-        const float ox = panel.cx() - grid_w * 0.5f;
-        const float oy = panel.y + 172.0f;
-
-        const char **cur_keys = keys_for_lang(key_lang_);
-
-        for (int r = 0; r < 4; ++r)
+        const float dp = kTvDp;
+        auto &app = rezka::App::instance();
+        std::vector<rezka::CatalogItem> suggestions;
+        bool loading = false;
         {
-            for (int c = 0; c < kKeyCols; ++c)
-            {
-                const int i = r * kKeyCols + c;
-                const Rect key{ox + static_cast<float>(c) * (kCell + kGap),
-                               oy + static_cast<float>(r) * (kCell * 0.82f + kGap), kCell, 58.0f};
-                const bool on = (key_row_ == r && key_col_ == c);
-                list.rounded_rect(key, 12.0f, on ? kAccent : kPanel);
-                if (on) list.bordered_rect(key, 12.0f, kClear, 2.0f, kWhite);
-                ui::text(list, fonts.semibold, cur_keys[i], key.cx(), centred(key.cy(), 24), 24,
-                         on ? kOnAccent : kInk, gfx::Align::center);
-            }
+            std::lock_guard<std::mutex> lock(app.catalog_mutex);
+            suggestions = app.search_suggestions;
+        }
+        loading = app.suggest_loading.load();
+        const std::vector<std::string> history = app.get_search_history();
+        const std::vector<SearchRow> rows = search_rows(history, suggestions);
+        list.rounded_rect({0, 0, kWidth, kHeight}, 0.0f, tv_surface());
+
+        // The field row
+        const float left = 48.0f * dp;
+        const bool has_query = !search_query_.empty();
+        const int buttons = has_query ? 3 : 2;
+        const float field_w = kWidth - 2.0f * left - static_cast<float>(buttons) * 60.0f * dp;
+        const Rect field{left, 24.0f * dp, field_w, 56.0f * dp};
+        const bool field_on = search_zone_ == kSearchField;
+        list.rounded_rect(field, 28.0f * dp, tv_surface_variant().with_alpha(0.3f));
+        list.bordered_rect(field, 28.0f * dp, kClear, (field_on ? 2.0f : 1.0f) * dp,
+                           field_on ? tv_primary() : tv_border_variant());
+        tv_icon(list, kTvIconSearch, field.x + 20.0f * dp, field.cy() - 12.0f * dp, 24.0f * dp,
+                tv_on_surface_variant());
+        const float text_x = field.x + 60.0f * dp;
+        if (has_query)
+        {
+            const std::string shown = tv_regular().font->fit(search_query_, 18.0f * dp, field.w - 100.0f * dp);
+            const float w = tv_text(list, tv_regular(), shown, text_x, field.cy() - 14.0f * dp, 18.0f * dp,
+                                    28.0f * dp, tv_on_surface());
+            if (field_on && std::fmod(clock_, 1.0f) < 0.5f)
+                list.rounded_rect({text_x + w + 2.0f, field.cy() - 12.0f * dp, 2.0f, 24.0f * dp}, 0.0f, tv_primary());
+        }
+        else
+            tv_text(list, tv_regular(), "Поиск фильмов и сериалов", text_x, field.cy() - 14.0f * dp, 18.0f * dp,
+                    28.0f * dp, tv_on_surface_variant());
+        float bx = field.x + field.w + 12.0f * dp + 24.0f * dp;
+        draw_search_button(list, bx, field.cy(), search_zone_ == kSearchKeyboard, kSearchKeyboard);
+        bx += 60.0f * dp;
+        draw_search_button(list, bx, field.cy(), search_zone_ == kSearchMic, kSearchMic);
+        if (has_query)
+        {
+            bx += 60.0f * dp;
+            draw_search_button(list, bx, field.cy(), search_zone_ == kSearchClear, kSearchClear);
         }
 
-        const float ay = oy + 4.0f * (kCell * 0.82f + kGap) + 8.0f;
-        draw_key_action_row(list, ox, ay, kCell, kGap, 64.0f, "▶ НАЙТИ");
+        // The rows
+        const float list_w = 560.0f * dp;
+        float top = 104.0f * dp;
+        if (!has_query)
+        {
+            if (history.empty())
+            {
+                tv_text(list, tv_regular(), "Введите название фильма или сериала в строку поиска", left, top,
+                        16.0f * dp, 24.0f * dp, tv_on_surface_variant());
+                draw_profile_ill(list, kIllVoid, {kWidth * 0.5f - 160.0f * dp, 200.0f * dp, 320.0f * dp, 220.0f * dp});
+            }
+            else
+            {
+                tv_text(list, tv_medium(), "История поиска", left, top, 14.0f * dp, 20.0f * dp,
+                        tv_on_surface_variant(), gfx::Align::left, 0.1f * dp);
+                top += 28.0f * dp;
+            }
+        }
+        else if (suggestions.empty())
+        {
+            tv_text(list, tv_regular(), loading ? "Поиск…" : "Ничего не найдено", left, top, 16.0f * dp, 24.0f * dp,
+                    tv_on_surface_variant());
+            top += 32.0f * dp;
+        }
+        const float row_h = 56.0f * dp;
+        const float gap = 8.0f * dp;
+        const int visible = std::max(1, static_cast<int>((kHeight - top - 24.0f * dp) / (row_h + gap)));
+        const int count = static_cast<int>(rows.size());
+        const int first = std::clamp(search_row_ - visible / 2, 0, std::max(0, count - visible));
+        for (int i = first; i < count && i < first + visible; ++i)
+        {
+            const SearchRow &row = rows[static_cast<std::size_t>(i)];
+            const Rect r{left, top + static_cast<float>(i - first) * (row_h + gap), list_w, row_h};
+            const bool on = search_zone_ == kSearchList && i == search_row_;
+            list.rounded_rect(r, 16.0f * dp, on ? tv_secondary_container() : tv_surface_variant().with_alpha(0.3f));
+            if (on)
+                list.bordered_rect(r, 16.0f * dp, kClear, 2.0f * dp, tv_primary());
+            const Color ink = on ? tv_on_secondary_container() : tv_on_surface();
+            switch (row.kind)
+            {
+            case kRowHistory:
+                tv_icon(list, kTvIconAccessTime, r.x + 20.0f * dp, r.cy() - 12.0f * dp, 24.0f * dp,
+                        tv_on_surface_variant());
+                tv_text(list, tv_regular(), tv_regular().font->fit(row.text, 16.0f * dp, r.w - 90.0f * dp),
+                        r.x + 60.0f * dp, r.cy() - 12.0f * dp, 16.0f * dp, 24.0f * dp, ink);
+                break;
+            case kRowClearAll:
+                tv_text(list, tv_medium(), row.text, r.x + 60.0f * dp, r.cy() - 12.0f * dp, 16.0f * dp, 24.0f * dp,
+                        tv_error(), gfx::Align::left, 0.1f * dp);
+                break;
+            case kRowShowAll:
+                tv_icon(list, kTvIconSearch, r.x + 20.0f * dp, r.cy() - 12.0f * dp, 24.0f * dp, tv_primary());
+                tv_text(list, tv_medium(), row.text, r.x + 60.0f * dp, r.cy() - 12.0f * dp, 16.0f * dp, 24.0f * dp,
+                        tv_primary(), gfx::Align::left, 0.1f * dp);
+                break;
+            default:
+                tv_text(list, tv_medium(), tv_medium().font->fit(row.text, 16.0f * dp, r.w - 150.0f * dp),
+                        r.x + 20.0f * dp, r.y + 6.0f * dp, 16.0f * dp, 24.0f * dp, ink);
+                tv_text(list, tv_regular(), row.sub, r.x + 20.0f * dp, r.y + 32.0f * dp, 12.0f * dp, 18.0f * dp,
+                        tv_on_surface_variant());
+                if (row.rating > 0.0f)
+                {
+                    char rating[16];
+                    std::snprintf(rating, sizeof(rating), "%.1f", row.rating);
+                    tv_text(list, tv_medium(), rating, r.x + r.w - 20.0f * dp, r.cy() - 12.0f * dp, 16.0f * dp,
+                            24.0f * dp, tv_rating_color(row.rating), gfx::Align::right);
+                }
+                break;
+            }
+        }
+        draw_voice(list);
+        kb_draw(list);
+    }
 
-        ui::text(list, fonts.regular, "ENG / РУС / #!     □ Стереть     △ Искать     ○ Закрыть",
-                 panel.cx(), panel.y + panel.h - 36.0f, 20, kInk.with_alpha(0.7f), gfx::Align::center);
+    // "Говорите…": the microphone is open (or its clip is out for recognition).
+    void draw_voice(gfx::DrawList &list) const
+    {
+        const int state = rezka::App::instance().voice_state.load();
+        if (state != 1 && state != 2)
+            return;
+        const float dp = kTvDp;
+        list.rounded_rect({0, 0, kWidth, kHeight}, 0.0f, kBlack.with_alpha(0.75f));
+        const float cx = kWidth * 0.5f, cy = kHeight * 0.5f - 40.0f * dp;
+        const float pulse = state == 1 ? 0.5f + 0.5f * std::sin(clock_ * 5.0f) : 0.0f;
+        list.circle(cx, cy, (56.0f + 14.0f * pulse) * dp, tv_primary_container().with_alpha(0.5f));
+        list.circle(cx, cy, 48.0f * dp, tv_primary());
+        draw_mic_icon(list, cx, cy, 2.0f, tv_on_primary());
+        tv_text(list, tv_regular(), state == 1 ? "Говорите…" : "Распознаём…", cx, cy + 76.0f * dp, 24.0f * dp,
+                32.0f * dp, tv_on_surface(), gfx::Align::center);
+        if (state == 1)
+            tv_text(list, tv_regular(), "Крестик — готово     Кружок — отмена", cx, cy + 116.0f * dp, 14.0f * dp, 20.0f * dp,
+                    tv_on_surface_variant(), gfx::Align::center);
     }
 
     void type_into(std::string &target)
@@ -2201,6 +2566,7 @@ class Store final : public app::Concept
         kIllWelcome,
         kIllMovieNight,
         kIllHomeCinema,
+        kIllVoid,
         kIllCount,
     };
     enum ProfileItem : int
@@ -2777,10 +3143,11 @@ class Store final : public app::Concept
         if (rgba)
             rezka::TextureLoader::free_decoded_image(rgba);
         // The profile's illustrations
-        static const char *const ill_files[4] = {
+        static const char *const ill_files[5] = {
             VK_EXAMPLE_ASSETS_DIR "tv/ill-enter.png", VK_EXAMPLE_ASSETS_DIR "tv/ill-welcome_cats.png",
-            VK_EXAMPLE_ASSETS_DIR "tv/ill-movie_night.png", VK_EXAMPLE_ASSETS_DIR "tv/ill-home_cinema.png"};
-        for (int i = 0; i < 4; ++i)
+            VK_EXAMPLE_ASSETS_DIR "tv/ill-movie_night.png", VK_EXAMPLE_ASSETS_DIR "tv/ill-home_cinema.png",
+            VK_EXAMPLE_ASSETS_DIR "tv/ill-void.png"};
+        for (int i = 0; i < 5; ++i)
         {
             rgba = rezka::TextureLoader::load_file_rgba(ill_files[i], &w, &h);
             if (rgba && w > 0 && h > 0)
@@ -8564,13 +8931,22 @@ class Store final : public app::Concept
     std::string tv_list_title_;   // heads a list opened from a title's page
     std::uint32_t tv_youtube_ = 0;
     // The profile
-    std::uint32_t tv_ill_[4] = {0, 0, 0, 0}; // tv/ill-*.png, by ProfileIll
-    float tv_ill_aspect_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::uint32_t tv_ill_[5] = {0, 0, 0, 0, 0}; // tv/ill-*.png, by ProfileIll
+    float tv_ill_aspect_[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     qr::Code profile_qr_;
     int profile_view_ = 0;
     int profile_focus_ = 0;
     int profile_list_focus_ = 0;
     bool profile_was_logged_ = false;
+    // The search
+    int search_zone_ = 0;
+    int search_row_ = 0;
+    bool search_was_open_ = false;
+    std::string search_suggested_;   // the query the suggestions are for
+    float search_debounce_ = 0.0f;
+    bool search_kb_pending_ = false; // the keyboard was opened by the search
+    std::string search_kb_before_;
+    float search_voice_timer_ = 0.0f;
 
     // A title's page (HDrezkaTV's MovieDetails screen).
     int dp_row_ = 1;
