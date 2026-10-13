@@ -925,6 +925,33 @@ std::vector<CatalogItem> Client::get_catalog(const std::string &category, const 
     return parse_catalog_html(html, category, mirror_);
 }
 
+std::vector<CatalogItem> Client::get_movie_list(const std::string &filter, int genre, int page,
+                                                bool *has_next, const std::string &prefix)
+{
+    std::string path = prefix;
+    if (page > 1)
+        path += "/page/" + std::to_string(page);
+    path += "/?filter=" + (filter.empty() ? std::string("watching") : filter);
+    if (genre > 0)
+        path += "&genre=" + std::to_string(genre);
+
+    const std::string html = http_get(path);
+    if (has_next) {
+        // The app's rule: a next page exists when the navigation block is
+        // there and its "next" arrow is not the disabled (no-page) one.
+        const bool nav = html.find("b-navigation") != std::string::npos;
+        const size_t next = html.find("b-navigation__next");
+        bool disabled = false;
+        if (next != std::string::npos) {
+            const size_t from = next > 160 ? next - 160 : 0;
+            const size_t no_page = html.rfind("no-page", next);
+            disabled = no_page != std::string::npos && no_page >= from;
+        }
+        *has_next = nav && next != std::string::npos && !disabled;
+    }
+    return parse_catalog_html(html, "home", mirror_);
+}
+
 Client::HomePage Client::get_home_page(const std::string &filter)
 {
     HomePage page;

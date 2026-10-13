@@ -220,6 +220,48 @@
       "url": "https://fonts.google.com/specimen/Patrick+Hand",
       "changes": "the TrueType file, for the samples' settings windows in the title's theme",
       "licence_file": "kit:third_party/fonts/PatrickHand-LICENSE.txt"
+    },
+    {
+      "path": "hui/fonts/roboto-regular.huifont",
+      "from": "file",
+      "source": "ps5/assets/fonts/roboto-regular.huifont",
+      "used_by": [
+        "@ui"
+      ],
+      "title": "Roboto Regular",
+      "author": "Christian Robertson (Google Fonts)",
+      "licence": "Apache-2.0",
+      "url": "https://fonts.google.com/specimen/Roboto",
+      "changes": "a signed-distance-field atlas (european glyph set), made by ps5-homebrew-ui's tools/font-baker",
+      "licence_file": "licenses/Apache-2.0.txt"
+    },
+    {
+      "path": "hui/fonts/roboto-medium.huifont",
+      "from": "file",
+      "source": "ps5/assets/fonts/roboto-medium.huifont",
+      "used_by": [
+        "@ui"
+      ],
+      "title": "Roboto Medium",
+      "author": "Christian Robertson (Google Fonts)",
+      "licence": "Apache-2.0",
+      "url": "https://fonts.google.com/specimen/Roboto",
+      "changes": "a signed-distance-field atlas (european glyph set), made by ps5-homebrew-ui's tools/font-baker",
+      "licence_file": "licenses/Apache-2.0.txt"
+    },
+    {
+      "path": "tv/icons.png",
+      "from": "file",
+      "source": "ps5/assets/tv/icons.png",
+      "used_by": [
+        "hdrezka"
+      ],
+      "title": "Material Icons (Rounded): account_circle, search, home, new_releases, video_library, campaign, settings, check",
+      "author": "Google",
+      "licence": "Apache-2.0",
+      "url": "https://github.com/google/material-design-icons",
+      "changes": "rasterised at 96 px, white on transparent, packed in one strip",
+      "licence_file": "licenses/Apache-2.0.txt"
     }
   ]
 }

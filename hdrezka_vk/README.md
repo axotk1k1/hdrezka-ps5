@@ -33,6 +33,14 @@ design's; holding OPTIONS for a second ends the title.
   feedback)` and a const `draw(frame)`, assembled from the kit's components and
   themes. The kit's guides are in PS5_VKHomebrewUI's `docs/` (CRAFT.md first, then
   COMPONENTS.md, THEMES.md and KIT.md), its headers in `.deps/hui/src/`.
+- **The home page** in it is HDrezkaTV's (the Android TV app, v1.4.0): its `tv_*`
+  members, measured from the app in dp, two virtual pixels each. A drawer of round
+  icons that opens over the page, the pill tabs Смотрят сейчас / Последние
+  поступления / Популярное, the type chips, a seven-column poster grid that pages
+  as the app does (`/?filter=…&genre=…`, `/page/N/`), and the clock. Roboto and the
+  Material icons it needs are in `ps5/assets/`. `ps5/tools/host-reference.sh` draws
+  it on a PC; `HDREZKA_HOST_KEYS="3:down,3.5:right,4:confirm"` presses buttons
+  there, each at its second.
 - **The program** around it, `examples/hdrezka/hdrezka.cpp`, owns the frame: input, sound,
   the light bar, the layers. A 3D scene goes under the screen as in the template's
   `uioverlay` sample (`kit.renderer.import_texture`).

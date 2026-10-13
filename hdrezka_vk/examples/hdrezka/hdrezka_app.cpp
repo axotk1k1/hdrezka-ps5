@@ -450,6 +450,177 @@ void App::load_home_async(int filter_idx)
     });
 }
 
+// Posters of the movies that have none yet, those from poster_hint on first:
+// the rows the focus is on are not kept waiting behind the whole list. A page
+// appended to the list restarts the worker, and what the last run did not
+// reach is picked up again here.
+static void queue_missing_posters(App *self, std::atomic<bool> &stop)
+{
+    std::set<std::string> tried;
+    while (!stop) {
+        std::string cover_url;
+        int index = -1;
+        {
+            std::lock_guard<std::mutex> lock(self->catalog_mutex);
+            const int count = static_cast<int>(self->movies.size());
+            const int hint = std::clamp(self->poster_hint.load(), 0, std::max(0, count - 1));
+            for (int k = 0; k < count; ++k) {
+                const int i = (hint + k) % count;
+                const MovieData &m = self->movies[static_cast<size_t>(i)];
+                if (m.texture_ready || m.cover_url.empty() || tried.count(m.cover_url))
+                    continue;
+                index = i;
+                cover_url = m.cover_url;
+                break;
+            }
+        }
+        if (index < 0)
+            break;
+        tried.insert(cover_url);
+        std::vector<uint8_t> img_bytes;
+        if (!self->client.http_get_binary(cover_url, img_bytes))
+            continue;
+        int w = 0, h = 0;
+        uint8_t *rgba = TextureLoader::decode_image_rgba(img_bytes.data(), img_bytes.size(), &w, &h);
+        if (!rgba || w <= 0 || h <= 0)
+            continue;
+        App::PendingTexture pt;
+        pt.movie_index = index;
+        pt.width = w;
+        pt.height = h;
+        pt.rgba.assign(rgba, rgba + w * h * 4);
+        TextureLoader::free_decoded_image(rgba);
+        std::lock_guard<std::mutex> p_lock(self->pending_mutex);
+        self->pending_textures.push_back(std::move(pt));
+    }
+}
+
+static const char *const kListFilters[] = {"watching", "last", "popular"};
+static const int kListGenres[] = {0, 1, 2, 3, 82};
+
+static std::vector<CatalogItem> fetch_list_page(Client &client, int tab, int type, int kind, int page,
+                                                bool *has_next)
+{
+    if (kind == 1)
+        return client.get_movie_list("last", kListGenres[type], page, has_next, "/new");
+    if (kind == 2)
+        return client.get_movie_list("soon", kListGenres[type], page, has_next);
+    return client.get_movie_list(kListFilters[tab], kListGenres[type], page, has_next);
+}
+
+void App::load_movie_list_async(int tab, int type, int kind)
+{
+    write_log("[DEBUG] App::load_movie_list_async tab %d type %d kind %d\n", tab, type, kind);
+    tab = std::clamp(tab, 0, 2);
+    type = std::clamp(type, 0, 4);
+    kind = std::clamp(kind, 0, 2);
+    current_category = -1;
+    catalog_loading = true;
+
+    if (worker_thread_.joinable()) {
+        stop_worker_ = true;
+        worker_thread_.join();
+        stop_worker_ = false;
+    }
+    {
+        // Posters decoded for the list that is going away
+        std::lock_guard<std::mutex> p_lock(pending_mutex);
+        pending_textures.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        list_tab = tab;
+        list_type = type;
+        list_kind = kind;
+        home_filter = tab;
+    }
+
+    worker_thread_ = BigThread([this, tab, type, kind]() {
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            home_layout = true;
+            home_sections.clear();
+            featured_indices.clear();
+            featured_movies.clear();
+            movies.clear();
+            list_page = 0;
+            list_has_next = false;
+            catalog_status = "Загрузка...";
+            catalog_version++;
+        }
+        if (!client.pick_mirror()) {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            catalog_status = "Ошибка сети";
+            catalog_loading = false;
+            catalog_version++;
+            return;
+        }
+        bool has_next = false;
+        auto items = fetch_list_page(client, tab, type, kind, 1, &has_next);
+        if (stop_worker_) {
+            catalog_loading = false;
+            return;
+        }
+        std::vector<MovieData> new_movies;
+        new_movies.reserve(items.size());
+        for (const auto &it : items)
+            new_movies.push_back(movie_from_catalog(it, ""));
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            movies = std::move(new_movies);
+            list_page = 1;
+            list_has_next = has_next && !movies.empty();
+            catalog_status = movies.empty() ? "Ничего не найдено" : "";
+            catalog_version++;
+        }
+        catalog_loading = false;
+        queue_missing_posters(this, stop_worker_);
+    });
+}
+
+void App::load_movie_list_more_async()
+{
+    int tab = 0, type = 0, kind = 0, page = 0;
+    {
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        if (!home_layout || !list_has_next || list_page < 1)
+            return;
+        tab = list_tab;
+        type = list_type;
+        kind = list_kind;
+        page = list_page + 1;
+    }
+    if (catalog_loading || list_more_loading.exchange(true))
+        return;
+
+    if (worker_thread_.joinable()) {
+        stop_worker_ = true;
+        worker_thread_.join();
+        stop_worker_ = false;
+    }
+
+    worker_thread_ = BigThread([this, tab, type, kind, page]() {
+        bool has_next = false;
+        auto items = fetch_list_page(client, tab, type, kind, page, &has_next);
+        if (!stop_worker_) {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            // The site's lists shift between requests: skip what is already here
+            std::set<std::string> known;
+            for (const auto &m : movies)
+                known.insert(m.url);
+            for (const auto &it : items) {
+                if (known.insert(it.url).second)
+                    movies.push_back(movie_from_catalog(it, ""));
+            }
+            list_page = page;
+            list_has_next = has_next && !items.empty();
+            catalog_version++;
+        }
+        list_more_loading = false;
+        queue_missing_posters(this, stop_worker_);
+    });
+}
+
 static std::string photo_address(const std::string &raw, const std::string &mirror);
 
 void App::search_async(const std::string &query)
@@ -1248,7 +1419,7 @@ void App::update(float dt)
     if (!network_started_) {
         write_log("[DEBUG] App::update network_started = false, starting\n");
         network_started_ = true;
-        load_home_async(home_filter);
+        load_movie_list_async(list_tab, list_type);
         refresh_account_async();
     }
 

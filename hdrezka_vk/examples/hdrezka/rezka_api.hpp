@@ -167,6 +167,15 @@ public:
                                          const std::string &filter = "popular",
                                          int page = 1);
 
+    // The home list of HDrezkaTV (its "MovieList" screen): one page of
+    // <mirror>[/page/N]/?filter=<filter>[&genre=G]. filter: watching | last |
+    // popular; genre: 0 all, 1 films, 2 series, 3 cartoons, 82 anime.
+    // has_next tells whether the site offers a page after this one.
+    // prefix is the section before it: "" for the home list, "/new" for Новинки.
+    std::vector<CatalogItem> get_movie_list(const std::string &filter, int genre, int page,
+                                            bool *has_next = nullptr,
+                                            const std::string &prefix = "");
+
     // Home discover rows: hero from newest slider + films/series/cartoons for filter.
     struct HomePage {
         std::vector<CatalogItem> hero;

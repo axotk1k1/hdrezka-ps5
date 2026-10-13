@@ -43,6 +43,7 @@ struct pad &ps5_pad();
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <string>
@@ -480,6 +481,11 @@ class Store final : public app::Concept
         }
         home_layout_ = home;
         home_sections_ = std::move(sections);
+        {
+            std::lock_guard<std::mutex> lock(app.catalog_mutex);
+            tv_status_ = app.catalog_status;
+        }
+        tv_rebuild_cards(current_movies);
 
         const int count = static_cast<int>(current_movies.size());
         if (count == 0)
@@ -779,8 +785,44 @@ class Store final : public app::Concept
         }
     }
 
-    void update(const InputFrame &input, float dt, app::Feedback &feedback) override
+#if defined(PS5_HOST_REFERENCE)
+    // The reference build has no pad. HDREZKA_HOST_KEYS scripts one for its
+    // pictures: "2.0:left,2.5:down,3:confirm" presses each at its second.
+    void host_script(InputFrame &input, float dt)
     {
+        static const char *script = std::getenv("HDREZKA_HOST_KEYS");
+        static float seconds = 0.0f;
+        const float before = seconds;
+        seconds += dt;
+        for (const char *p = script; p && *p;)
+        {
+            char *colon = nullptr;
+            const float at = std::strtof(p, &colon);
+            if (!colon || *colon != ':')
+                break;
+            const char *name = colon + 1;
+            const char *end = std::strchr(name, ',');
+            const std::string key(name, end ? static_cast<std::size_t>(end - name) : std::strlen(name));
+            if (at > before && at <= seconds)
+            {
+                if (key == "left") input.nav = Direction::left;
+                else if (key == "right") input.nav = Direction::right;
+                else if (key == "up") input.nav = Direction::up;
+                else if (key == "down") input.nav = Direction::down;
+                else if (key == "confirm") input.pressed |= action_bit(Action::confirm);
+                else if (key == "back") input.pressed |= action_bit(Action::back);
+            }
+            p = end ? end + 1 : nullptr;
+        }
+    }
+#endif
+
+    void update(const InputFrame &pad_input, float dt, app::Feedback &feedback) override
+    {
+        InputFrame input = pad_input;
+#if defined(PS5_HOST_REFERENCE)
+        host_script(input, dt);
+#endif
         if (rezka::App::instance().is_playing || rezka::App::instance().is_buffering)
         {
             update_player(input, dt, feedback);
@@ -838,17 +880,15 @@ class Store final : public app::Concept
             return;
         }
 
-        // The backdrop stays charcoal; only its undertone and one soft light
-        // behind the banner take the featured title's colours.
-        const float away = tween::clamp01(scroll_.value / (kChipsY - kStickY));
+        // The app's surface colour, plain, behind everything.
         frame.backdrop.mode = gfx::BackdropMode::gradient;
-        frame.backdrop.colors[0] = palette_[0].value();
-        frame.backdrop.colors[1] = palette_[1].value();
-        frame.backdrop.colors[2] = palette_[2].value();
-        frame.backdrop.params[0] = 0.72f;
-        frame.backdrop.params[1] = 0.3f - 0.25f * away;
-        frame.backdrop.params[2] = 0.26f - 0.12f * away;
-        frame.backdrop.time = clock_;
+        frame.backdrop.colors[0] = tv_surface();
+        frame.backdrop.colors[1] = tv_surface();
+        frame.backdrop.colors[2] = tv_surface();
+        frame.backdrop.params[0] = 0.0f;
+        frame.backdrop.params[1] = 0.0f;
+        frame.backdrop.params[2] = 0.0f;
+        frame.backdrop.time = 0.0f;
 
         const float page = page_.value;
         const float drawer = drawer_.value;
@@ -858,20 +898,11 @@ class Store final : public app::Concept
         gfx::DrawList &scene = frame.scene;
         scene.push_transform(1.0f - 0.03f * std::max(page, 0.6f * drawer) * travel(), 960, 540, 0,
                              0);
-        draw_top_bar(scene);
-        scene.push_clip({0, kPageTop, kWidth, kHeight - kPageTop});
-        draw_banner(scene);
-        draw_grid(scene);
-        draw_chips(scene);
-        scene.pop_clip();
+        tv_draw_home(scene);
         scene.pop_transform();
-        // Each layer has its own hint row in the same corner. A row leaves
-        // during the first third of the next layer's arrival and that layer's
-        // row comes in afterwards, so two rows are never legible at once.
-        const auto leaving = [](float above) { return 1.0f - tween::clamp01(above * 3.0f); };
+        // The home page has no hint row, as the app has none; the layers over
+        // it keep theirs, each arriving once its layer has.
         const auto arriving = [](float value) { return tween::clamp01((value - 0.4f) / 0.6f); };
-        draw_hints(scene, 0,
-                   tween::stagger(age_, 10, 0.07f, 0.5f) * leaving(std::max(page, drawer)));
 
         gfx::DrawList &overlay = frame.overlay;
         frame.glass = page > 0.004f || dialog > 0.004f || toast_.value > 0.01f || qr_.value > 0.01f ||
@@ -1761,6 +1792,12 @@ class Store final : public app::Concept
         zone_ = Zone::grid;
         focus_ = 0;
         scroll_.snap(0.0f);
+        tv_zone_ = TvZone::grid;
+        tv_focus_ = 0;
+        tv_tab_delay_ = -1.0f;
+        tv_scroll_.snap(0.0f);
+        tv_cards_.clear();
+        home_layout_ = false;
         {
             auto &app = rezka::App::instance();
             std::lock_guard<std::mutex> lock(app.catalog_mutex);
@@ -2075,8 +2112,858 @@ class Store final : public app::Concept
                  gfx::Align::center);
     }
 
+    // ---- the home page: HDrezkaTV's "MovieList" screen ----------------------
+    //
+    // The Android TV app's home, measure for measure: its layout is in dp on a
+    // 960x540 screen, which is two virtual pixels a dp here. A navigation
+    // drawer of round icons on the left (it opens over a dimmed page that
+    // slides aside), a pill tab row (Смотрят сейчас / Последние поступления /
+    // Популярное) that switches as the focus moves, a row of type chips, a
+    // seven-column grid of 2:3 posters with two lines of title and two of
+    // year, country and genre, and a clock hanging from the top edge. Colours
+    // are the app's dark scheme, type is Roboto at the app's sizes.
+
+    static constexpr float kTvDp = 2.0f;
+    static constexpr float kTvRail = 80.0f * kTvDp;        // the closed drawer's width
+    static constexpr float kTvSlide = 220.0f * kTvDp;      // the page moves this far when it opens
+    static constexpr float kTvItem = 56.0f * kTvDp;        // a drawer item, closed: a circle
+    static constexpr float kTvItemOpen = 256.0f * kTvDp;   // ... and open
+    static constexpr float kTvPad = 48.0f * kTvDp;         // the page's side padding
+    static constexpr float kTvTabsY = 24.0f * kTvDp;       // 16 above the row, 8 inside it
+    static constexpr float kTvTabH = 36.0f * kTvDp;
+    static constexpr float kTvChipsY = 84.0f * kTvDp;
+    static constexpr float kTvChipH = 36.0f * kTvDp;
+    static constexpr float kTvGridTop = 136.0f * kTvDp;    // the grid's viewport starts here
+    static constexpr float kTvGridPad = 24.0f * kTvDp;     // its content padding, top and bottom
+    static constexpr float kTvGap = 12.0f * kTvDp;
+    static constexpr int kTvColumns = 7;                   // the app's default "Столбцы в списках"
+    static constexpr float kTvCardW =
+        (kWidth - kTvRail - 2.0f * kTvPad - (kTvColumns - 1) * kTvGap) / kTvColumns;
+    static constexpr float kTvCoverH = kTvCardW * 1.5f;
+    static constexpr float kTvTitleSize = 14.0f * kTvDp;
+    static constexpr float kTvSubSize = 12.0f * kTvDp;
+    static constexpr float kTvCardH =
+        kTvCoverH + 12.0f * kTvDp + 2.0f * kTvTitleSize + 4.0f * kTvDp + 2.0f * kTvSubSize;
+    static constexpr float kTvRowPitch = kTvCardH + kTvGap;
+    static constexpr int kTvDrawerItems = 7;
+    static constexpr int kTvHomeItem = 2;
+    static constexpr int kTvTabs = 3;
+    static constexpr int kTvTypes = 5;
+
+    static constexpr const char *kTvDrawerNames[kTvDrawerItems] = {
+        "Профиль", "Поиск", "Главная", "Новинки", "Подборки", "Анонсы", "Настройки"};
+    static constexpr const char *kTvTabNames[kTvTabs] = {"Смотрят сейчас", "Последние поступления",
+                                                          "Популярное"};
+    static constexpr const char *kTvTypeNames[kTvTypes] = {"Все", "Фильмы", "Сериалы",
+                                                            "Мультфильмы", "Аниме"};
+
+    // The app's dark colour scheme (q9.a in the APK), by Material role.
+    static Color tv_surface() { return Color::rgb(0x191c1e); }
+    static Color tv_on_surface() { return Color::rgb(0xe1e2e5); }
+    static Color tv_surface_variant() { return Color::rgb(0x40484c); }
+    static Color tv_on_surface_variant() { return Color::rgb(0xc0c7cd); }
+    static Color tv_primary_container() { return Color::rgb(0x004d66); }
+    static Color tv_on_primary_container() { return Color::rgb(0xc0e8ff); }
+    static Color tv_on_primary() { return Color::rgb(0x003547); }
+    static Color tv_secondary() { return Color::rgb(0xb4cad6); }
+    static Color tv_secondary_container() { return Color::rgb(0x364954); }
+    static Color tv_on_secondary_container() { return Color::rgb(0xd0e6f3); }
+    static Color tv_border() { return Color::rgb(0x8a9297); }
+    static Color tv_inverse_on_surface() { return Color::rgb(0x191c1e); }
+
+    enum class TvZone : std::uint8_t
+    {
+        drawer,
+        tabs,
+        chips,
+        grid,
+    };
+
+    // What a card shows, measured once per title.
+    struct TvCard
+    {
+        std::string url;
+        std::string title[2];
+        std::string sub[2];
+        std::uint32_t texture = 0;
+        float lift = 0.0f; // 1 while the focus is on it
+    };
+
+    // Roboto, in the two kit font slots this title does not otherwise use.
+    const ui::FontRef &tv_regular() const
+    {
+        return context_.fonts.pixel;
+    }
+    const ui::FontRef &tv_medium() const
+    {
+        return context_.fonts.hand;
+    }
+
+    // One line of text in a line box of the given height, as Android centres
+    // a font's ascent and descent in it. Returns the width.
+    float tv_text(gfx::DrawList &list, const ui::FontRef &font, std::string_view value, float x,
+                  float top, float size, float line_height, Color color,
+                  gfx::Align align = gfx::Align::left, float tracking = 0.0f) const
+    {
+        const float ascent = font.font->ascent(size);
+        const float descent = font.font->descent(size);
+        const float baseline = top + (line_height - (ascent + descent)) * 0.5f + ascent;
+        return list.text(*font.font, font.texture, value, x, baseline, size, color, align, tracking);
+    }
+
+    // At most two lines, the second ending in an ellipsis when text remains.
+    static void tv_two_lines(const gfx::Font &font, const std::string &text, float size, float width,
+                             std::string out[2])
+    {
+        out[0].clear();
+        out[1].clear();
+        std::vector<std::string> lines = font.wrap(text, size, width);
+        // A word wider than the column breaks where it must, as on Android.
+        for (std::size_t i = 0; i < lines.size() && i < 3; ++i)
+        {
+            if (font.measure(lines[i], size) <= width)
+                continue;
+            std::size_t cut = 0;
+            for (std::size_t at = 0; at < lines[i].size();)
+            {
+                std::size_t next = at + 1;
+                while (next < lines[i].size() && (static_cast<unsigned char>(lines[i][next]) & 0xc0) == 0x80)
+                    ++next;
+                if (font.measure(std::string_view(lines[i]).substr(0, next), size) > width)
+                    break;
+                cut = at = next;
+            }
+            if (cut == 0)
+                continue;
+            lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(i) + 1, lines[i].substr(cut));
+            lines[i].resize(cut);
+        }
+        if (lines.empty())
+            return;
+        out[0] = lines[0];
+        if (lines.size() == 2)
+            out[1] = lines[1];
+        else if (lines.size() > 2)
+        {
+            std::string rest = lines[1];
+            for (std::size_t i = 2; i < lines.size(); ++i)
+                rest += " " + lines[i];
+            out[1] = font.fit(rest, size, width);
+        }
+    }
+
+    // The cards' texts and covers, from the catalogue copy made by
+    // refresh_catalog_from_app. Titles already measured keep their lines.
+    void tv_rebuild_cards(const std::vector<rezka::MovieData> &movies)
+    {
+        std::vector<TvCard> cards(movies.size());
+        for (std::size_t i = 0; i < movies.size(); ++i)
+        {
+            const rezka::MovieData &m = movies[i];
+            TvCard &card = cards[i];
+            if (i < tv_cards_.size() && tv_cards_[i].url == m.url)
+                card = std::move(tv_cards_[i]);
+            else
+            {
+                card.url = m.url;
+                tv_two_lines(*tv_medium().font, m.title, kTvTitleSize, kTvCardW, card.title);
+                tv_two_lines(*tv_regular().font, m.info, kTvSubSize, kTvCardW, card.sub);
+            }
+            card.texture = m.texture_ready ? m.texture_id : 0;
+        }
+        tv_cards_ = std::move(cards);
+        const int count = static_cast<int>(tv_cards_.size());
+        tv_focus_ = std::clamp(tv_focus_, 0, std::max(0, count - 1));
+        if (count == 0 && tv_zone_ == TvZone::grid)
+            tv_zone_ = home_layout_ ? TvZone::chips : TvZone::drawer;
+    }
+
+    void tv_ensure_icons()
+    {
+        auto &app = rezka::App::instance();
+        if (tv_icons_ != 0 || tv_icons_tried_ || !app.renderer)
+            return;
+        tv_icons_tried_ = true;
+        int w = 0, h = 0;
+        std::uint8_t *rgba =
+            rezka::TextureLoader::load_file_rgba(VK_EXAMPLE_ASSETS_DIR "tv/icons.png", &w, &h);
+        if (rgba && w > 0 && h > 0)
+            tv_icons_ = app.renderer->create_texture(w, h, rgba);
+        if (rgba)
+            rezka::TextureLoader::free_decoded_image(rgba);
+    }
+
+    // The Material icons of the strip, in its order.
+    enum TvIcon
+    {
+        kTvIconAccount,
+        kTvIconSearch,
+        kTvIconHome,
+        kTvIconNew,
+        kTvIconLibrary,
+        kTvIconCampaign,
+        kTvIconSettings,
+        kTvIconCheck,
+        kTvIconCount,
+    };
+    void tv_icon(gfx::DrawList &list, int icon, float x, float y, float size, Color color) const
+    {
+        if (tv_icons_ == 0)
+            return;
+        const float u = 1.0f / static_cast<float>(kTvIconCount);
+        list.image(tv_icons_, {x, y, size, size}, {u * static_cast<float>(icon), 0.0f, u, 1.0f},
+                   color);
+    }
+
+    // ---- layout ------------------------------------------------------------
+
+    // The page's left edge: it slides aside as the drawer opens.
+    float tv_page_x() const
+    {
+        return kTvRail + kTvSlide * tv_open_.value;
+    }
+    static float tv_drawer_item_y(int item)
+    {
+        // Seven items centred in the height, the profile set apart above and
+        // the settings below by 24 dp.
+        const float gap = 24.0f * kTvDp;
+        const float total = kTvDrawerItems * kTvItem + 2.0f * gap;
+        float y = (kHeight - total) * 0.5f + static_cast<float>(item) * kTvItem;
+        if (item >= 1)
+            y += gap;
+        if (item == kTvDrawerItems - 1)
+            y += gap;
+        return y;
+    }
+    // Tab rectangles on the page (x from the page's left edge).
+    void tv_tab_layout(Rect out[kTvTabs]) const
+    {
+        float x = kTvPad;
+        for (int i = 0; i < kTvTabs; ++i)
+        {
+            const float w = tv_medium().measure(kTvTabNames[i], 16.0f * kTvDp, 0.2f * kTvDp) +
+                            32.0f * kTvDp;
+            out[i] = {x, kTvTabsY, w, kTvTabH};
+            x += w + 12.0f * kTvDp;
+        }
+    }
+    void tv_chip_layout(Rect out[kTvTypes]) const
+    {
+        float x = kTvPad;
+        for (int i = 0; i < kTvTypes; ++i)
+        {
+            const bool selected = i == tv_type_;
+            // A selected chip leads with a check mark: 12 before it, 8 after.
+            float w = tv_medium().measure(kTvTypeNames[i], 14.0f * kTvDp, 0.1f * kTvDp) +
+                      (selected ? 12.0f + 18.0f + 8.0f + 16.0f : 32.0f) * kTvDp;
+            out[i] = {x, kTvChipsY, w, kTvChipH};
+            x += w + 12.0f * kTvDp;
+        }
+    }
+    // A card's place in the grid's content (before scrolling), from the page's left edge.
+    static Rect tv_card_rect(int index)
+    {
+        const int col = index % kTvColumns;
+        const int row = index / kTvColumns;
+        return {kTvPad + static_cast<float>(col) * (kTvCardW + kTvGap),
+                kTvGridPad + static_cast<float>(row) * kTvRowPitch, kTvCardW, kTvCardH};
+    }
+    // Compose's bring-into-view on a TV: the focused row's top rests 30% down
+    // the viewport, as far as the content allows.
+    float tv_scroll_target() const
+    {
+        const int count = static_cast<int>(tv_cards_.size());
+        if (tv_zone_ != TvZone::grid || count == 0)
+            return tv_scroll_.target;
+        const float view = kHeight - kTvGridTop;
+        const int rows = (count + kTvColumns - 1) / kTvColumns;
+        const float content = 2.0f * kTvGridPad + static_cast<float>(rows) * kTvRowPitch - kTvGap;
+        const float top = tv_card_rect(tv_focus_).y;
+        return std::clamp(top - 0.3f * view, 0.0f, std::max(0.0f, content - view));
+    }
+
+    // ---- input -------------------------------------------------------------
+
+    void tv_tick(app::Feedback &feedback, float x) const
+    {
+        feedback.play(audio::Cue::focus, 1.0f, ui::pan_for_x(x));
+    }
+    void tv_refuse(app::Feedback &feedback, bool repeat) const
+    {
+        if (repeat)
+            return;
+        feedback.play(audio::Cue::error, 1.0f, 0.0f, 0.6f);
+        feedback.rumble(0.25f, 0.05f);
+    }
+    void tv_open_drawer(app::Feedback &feedback)
+    {
+        tv_return_ = tv_zone_;
+        tv_zone_ = TvZone::drawer;
+        tv_drawer_focus_ = tv_kind_ == 1 ? 3 : tv_kind_ == 2 ? 5 : kTvHomeItem;
+        feedback.play(audio::Cue::open);
+    }
+    void tv_close_drawer()
+    {
+        const bool has_cards = !tv_cards_.empty();
+        TvZone to = tv_return_;
+        if (!home_layout_)
+        {
+            // Search results have the grid alone to go back to
+            if (!has_cards)
+                return;
+            to = TvZone::grid;
+        }
+        else
+        {
+            if (to == TvZone::drawer)
+                to = TvZone::tabs;
+            if (to == TvZone::grid && !has_cards)
+                to = TvZone::chips;
+            if (to == TvZone::tabs && tv_kind_ != 0)
+                to = TvZone::chips;
+        }
+        tv_zone_ = to;
+    }
+    // Starts over with a list: the home tabs, Новинки or Анонсы.
+    void tv_load(int kind)
+    {
+        tv_kind_ = kind;
+        tv_tab_delay_ = -1.0f;
+        tv_focus_ = 0;
+        tv_scroll_.snap(0.0f);
+        tv_cards_.clear();
+        home_layout_ = true;
+        rezka::App::instance().load_movie_list_async(tv_tab_, tv_type_, tv_kind_);
+    }
+    void tv_open_profile(app::Feedback &feedback)
+    {
+        profile_open_ = true;
+        search_open_ = false;
+        page_open_ = false;
+        key_lang_ = 0; // ENG for email/password
+        key_row_ = 0;
+        key_col_ = 0;
+        login_field_ = 0;
+        login_fields_focus_ = true;
+        feedback.play(audio::Cue::open);
+    }
+    void tv_open_search(app::Feedback &feedback)
+    {
+        search_open_ = true;
+        profile_open_ = false;
+        page_open_ = false;
+        feedback.play(audio::Cue::open);
+    }
+
+    void tv_update_drawer(const InputFrame &input, app::Feedback &feedback)
+    {
+        if (input.nav == Direction::up || input.nav == Direction::down)
+        {
+            const int next = tv_drawer_focus_ + (input.nav == Direction::down ? 1 : -1);
+            if (next < 0 || next >= kTvDrawerItems)
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                tv_drawer_focus_ = next;
+                tv_tick(feedback, kTvRail);
+            }
+        }
+        else if (input.nav == Direction::right || input.is_pressed(Action::back))
+        {
+            tv_close_drawer();
+            feedback.play(audio::Cue::back);
+        }
+        else if (input.nav == Direction::left)
+            tv_refuse(feedback, input.nav_repeat);
+
+        if (!input.is_pressed(Action::confirm) || tv_zone_ != TvZone::drawer)
+            return;
+        switch (tv_drawer_focus_)
+        {
+        case 0:
+            tv_close_drawer();
+            tv_open_profile(feedback);
+            break;
+        case 1:
+            tv_close_drawer();
+            tv_open_search(feedback);
+            break;
+        case 2:
+        case 3:
+        case 5:
+        {
+            const int kind = tv_drawer_focus_ == 3 ? 1 : tv_drawer_focus_ == 5 ? 2 : 0;
+            if (kind != tv_kind_ || !home_layout_)
+                tv_load(kind);
+            tv_return_ = kind == 0 ? TvZone::tabs : TvZone::chips;
+            tv_close_drawer();
+            feedback.play(audio::Cue::select);
+            break;
+        }
+        default:
+            // Подборки and Настройки have no screen here yet; the app's own word for that.
+            show_message("В разработке");
+            feedback.play(audio::Cue::select);
+            break;
+        }
+    }
+
+    void tv_update_home(const InputFrame &input, app::Feedback &feedback)
+    {
+        tv_ensure_icons();
+        if (input.is_pressed(Action::menu) || ((ps5_pad().pressed & PAD_OPTIONS) != 0))
+        {
+            tv_open_profile(feedback);
+            return;
+        }
+        if (tv_zone_ == TvZone::drawer)
+        {
+            tv_update_drawer(input, feedback);
+            return;
+        }
+        const int count = static_cast<int>(tv_cards_.size());
+        // Search results take the page: no tabs, no chips, and Circle leaves them.
+        const bool listing = home_layout_;
+        if (!listing && tv_zone_ != TvZone::grid)
+            tv_zone_ = count > 0 ? TvZone::grid : TvZone::drawer;
+        if (listing && tv_kind_ != 0 && tv_zone_ == TvZone::tabs)
+            tv_zone_ = TvZone::chips;
+
+        if (input.is_pressed(Action::back))
+        {
+            if (!listing)
+            {
+                tv_zone_ = TvZone::tabs;
+                tv_load(0);
+                feedback.play(audio::Cue::back);
+            }
+            else if (tv_zone_ == TvZone::grid && tv_focus_ >= kTvColumns)
+            {
+                tv_focus_ %= kTvColumns;
+                feedback.play(audio::Cue::back);
+            }
+            else if (tv_zone_ == TvZone::grid)
+            {
+                tv_zone_ = TvZone::chips;
+                tv_chip_focus_ = tv_type_;
+                feedback.play(audio::Cue::back);
+            }
+            else
+                tv_open_drawer(feedback);
+            return;
+        }
+
+        const Direction nav = input.nav;
+        if (tv_zone_ == TvZone::tabs && nav != Direction::none)
+        {
+            if (nav == Direction::left || nav == Direction::right)
+            {
+                const int next = tv_tab_ + (nav == Direction::right ? 1 : -1);
+                if (next < 0)
+                    tv_open_drawer(feedback);
+                else if (next >= kTvTabs)
+                    tv_refuse(feedback, input.nav_repeat);
+                else
+                {
+                    // The tab under the focus is the selected one, as in the
+                    // app; the list follows once the focus rests.
+                    tv_tab_ = next;
+                    tv_tab_delay_ = 0.35f;
+                    tv_focus_ = 0;
+                    tv_scroll_.snap(0.0f);
+                    Rect tabs[kTvTabs];
+                    tv_tab_layout(tabs);
+                    tv_tick(feedback, tv_page_x() + tabs[next].cx());
+                }
+            }
+            else if (nav == Direction::down)
+            {
+                tv_zone_ = TvZone::chips;
+                tv_chip_focus_ = tv_type_;
+                tv_tick(feedback, tv_page_x() + kTvPad);
+            }
+            else
+                tv_refuse(feedback, input.nav_repeat);
+        }
+        else if (tv_zone_ == TvZone::chips && nav != Direction::none)
+        {
+            if (nav == Direction::left || nav == Direction::right)
+            {
+                const int next = tv_chip_focus_ + (nav == Direction::right ? 1 : -1);
+                if (next < 0)
+                    tv_open_drawer(feedback);
+                else if (next >= kTvTypes)
+                    tv_refuse(feedback, input.nav_repeat);
+                else
+                {
+                    tv_chip_focus_ = next;
+                    Rect chips[kTvTypes];
+                    tv_chip_layout(chips);
+                    tv_tick(feedback, tv_page_x() + chips[next].cx());
+                }
+            }
+            else if (nav == Direction::up)
+            {
+                if (tv_kind_ == 0)
+                {
+                    tv_zone_ = TvZone::tabs;
+                    tv_tick(feedback, tv_page_x() + kTvPad);
+                }
+                else
+                    tv_refuse(feedback, input.nav_repeat);
+            }
+            else if (count > 0)
+            {
+                // The card last left, or the one under the chip.
+                tv_zone_ = TvZone::grid;
+                tv_focus_ = std::clamp(tv_focus_, 0, count - 1);
+                tv_tick(feedback, tv_page_x() + tv_card_rect(tv_focus_).cx());
+            }
+            else
+                tv_refuse(feedback, input.nav_repeat);
+        }
+        else if (tv_zone_ == TvZone::grid && nav != Direction::none && count > 0)
+        {
+            const int col = tv_focus_ % kTvColumns;
+            int next = tv_focus_;
+            if (nav == Direction::left)
+                next = col == 0 ? -1 : tv_focus_ - 1;
+            else if (nav == Direction::right)
+                next = (col == kTvColumns - 1 || tv_focus_ + 1 >= count) ? tv_focus_ : tv_focus_ + 1;
+            else if (nav == Direction::up)
+                next = tv_focus_ - kTvColumns;
+            else
+            {
+                // Down into a short last row lands on its last card.
+                next = tv_focus_ + kTvColumns;
+                if (next >= count && next / kTvColumns == (count - 1) / kTvColumns)
+                    next = count - 1;
+                else if (next >= count)
+                    next = tv_focus_;
+            }
+            if (nav == Direction::left && next < 0)
+                tv_open_drawer(feedback);
+            else if (nav == Direction::up && next < 0)
+            {
+                if (listing)
+                {
+                    tv_zone_ = TvZone::chips;
+                    tv_chip_focus_ = tv_type_;
+                    tv_tick(feedback, tv_page_x() + kTvPad);
+                }
+                else
+                    tv_refuse(feedback, input.nav_repeat);
+            }
+            else if (next == tv_focus_)
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                tv_focus_ = next;
+                tv_tick(feedback, tv_page_x() + tv_card_rect(next).cx());
+            }
+            // The app asks for the next page a page ahead of the focus.
+            if (listing && tv_focus_ + 2 * kTvColumns >= count)
+                rezka::App::instance().load_movie_list_more_async();
+        }
+
+        if (!input.is_pressed(Action::confirm))
+            return;
+        if (tv_zone_ == TvZone::grid && count > 0)
+            open_page(tv_focus_, false, feedback);
+        else if (tv_zone_ == TvZone::chips)
+        {
+            if (tv_chip_focus_ != tv_type_)
+            {
+                tv_type_ = tv_chip_focus_;
+                tv_load(tv_kind_);
+            }
+            feedback.play(audio::Cue::select);
+        }
+        else if (tv_zone_ == TvZone::tabs && count > 0)
+        {
+            tv_zone_ = TvZone::grid;
+            feedback.play(audio::Cue::select);
+        }
+    }
+
+    void tv_animate(float dt)
+    {
+        // A tab the focus has settled on loads its list.
+        if (tv_tab_delay_ >= 0.0f)
+        {
+            tv_tab_delay_ -= dt;
+            if (tv_tab_delay_ < 0.0f)
+                tv_load(0);
+        }
+        // Posters come for the rows in view first
+        rezka::App::instance().poster_hint =
+            std::max(0, (tv_focus_ / kTvColumns - 1) * kTvColumns);
+        tv_open_.target = tv_zone_ == TvZone::drawer ? 1.0f : 0.0f;
+        tv_open_.update(dt, omega(14.0f));
+        tv_scroll_.target = tv_scroll_target();
+        tv_scroll_.update(dt, omega(12.0f));
+        const bool covered = page_open_ || search_open_ || profile_open_ || person_open_;
+        tv_clock_.target = (tv_zone_ != TvZone::drawer && home_layout_ && !covered) ? 1.0f : 0.0f;
+        tv_clock_.update(dt, omega(12.0f));
+        const float rate = std::min(1.0f, dt * 14.0f);
+        for (int i = 0; i < static_cast<int>(tv_cards_.size()); ++i)
+        {
+            const float want = (tv_zone_ == TvZone::grid && i == tv_focus_) ? 1.0f : 0.0f;
+            float &lift = tv_cards_[static_cast<std::size_t>(i)].lift;
+            lift += (want - lift) * rate;
+        }
+        Rect tabs[kTvTabs];
+        tv_tab_layout(tabs);
+        tv_pill_.target(tabs[tv_tab_]);
+        if (!tv_pill_set_)
+        {
+            tv_pill_.snap(tabs[tv_tab_]);
+            tv_pill_set_ = true;
+        }
+        tv_pill_.update(dt, 22.0f);
+        tv_tabs_lit_.target = tv_zone_ == TvZone::tabs ? 1.0f : 0.0f;
+        tv_tabs_lit_.update(dt, 22.0f);
+    }
+
+    // ---- drawing -----------------------------------------------------------
+
+    void tv_draw_tabs(gfx::DrawList &list) const
+    {
+        const float size = 16.0f * kTvDp;
+        if (!home_layout_ || tv_kind_ != 0)
+        {
+            // Other lists are headed by their name where the tabs would be.
+            const char *title = !home_layout_ ? "Поиск" : tv_kind_ == 1 ? "Новинки" : "Анонсы";
+            tv_text(list, tv_regular(), title, kTvPad, kTvTabsY, 24.0f * kTvDp, kTvTabH,
+                    tv_on_surface());
+            return;
+        }
+        Rect tabs[kTvTabs];
+        tv_tab_layout(tabs);
+        // The pill: light under the focus, a quiet tint under the selected tab otherwise.
+        const float lit = tv_tabs_lit_.value;
+        const Color pill = mix(tv_secondary_container().with_alpha(0.4f), tv_on_surface(), lit);
+        const Rect p = tv_pill_.value();
+        list.rounded_rect(p, p.h * 0.5f, pill);
+        for (int i = 0; i < kTvTabs; ++i)
+        {
+            const bool selected = i == tv_tab_;
+            const Color resting =
+                selected ? tv_on_primary_container() : tv_on_surface().with_alpha(0.4f);
+            const Color focused = selected ? tv_surface_variant() : tv_on_surface();
+            tv_text(list, tv_medium(), kTvTabNames[i], tabs[i].x + 16.0f * kTvDp, tabs[i].y + 8.0f * kTvDp,
+                    size, 20.0f * kTvDp, mix(resting, focused, lit), gfx::Align::left, 0.2f * kTvDp);
+        }
+    }
+
+    void tv_draw_chips(gfx::DrawList &list) const
+    {
+        if (!home_layout_)
+            return;
+        Rect chips[kTvTypes];
+        tv_chip_layout(chips);
+        const float radius = 8.0f * kTvDp;
+        for (int i = 0; i < kTvTypes; ++i)
+        {
+            const bool selected = i == tv_type_;
+            const bool focused = tv_zone_ == TvZone::chips && i == tv_chip_focus_;
+            Color fill = kClear, content = tv_on_surface_variant(), border = tv_border();
+            float border_w = 1.0f * kTvDp;
+            if (focused && selected)
+            {
+                fill = tv_on_primary_container();
+                content = tv_on_primary();
+                border = tv_on_primary_container();
+                border_w = 1.1f * kTvDp;
+            }
+            else if (focused)
+            {
+                fill = tv_on_surface();
+                content = tv_inverse_on_surface();
+                border_w = 0.0f;
+            }
+            else if (selected)
+            {
+                fill = tv_secondary_container().with_alpha(0.4f);
+                content = tv_on_secondary_container();
+                border = tv_secondary();
+            }
+            if (border_w > 0.0f)
+                list.bordered_rect(chips[i], radius, fill, border_w, border);
+            else
+                list.rounded_rect(chips[i], radius, fill);
+            float x = chips[i].x + (selected ? 12.0f : 16.0f) * kTvDp;
+            if (selected)
+            {
+                tv_icon(list, kTvIconCheck, x, chips[i].cy() - 9.0f * kTvDp, 18.0f * kTvDp, content);
+                x += (18.0f + 8.0f) * kTvDp;
+            }
+            tv_text(list, tv_medium(), kTvTypeNames[i], x, chips[i].y + 8.0f * kTvDp, 14.0f * kTvDp,
+                    20.0f * kTvDp, content, gfx::Align::left, 0.1f * kTvDp);
+        }
+    }
+
+    void tv_draw_grid(gfx::DrawList &list) const
+    {
+        const float scroll = tv_scroll_.value;
+        const float view = kHeight - kTvGridTop;
+        const int count = static_cast<int>(tv_cards_.size());
+        const float radius = 8.0f * kTvDp;
+        const auto &app = rezka::App::instance();
+        if (count == 0)
+        {
+            if (app.catalog_loading)
+            {
+                // The app's placeholder grid while the first page loads
+                const float pulse = 0.35f + 0.15f * std::sin(clock_ * 3.0f);
+                for (int i = 0; i < 2 * kTvColumns; ++i)
+                {
+                    const Rect r = tv_card_rect(i);
+                    list.rounded_rect({r.x, kTvGridTop + r.y, r.w, kTvCoverH}, radius,
+                                      tv_surface_variant().with_alpha(pulse));
+                }
+            }
+            else if (!tv_status_.empty())
+                tv_text(list, tv_regular(), tv_status_, (kWidth - kTvRail) * 0.5f,
+                        kTvGridTop + view * 0.4f, 22.0f * kTvDp, 28.0f * kTvDp, tv_on_surface(),
+                        gfx::Align::center);
+            return;
+        }
+
+        // Only the rows in the viewport; the focused card goes last, over its neighbours.
+        const int first_row = std::max(0, static_cast<int>((scroll - kTvGridPad) / kTvRowPitch) - 1);
+        const int last_row = static_cast<int>((scroll + view) / kTvRowPitch) + 1;
+        const int first = first_row * kTvColumns;
+        const int last = std::min(count, (last_row + 1) * kTvColumns);
+        const int focused = tv_zone_ == TvZone::grid ? tv_focus_ : -1;
+        list.push_clip({-kTvSlide, kTvGridTop, kWidth + kTvSlide, view});
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            for (int i = first; i < last; ++i)
+            {
+                if ((i == focused) != (pass == 1))
+                    continue;
+                const TvCard &card = tv_cards_[static_cast<std::size_t>(i)];
+                Rect r = tv_card_rect(i);
+                r.y += kTvGridTop - scroll;
+                // The cover alone grows under the focus, by a tenth, with the
+                // border colour's 3 dp frame; the texts under it stay put.
+                const float scale = 1.0f + 0.1f * card.lift;
+                const Rect cover{r.x, r.y, r.w, kTvCoverH};
+                const Rect grown = scaled(cover, scale);
+                const float grown_radius = radius * scale;
+                if (card.texture != 0)
+                    list.image(card.texture, grown, cover_uv(grown), kWhite, grown_radius);
+                else
+                    list.rounded_rect(grown, grown_radius, tv_surface_variant());
+                if (card.lift > 0.01f)
+                    list.bordered_rect(grown, grown_radius, kClear, 3.0f * kTvDp * scale,
+                                       tv_border().with_alpha(card.lift));
+                float y = cover.y + kTvCoverH + 12.0f * kTvDp;
+                for (const std::string &line : card.title)
+                {
+                    if (!line.empty())
+                        tv_text(list, tv_medium(), line, r.x, y, kTvTitleSize, kTvTitleSize,
+                                tv_on_surface());
+                    y += kTvTitleSize;
+                }
+                y += 4.0f * kTvDp;
+                for (const std::string &line : card.sub)
+                {
+                    if (!line.empty())
+                        tv_text(list, tv_regular(), line, r.x, y, kTvSubSize, kTvSubSize,
+                                tv_on_surface().with_alpha(0.6f));
+                    y += kTvSubSize;
+                }
+            }
+        }
+        list.pop_clip();
+    }
+
+    // The clock: time over date on a tab hanging from the top edge, 64 dp in from the right.
+    void tv_draw_clock(gfx::DrawList &list) const
+    {
+        const float shown = tv_clock_.value;
+        if (shown < 0.01f)
+            return;
+        char time[16] = "";
+        char date[48] = "";
+        page_clock(time, sizeof(time), date, sizeof(date));
+        const float pad = 16.0f * kTvDp;
+        const float time_size = 22.0f * kTvDp;
+        const float date_size = 16.0f * kTvDp;
+        const float text_w = std::max(tv_medium().measure(time, time_size),
+                                      tv_regular().measure(date, date_size, 0.5f * kTvDp));
+        const float w = text_w + 2.0f * pad;
+        const float h = 28.0f * kTvDp + 24.0f * kTvDp + 2.0f * pad;
+        const float x = kWidth - 64.0f * kTvDp - w;
+        const float y = -(1.0f - shown) * h;
+        list.push_opacity(shown);
+        // Square at the top (it runs off the screen), 16 dp round at the bottom
+        list.rounded_rect({x, y - pad, w, h + pad}, pad, tv_primary_container());
+        tv_text(list, tv_medium(), time, x + w * 0.5f, y + pad, time_size, 28.0f * kTvDp,
+                tv_on_surface(), gfx::Align::center);
+        tv_text(list, tv_regular(), date, x + w * 0.5f, y + pad + 28.0f * kTvDp, date_size,
+                24.0f * kTvDp, tv_on_surface().with_alpha(0.7f), gfx::Align::center, 0.5f * kTvDp);
+        list.pop_opacity();
+    }
+
+    void tv_draw_drawer(gfx::DrawList &list) const
+    {
+        const float open = tv_open_.value;
+        // The modal drawer's scrim over the page
+        if (open > 0.004f)
+            list.rounded_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, kBlack.with_alpha(0.5f * open));
+        const float x = 12.0f * kTvDp;
+        const float width = kTvItem + (kTvItemOpen - kTvItem) * open;
+        const int selected = !home_layout_ ? 1 : tv_kind_ == 1 ? 3 : tv_kind_ == 2 ? 5 : kTvHomeItem;
+        for (int i = 0; i < kTvDrawerItems; ++i)
+        {
+            const Rect r{x, tv_drawer_item_y(i), width, kTvItem};
+            const bool focused = tv_zone_ == TvZone::drawer && i == tv_drawer_focus_;
+            // Closed, the items that are not selected step back to 40%.
+            Color content = tv_on_surface().with_alpha(0.4f + 0.6f * open);
+            if (focused)
+            {
+                list.rounded_rect(r, r.h * 0.5f, tv_on_surface());
+                content = tv_inverse_on_surface();
+            }
+            else if (i == selected)
+            {
+                list.rounded_rect(r, r.h * 0.5f, tv_secondary_container().with_alpha(0.4f));
+                content = tv_on_secondary_container();
+            }
+            tv_icon(list, i, r.x + 16.0f * kTvDp, r.y + 16.0f * kTvDp, 24.0f * kTvDp, content);
+            if (open > 0.02f)
+            {
+                list.push_clip({r.x, r.y, r.w - 16.0f * kTvDp, r.h});
+                tv_text(list, tv_medium(), kTvDrawerNames[i], r.x + (16.0f + 24.0f + 8.0f) * kTvDp,
+                        r.y + 18.0f * kTvDp, 14.0f * kTvDp, 20.0f * kTvDp,
+                        content.with_alpha(tween::clamp01(open * 1.5f - 0.5f)), gfx::Align::left,
+                        0.1f * kTvDp);
+                list.pop_clip();
+            }
+        }
+    }
+
+    void tv_draw_home(gfx::DrawList &list) const
+    {
+        list.push_transform(1.0f, 0.0f, 0.0f, tv_page_x(), 0.0f);
+        tv_draw_tabs(list);
+        tv_draw_chips(list);
+        tv_draw_grid(list);
+        list.pop_transform();
+        tv_draw_clock(list);
+        tv_draw_drawer(list);
+    }
+
     void update_home(const InputFrame &input, app::Feedback &feedback)
     {
+        // The home page is HDrezkaTV's; what follows is the store design's
+        // input, kept for its parts the other layers still use.
+        tv_update_home(input, feedback);
+        return;
+
         if (input.is_pressed(Action::menu) || ((ps5_pad().pressed & PAD_OPTIONS) != 0))
         {
             profile_open_ = true;
@@ -3368,6 +4255,7 @@ class Store final : public app::Concept
             drift_ += dt;
             drift_previous_ += dt;
         }
+        tv_animate(dt);
         banner_fade_.update(dt);
         banner_focus_.target = zone_ == Zone::banner ? 1.0f : 0.0f;
         banner_focus_.update(dt, 16.0f);
@@ -5088,6 +5976,27 @@ class Store final : public app::Concept
     float drift_ = 0.0f;          // seconds of artwork drift, current banner
     float drift_previous_ = 0.0f; // ... and the one fading out
     tween::Spring banner_focus_;
+
+    // The home page (HDrezkaTV's MovieList screen).
+    std::vector<TvCard> tv_cards_;
+    std::string tv_status_;       // what the catalogue says when it has no cards
+    TvZone tv_zone_ = TvZone::tabs;
+    TvZone tv_return_ = TvZone::tabs; // where the focus was when the drawer opened
+    int tv_kind_ = 0;             // 0 the home tabs, 1 Новинки, 2 Анонсы
+    int tv_tab_ = 0;              // Смотрят сейчас, as the app starts
+    int tv_type_ = 0;             // the selected type chip
+    int tv_chip_focus_ = 0;
+    int tv_focus_ = 0;            // the focused card
+    int tv_drawer_focus_ = kTvHomeItem;
+    float tv_tab_delay_ = -1.0f;  // seconds until the focused tab's list is asked for
+    tween::Spring tv_open_;       // the drawer
+    tween::Spring tv_scroll_;     // the grid
+    tween::Spring tv_clock_;
+    tween::Spring tv_tabs_lit_;   // the tab row has the focus
+    ui::SpringRect tv_pill_;
+    bool tv_pill_set_ = false;
+    std::uint32_t tv_icons_ = 0;
+    bool tv_icons_tried_ = false;
 
     // The product page.
     bool page_open_ = false;

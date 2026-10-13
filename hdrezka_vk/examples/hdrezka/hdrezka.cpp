@@ -166,6 +166,10 @@ public:
 
 	~VulkanExample() override
 	{
+		// The catalogue's worker may still be fetching posters: it ends here,
+		// not during the process's exit handlers, where the TLS library it
+		// is in is already being torn down.
+		rezka::App::instance().shutdown();
 		if (device) {
 			vkDeviceWaitIdle(device);
 		}

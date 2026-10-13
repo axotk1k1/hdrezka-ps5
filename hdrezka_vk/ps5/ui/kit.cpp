@@ -30,10 +30,13 @@ inline void local_write_log(const char* fmt, ...) {
 
 namespace {
 
-// The faces in ui::Fonts order, as the kit bakes them
+// The faces in ui::Fonts order, as the kit bakes them. This title has no use
+// for the Pixel and Sketch themes' faces: their two slots (fonts.pixel and
+// fonts.hand) carry Roboto Regular and Medium, the type of the HDrezkaTV home
+// page (ps5/assets/fonts/, baked with the kit's font-baker, european set).
 const char *const faceFiles[6] = {
 	"inter-regular.huifont", "inter-semibold.huifont", "montserrat-medium.huifont",
-	"dejavu-sans-mono.huifont", "press-start-2p.huifont", "patrick-hand.huifont",
+	"dejavu-sans-mono.huifont", "roboto-regular.huifont", "roboto-medium.huifont",
 };
 
 // The audio thread renders the mixer; posting to it never blocks the frame

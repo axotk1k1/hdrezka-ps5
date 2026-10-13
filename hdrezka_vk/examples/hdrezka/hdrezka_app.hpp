@@ -152,6 +152,20 @@ public:
     // HDrezkaTV home: newest slider hero + films/series/cartoons rows.
     // filter_idx: 0=watching, 1=last, 2=popular, 3=soon
     void load_home_async(int filter_idx = 1);
+    // HDrezkaTV's home list: tab 0 watching, 1 last, 2 popular; type 0 all,
+    // 1 films, 2 series, 3 cartoons, 4 anime. kind 0 is the home list, 1 the
+    // drawer's Новинки (/new, latest), 2 its Анонсы (filter=soon); the tab
+    // counts for the home list only. Replaces the catalogue with the first
+    // page; load_movie_list_more_async appends the next one.
+    void load_movie_list_async(int tab, int type, int kind = 0);
+    void load_movie_list_more_async();
+    int list_tab = 0;
+    int list_type = 0;
+    int list_kind = 0;
+    int list_page = 0;                     // pages in movies[]; guarded by catalog_mutex
+    bool list_has_next = false;            // guarded by catalog_mutex
+    std::atomic<bool> list_more_loading{false};
+    std::atomic<int> poster_hint{0};       // the list's posters are fetched from this index on
     void search_async(const std::string &query);
     // Fills the catalogue with what the fetch returns; genre_label names it.
     void list_async(std::function<std::vector<CatalogItem>(Client &)> fetch, const std::string &genre_label);

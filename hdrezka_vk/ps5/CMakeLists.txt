@@ -76,8 +76,17 @@ else()
 	set(surface_platform _DIRECT2DISPLAY)
 endif()
 set(PACBREW_ROOT "${ROOT}/../native/.deps/pacbrew/v0.40.2/sysroot/user/homebrew")
+# console_curl.c is what PacBrew's libcurl needs on the console; the host
+# reference build uses the PC's libcurl and FFmpeg instead.
+if(PS5_HOST_REFERENCE)
+	set(rezka_platform_sources src/console_curl_host.c)
+	set(rezka_include_dirs)
+else()
+	set(rezka_platform_sources ${ROOT}/examples/hdrezka/console_curl.c)
+	set(rezka_include_dirs ${PACBREW_ROOT}/include)
+endif()
 set(rezka_sources
-	${ROOT}/examples/hdrezka/console_curl.c
+	${rezka_platform_sources}
 	${ROOT}/examples/hdrezka/rezka_api.cpp
 	${ROOT}/examples/hdrezka/qr_code.cpp
 	${ROOT}/examples/hdrezka/texture_loader.cpp
@@ -112,7 +121,7 @@ target_include_directories(samples PRIVATE
 	${ROOT}/external/ktx/other_include
 	${ROOT}/base
 	${ROOT}/examples/hdrezka
-	${PACBREW_ROOT}/include
+	${rezka_include_dirs}
 	third_party/volk
 	src)
 set_target_properties(samples PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON C_STANDARD 11)
@@ -133,7 +142,8 @@ endif()
 
 if(PS5_HOST_REFERENCE)
 	add_executable(ps5-samples-host $<TARGET_OBJECTS:samples>)
-	target_link_libraries(ps5-samples-host PRIVATE dl pthread)
+	target_link_libraries(ps5-samples-host PRIVATE dl pthread
+		curl avformat avcodec avutil swscale swresample crypto)
 	return()
 endif()
 
