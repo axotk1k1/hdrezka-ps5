@@ -1,0 +1,207 @@
+#pragma once
+
+#include "rezka_api.hpp"
+#include "video_player.hpp"
+#include "texture_loader.hpp"
+#include "gfx/vk/vk_renderer.hpp"
+#include "audio/mixer.hpp"
+#include "audio/stream_ring.hpp"
+#include "VulkanDevice.h"
+
+#include <string>
+#include <vector>
+#include <map>
+#include <functional>
+#include <set>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include "big_thread.hpp"
+#include <atomic>
+
+namespace rezka
+{
+
+struct MovieData
+{
+    std::string id;
+    std::string title;
+    std::string original_title;
+    std::string url;
+    std::string cover_url;
+    std::string local_poster;
+    std::string info;
+    std::string cover_info; // episode / premiere from span.info
+    std::string entity;     // Фильм / Сериал from i.entity
+    std::string genre;
+    int year = 2024;
+    float rating = 0.0f;
+    int rating_votes = 0;
+    std::string blurb;
+    std::string quality; // poster badge: "4K", "HD", "1080p", ...
+    uint32_t texture_id = 0;
+    bool texture_ready = false;
+    VideoDetails details;
+    bool details_loaded = false;
+    std::vector<StreamQuality> streams;
+};
+
+// One labeled row on the HDrezkaTV-style home page.
+struct HomeSection
+{
+    std::string title;
+    int begin = 0; // index into movies[]
+    int count = 0;
+};
+
+struct ContinueEntry
+{
+    std::string url;
+    std::string title;
+    double t = 0.0;
+    std::string translator_id;
+    std::string quality;
+    int translator_idx = 0;
+    int quality_idx = 0;
+    int season_idx = 0;
+    int episode_idx = 0;
+};
+
+class App
+{
+public:
+    static App &instance()
+    {
+        static App inst;
+        return inst;
+    }
+
+    Client client;
+    Account account;
+    VideoPlayer player;
+    VideoTexture video_texture;
+    hui::audio::StreamRing audio_ring{1u << 18}; // ~5.5s @ 48kHz stereo -- survive seeks
+
+    vks::VulkanDevice *device = nullptr;
+    VkQueue queue = VK_NULL_HANDLE;
+    hui::gfx::VkRenderer *renderer = nullptr;
+    hui::audio::Mixer *mixer = nullptr;
+
+    // Catalog state
+    std::mutex catalog_mutex;
+    std::vector<MovieData> movies;
+    std::vector<MovieData> featured_movies; // hero slides (also mirrored in movies)
+    std::vector<int> featured_indices;      // indices into movies[] for the hero
+    std::vector<HomeSection> home_sections; // Фильмы / Сериалы / Мультфильмы
+    bool home_layout = true;                // discover rows vs flat catalog grid
+    std::vector<uint32_t> fallback_posters;
+    int current_category = 0; // home filter or catalog mapping (see load_*)
+    int home_filter = 1;      // 0 watching, 1 last, 2 popular, 3 soon (HDrezkaTV tabs)
+    std::atomic<bool> catalog_loading{false};
+    std::atomic<uint32_t> catalog_version{1};
+    std::string catalog_status;
+
+    // Pending poster uploads to GPU on main thread
+    struct PendingTexture {
+        int movie_index = 0;
+        int person_movie_index = -1; // poster for person_movies[i], when >= 0
+        std::string photo_url; // set for an actor's photo, else movie_index is the poster's
+        int width = 0;
+        int height = 0;
+        std::vector<uint8_t> rgba;
+    };
+    std::mutex pending_mutex;
+    std::vector<PendingTexture> pending_textures;
+    // Actors' photos, by address. Requested by the product page; the texture
+    // is made on the main thread like a poster. Both are guarded by catalog_mutex.
+    std::map<std::string, uint32_t> photo_textures;
+    std::set<std::string> photo_requests;
+    void request_photo(const std::string &url);
+    uint32_t photo_texture(const std::string &url);
+
+    // Player state
+    std::atomic<bool> is_playing{false};
+    std::atomic<bool> is_buffering{false};
+    std::string playing_title;
+    std::string playing_voice;
+    std::string playing_quality;
+    std::string playing_url;
+    int playing_movie_idx = -1;
+    int playing_translator_idx = 0;
+    int playing_quality_idx = 0;
+    int playing_season_idx = 0;
+    int playing_episode_idx = 0;
+    std::mutex play_mu_;
+    std::string pending_play_url_;
+    std::string pending_play_title_;
+    std::string pending_play_voice_;
+    std::string pending_play_quality_;
+    std::string pending_play_item_url_;
+    double pending_seek_ = -1.0;
+    float osd_timer = 4.0f;
+    bool osd_visible = true;
+
+    // Resume positions (url → entry), persisted under data/continue.txt
+    std::mutex continue_mutex_;
+    std::map<std::string, ContinueEntry> continue_map_;
+
+    void init(vks::VulkanDevice *dev, VkQueue q, hui::gfx::VkRenderer *rend, hui::audio::Mixer *mix);
+    void shutdown();
+
+    void load_category_async(int category_idx);
+    // HDrezkaTV home: newest slider hero + films/series/cartoons rows.
+    // filter_idx: 0=watching, 1=last, 2=popular, 3=soon
+    void load_home_async(int filter_idx = 1);
+    void search_async(const std::string &query);
+    // Fills the catalogue with what the fetch returns; genre_label names it.
+    void list_async(std::function<std::vector<CatalogItem>(Client &)> fetch, const std::string &genre_label);
+    // Actor page (separate from the home catalogue).
+    PersonDetails person;
+    std::vector<MovieData> person_movies; // films of the active career chip
+    std::vector<std::string> person_career_titles;
+    int person_career_idx = 0;
+    std::atomic<bool> person_loading{false};
+    std::atomic<uint32_t> person_version{0};
+    std::string person_status;
+    void person_async(const std::string &url, const std::string &name);
+    void person_select_career(int career_idx);
+    // Inserts (or finds) a person film in movies[] so the product page can open it.
+    int adopt_person_film(int person_movie_idx);
+    // Legacy name: loads the actor page (does not replace the home catalogue).
+    void person_films_async(const std::string &url, const std::string &name);
+    void load_details_async(int movie_idx);
+
+    void play_stream(const std::string &title, const std::string &voice, const std::string &url);
+    void play_title_async(int movie_idx, int translator_idx, int quality_idx, int season_idx,
+                          int episode_idx, double start_time = -1.0);
+    void login_async(const std::string& email, const std::string& password);
+    void refresh_account_async();
+    void stop_playback();
+    void save_continue_progress();
+    bool get_continue(const std::string &url, ContinueEntry &out);
+    void load_continue_map();
+    void persist_continue_map();
+
+    // Bookmarks, by page url. toggle_favorite returns the new state.
+    bool is_favorite(const std::string &url);
+    bool toggle_favorite(const std::string &url, const std::string &title);
+    void update(float dt);
+
+private:
+    App() = default;
+    ~App() { shutdown(); }
+    App(const App &) = delete;
+    App &operator=(const App &) = delete;
+
+    void load_favorites();
+    void persist_favorites();
+    std::mutex favorites_mutex_;
+    std::map<std::string, std::string> favorites_; // url -> title
+
+    BigThread worker_thread_;
+    std::atomic<bool> stop_worker_{false};
+    bool network_started_ = false;
+    void init_defaults();
+};
+
+} // namespace rezka

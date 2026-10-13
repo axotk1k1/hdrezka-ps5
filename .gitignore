@@ -1,0 +1,14 @@
+data/config.json
+data/cookies.txt
+decompiled/
+*.apk
+dist/
+PS5_Mesa/
+PS5_Vulkan/
+PS5_PayloadSDK/
+PS5_VKHomebrewUI/
+rezka-ps5.elf
+rezka-pc
+__pycache__/
+*.o
+.DS_Store
