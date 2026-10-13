@@ -2,6 +2,7 @@
 
 #include "vulkan/vulkan.h"
 #include "VulkanDevice.h"
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -54,7 +55,7 @@ struct VideoTexture
     uint32_t hui_handle = 0;
 
     bool init(vks::VulkanDevice *dev, VkQueue q, uint32_t w, uint32_t h);
-    bool update_frame(const uint8_t *rgba_pixels);
+    bool update_frame(const uint8_t *rgba_pixels, size_t nbytes);
     void release();
 };
 

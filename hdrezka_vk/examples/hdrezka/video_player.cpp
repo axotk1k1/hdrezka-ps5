@@ -154,11 +154,60 @@ bool VideoPlayer::apply_pending_seek(double *last_video_pts)
     return true;
 }
 
+int VideoPlayer::ffmpeg_interrupt(void *opaque)
+{
+    auto *self = static_cast<VideoPlayer *>(opaque);
+    return (self && self->stop_thread_.load(std::memory_order_acquire)) ? 1 : 0;
+}
+
+void VideoPlayer::clear_frame_buffer()
+{
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    frame_buffer_.clear();
+    frame_buffer_.shrink_to_fit();
+    frame_w_ = 0;
+    frame_h_ = 0;
+    new_frame_ready_ = false;
+}
+
+void VideoPlayer::free_codec_state()
+{
+    if (sws_ctx_) {
+        sws_freeContext(sws_ctx_);
+        sws_ctx_ = nullptr;
+    }
+    if (swr_ctx_) {
+        swr_free(&swr_ctx_);
+        swr_ctx_ = nullptr;
+    }
+    if (video_codec_ctx_) {
+        avcodec_free_context(&video_codec_ctx_);
+        video_codec_ctx_ = nullptr;
+    }
+    if (audio_codec_ctx_) {
+        avcodec_free_context(&audio_codec_ctx_);
+        audio_codec_ctx_ = nullptr;
+    }
+    if (format_ctx_) {
+        avformat_close_input(&format_ctx_);
+        format_ctx_ = nullptr;
+    }
+}
+
 bool VideoPlayer::open(const std::string &url)
 {
     close();
+    stop_thread_ = false;
+    playing_ = false;
+    is_open_ = false;
 
     write_log("[DEBUG] VideoPlayer::open url=%s\n", url.c_str());
+
+    format_ctx_ = avformat_alloc_context();
+    if (!format_ctx_)
+        return false;
+    format_ctx_->interrupt_callback.callback = &VideoPlayer::ffmpeg_interrupt;
+    format_ctx_->interrupt_callback.opaque = this;
 
     AVDictionary *opts = nullptr;
     av_dict_set(&opts, "tls_verify", "0", 0);
@@ -175,19 +224,22 @@ bool VideoPlayer::open(const std::string &url)
     av_dict_set(&opts, "reconnect_delay_max", "5", 0);
 
     int ret = avformat_open_input(&format_ctx_, url.c_str(), nullptr, &opts);
+    av_dict_free(&opts);
     if (ret != 0) {
         char errbuf[128] = {0};
         av_strerror(ret, errbuf, sizeof(errbuf));
         write_log("[DEBUG] avformat_open_input failed ret=%d err='%s'\n", ret, errbuf);
-        av_dict_free(&opts);
+        if (format_ctx_) {
+            avformat_free_context(format_ctx_);
+            format_ctx_ = nullptr;
+        }
         return false;
     }
-    av_dict_free(&opts);
     write_log("[DEBUG] avformat_open_input success\n");
 
     if (avformat_find_stream_info(format_ctx_, nullptr) < 0) {
         write_log("[DEBUG] avformat_find_stream_info failed\n");
-        avformat_close_input(&format_ctx_);
+        free_codec_state();
         return false;
     }
 
@@ -211,14 +263,14 @@ bool VideoPlayer::open(const std::string &url)
     }
 
     if (video_stream_idx_ < 0) {
-        avformat_close_input(&format_ctx_);
+        free_codec_state();
         return false;
     }
 
     AVCodecParameters *v_par = format_ctx_->streams[video_stream_idx_]->codecpar;
     const AVCodec *v_codec = avcodec_find_decoder(v_par->codec_id);
     if (!v_codec) {
-        avformat_close_input(&format_ctx_);
+        free_codec_state();
         return false;
     }
 
@@ -227,13 +279,19 @@ bool VideoPlayer::open(const std::string &url)
     // Prefer more threads for software decode on PS5 CPU.
     video_codec_ctx_->thread_count = 2;
     if (avcodec_open2(video_codec_ctx_, v_codec, nullptr) < 0) {
-        avcodec_free_context(&video_codec_ctx_);
-        avformat_close_input(&format_ctx_);
+        free_codec_state();
         return false;
     }
 
-    width_ = video_codec_ctx_->width;
-    height_ = video_codec_ctx_->height;
+    width_ = static_cast<uint32_t>(video_codec_ctx_->width);
+    height_ = static_cast<uint32_t>(video_codec_ctx_->height);
+    if (width_ == 0 || height_ == 0) {
+        write_log("[DEBUG] VideoPlayer::open invalid size %ux%u\n", width_, height_);
+        free_codec_state();
+        width_ = 0;
+        height_ = 0;
+        return false;
+    }
 
     {
         const AVRational fr = format_ctx_->streams[video_stream_idx_]->avg_frame_rate;
@@ -254,8 +312,17 @@ bool VideoPlayer::open(const std::string &url)
                   1.0 / frame_duration_);
     }
 
-    sws_ctx_ = sws_getContext(width_, height_, video_codec_ctx_->pix_fmt, width_, height_,
-                              AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+    sws_ctx_ = sws_getContext(static_cast<int>(width_), static_cast<int>(height_),
+                              video_codec_ctx_->pix_fmt, static_cast<int>(width_),
+                              static_cast<int>(height_), AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR,
+                              nullptr, nullptr, nullptr);
+    if (!sws_ctx_) {
+        write_log("[DEBUG] sws_getContext failed\n");
+        free_codec_state();
+        width_ = 0;
+        height_ = 0;
+        return false;
+    }
 
     audio_out_rate_ = kAudioRate;
     if (audio_stream_idx_ >= 0) {
@@ -283,6 +350,7 @@ bool VideoPlayer::open(const std::string &url)
     if (audio_ring_)
         audio_ring_->drain();
 
+    clear_frame_buffer();
     is_open_ = true;
     playing_ = true;
     stop_thread_ = false;
@@ -303,41 +371,25 @@ bool VideoPlayer::open(const std::string &url)
 void VideoPlayer::close()
 {
     stop_thread_ = true;
+    playing_ = false;
     if (worker_thread_.joinable()) {
         worker_thread_.join();
     }
 
-    if (sws_ctx_) {
-        sws_freeContext(sws_ctx_);
-        sws_ctx_ = nullptr;
-    }
-    if (swr_ctx_) {
-        swr_free(&swr_ctx_);
-        swr_ctx_ = nullptr;
-    }
-    if (video_codec_ctx_) {
-        avcodec_free_context(&video_codec_ctx_);
-        video_codec_ctx_ = nullptr;
-    }
-    if (audio_codec_ctx_) {
-        avcodec_free_context(&audio_codec_ctx_);
-        audio_codec_ctx_ = nullptr;
-    }
-    if (format_ctx_) {
-        avformat_close_input(&format_ctx_);
-        format_ctx_ = nullptr;
-    }
+    free_codec_state();
 
     if (audio_ring_)
         audio_ring_->drain();
 
     is_open_ = false;
-    playing_ = false;
     seeking_ = false;
     seek_target_ = -1.0;
     seek_discard_until_ = -1.0;
+    duration_ = 0.0;
+    current_position_ = 0.0;
     width_ = 0;
     height_ = 0;
+    clear_frame_buffer();
     {
         std::lock_guard<std::mutex> lock(clock_mutex_);
         clock_started_ = false;
@@ -392,29 +444,45 @@ void VideoPlayer::seek(double target_seconds)
     seek_target_.store(target_seconds, std::memory_order_release);
 }
 
-bool VideoPlayer::get_frame(std::vector<uint8_t> &out_rgba)
+bool VideoPlayer::get_frame(std::vector<uint8_t> &out_rgba, uint32_t &out_w, uint32_t &out_h)
 {
     std::lock_guard<std::mutex> lock(frame_mutex_);
-    if (!new_frame_ready_ || frame_buffer_.empty()) {
+    const size_t need = static_cast<size_t>(frame_w_) * static_cast<size_t>(frame_h_) * 4;
+    if (!new_frame_ready_ || frame_buffer_.empty() || frame_w_ == 0 || frame_h_ == 0 ||
+        frame_buffer_.size() != need) {
         return false;
     }
     out_rgba = frame_buffer_;
+    out_w = frame_w_;
+    out_h = frame_h_;
     new_frame_ready_ = false;
     return true;
 }
 
 void VideoPlayer::decode_loop()
 {
+    const int dec_w = static_cast<int>(width_);
+    const int dec_h = static_cast<int>(height_);
+    if (dec_w <= 0 || dec_h <= 0 || !format_ctx_ || !video_codec_ctx_ || !sws_ctx_)
+        return;
+
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
     AVFrame *audio_frame = av_frame_alloc();
     AVFrame *rgba_frame = av_frame_alloc();
+    if (!packet || !frame || !audio_frame || !rgba_frame) {
+        av_frame_free(&rgba_frame);
+        av_frame_free(&audio_frame);
+        av_frame_free(&frame);
+        av_packet_free(&packet);
+        return;
+    }
 
-    const int rgba_buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGBA, width_, height_, 1);
+    const int rgba_buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGBA, dec_w, dec_h, 1);
     std::vector<uint8_t> rgba_raw(static_cast<size_t>(rgba_buf_size));
 
     av_image_fill_arrays(rgba_frame->data, rgba_frame->linesize, rgba_raw.data(), AV_PIX_FMT_RGBA,
-                         width_, height_, 1);
+                         dec_w, dec_h, 1);
 
     double last_video_pts = AV_NOPTS_VALUE;
 
@@ -469,19 +537,21 @@ void VideoPlayer::decode_loop()
                     if (delay < -0.25)
                         continue;
 
-                    sws_scale(sws_ctx_, frame->data, frame->linesize, 0, height_,
+                    sws_scale(sws_ctx_, frame->data, frame->linesize, 0, dec_h,
                               rgba_frame->data, rgba_frame->linesize);
 
                     {
                         std::lock_guard<std::mutex> lock(frame_mutex_);
-                        const size_t need = static_cast<size_t>(width_) * height_ * 4;
+                        const size_t need = static_cast<size_t>(dec_w) * static_cast<size_t>(dec_h) * 4;
                         if (frame_buffer_.size() != need)
                             frame_buffer_.resize(need);
-                        for (uint32_t y = 0; y < height_; ++y) {
-                            std::memcpy(frame_buffer_.data() + y * width_ * 4,
+                        for (int y = 0; y < dec_h; ++y) {
+                            std::memcpy(frame_buffer_.data() + static_cast<size_t>(y) * static_cast<size_t>(dec_w) * 4,
                                         rgba_frame->data[0] + y * rgba_frame->linesize[0],
-                                        width_ * 4);
+                                        static_cast<size_t>(dec_w) * 4);
                         }
+                        frame_w_ = static_cast<uint32_t>(dec_w);
+                        frame_h_ = static_cast<uint32_t>(dec_h);
                         new_frame_ready_ = true;
                     }
                 }

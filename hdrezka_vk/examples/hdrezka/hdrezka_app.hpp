@@ -106,6 +106,7 @@ public:
         int movie_index = 0;
         int person_movie_index = -1; // poster for person_movies[i], when >= 0
         std::string photo_url; // set for an actor's photo, else movie_index is the poster's
+        std::string bind_url;  // person poster applies only while this cover is still there
         int width = 0;
         int height = 0;
         std::vector<uint8_t> rgba;
@@ -132,6 +133,7 @@ public:
     int playing_season_idx = 0;
     int playing_episode_idx = 0;
     std::mutex play_mu_;
+    std::atomic<uint32_t> play_serial_{0};
     std::string pending_play_url_;
     std::string pending_play_title_;
     std::string pending_play_voice_;
@@ -197,11 +199,17 @@ public:
     std::vector<MovieData> person_movies; // films of the active career chip
     std::vector<std::string> person_career_titles;
     int person_career_idx = 0;
+    int person_page = 1;
     std::atomic<bool> person_loading{false};
+    std::atomic<bool> person_has_next{false};
+    std::atomic<bool> person_more_loading{false};
     std::atomic<uint32_t> person_version{0};
+    std::atomic<uint32_t> person_epoch{0}; // bumped when the actor or the career changes
     std::string person_status;
     void person_async(const std::string &url, const std::string &name);
     void person_select_career(int career_idx);
+    // The next /person/.../page/N/ when the site still has films to give.
+    void person_load_more_async();
     // Inserts (or finds) a title met on another title's page (its franchise,
     // "Смотрите также") in movies[] so its own page can open; -1 without a url.
     int adopt_catalog_item(const CatalogItem &item);
@@ -253,6 +261,8 @@ private:
     App(const App &) = delete;
     App &operator=(const App &) = delete;
 
+    void halt_decoder();
+    void queue_person_posters(uint32_t epoch, int from);
     void load_favorites();
     void persist_favorites();
     std::mutex favorites_mutex_;

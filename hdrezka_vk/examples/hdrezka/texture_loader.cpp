@@ -308,14 +308,16 @@ bool VideoTexture::init(vks::VulkanDevice *dev, VkQueue q, uint32_t w, uint32_t 
     return true;
 }
 
-bool VideoTexture::update_frame(const uint8_t *rgba_pixels)
+bool VideoTexture::update_frame(const uint8_t *rgba_pixels, size_t nbytes)
 {
     if (!device || !mapped_staging || !rgba_pixels || image == VK_NULL_HANDLE) {
         return false;
     }
 
-    VkDeviceSize image_size = width * height * 4;
-    std::memcpy(mapped_staging, rgba_pixels, image_size);
+    const VkDeviceSize image_size = static_cast<VkDeviceSize>(width) * height * 4;
+    if (nbytes < image_size || image_size == 0)
+        return false;
+    std::memcpy(mapped_staging, rgba_pixels, static_cast<size_t>(image_size));
 
     VkCommandBuffer cmd = device->createCommandBuffer(VK_COMMAND_BUFFER_LEVEL_PRIMARY, true);
     VkImageSubresourceRange subresource_range{

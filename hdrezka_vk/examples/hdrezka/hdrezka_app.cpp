@@ -1,6 +1,7 @@
 #include "hdrezka_app.hpp"
 #include <iostream>
 #include <algorithm>
+#include <cctype>
 #include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
@@ -826,10 +827,133 @@ std::string App::take_voice_text()
     return text;
 }
 
+static int merge_person_page(PersonDetails &dst, const PersonDetails &src)
+{
+    int added = 0;
+    auto take = [&](PersonCareer &into, const std::vector<CatalogItem> &movies, int expected) {
+        std::set<std::string> seen;
+        for (const CatalogItem &m : into.movies)
+            if (!m.url.empty())
+                seen.insert(m.url);
+        for (const CatalogItem &m : movies) {
+            if (m.url.empty() || !seen.insert(m.url).second)
+                continue;
+            into.movies.push_back(m);
+            ++added;
+        }
+        if (expected > into.expected)
+            into.expected = expected;
+    };
+    if (src.careers.empty()) {
+        if (!src.movies.empty()) {
+            if (dst.careers.empty()) {
+                PersonCareer career;
+                career.title = "Фильмография";
+                dst.careers.push_back(std::move(career));
+            }
+            take(dst.careers.front(), src.movies, 0);
+        }
+    } else {
+        for (const PersonCareer &career : src.careers) {
+            PersonCareer *into = nullptr;
+            for (PersonCareer &have : dst.careers) {
+                if (have.title == career.title) {
+                    into = &have;
+                    break;
+                }
+            }
+            if (!into) {
+                dst.careers.push_back(career);
+                added += static_cast<int>(career.movies.size());
+            } else {
+                take(*into, career.movies, career.expected);
+            }
+        }
+    }
+    dst.movies.clear();
+    std::set<std::string> seen;
+    for (const PersonCareer &career : dst.careers) {
+        for (const CatalogItem &movie : career.movies) {
+            if (!movie.url.empty() && seen.insert(movie.url).second)
+                dst.movies.push_back(movie);
+        }
+    }
+    return added;
+}
+
+static void sync_person_movies_locked(App *self)
+{
+    self->person_career_titles.clear();
+    for (const PersonCareer &career : self->person.careers) {
+        std::string label = career.title + " (" + std::to_string(career.movies.size()) + ")";
+        self->person_career_titles.push_back(std::move(label));
+    }
+    if (self->person.careers.empty()) {
+        self->person_career_idx = 0;
+        self->person_movies.clear();
+        return;
+    }
+    self->person_career_idx =
+        std::clamp(self->person_career_idx, 0, static_cast<int>(self->person.careers.size()) - 1);
+    const PersonCareer &career =
+        self->person.careers[static_cast<std::size_t>(self->person_career_idx)];
+    std::map<std::string, MovieData> keep;
+    for (MovieData &movie : self->person_movies) {
+        if (!movie.url.empty())
+            keep.emplace(movie.url, std::move(movie));
+    }
+    self->person_movies.clear();
+    self->person_movies.reserve(career.movies.size());
+    for (const CatalogItem &it : career.movies) {
+        auto found = keep.find(it.url);
+        if (found != keep.end())
+            self->person_movies.push_back(std::move(found->second));
+        else
+            self->person_movies.push_back(movie_from_catalog(it, career.title));
+    }
+}
+
+void App::queue_person_posters(uint32_t epoch, int from)
+{
+    for (int i = from;; ++i) {
+        if (stop_worker_ || person_epoch.load() != epoch)
+            return;
+        std::string cover_url;
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            if (person_epoch.load() != epoch || i >= static_cast<int>(person_movies.size()))
+                return;
+            const MovieData &movie = person_movies[static_cast<std::size_t>(i)];
+            if (movie.texture_id != 0 || movie.cover_url.empty())
+                continue;
+            cover_url = movie.cover_url;
+        }
+        std::vector<uint8_t> img_bytes;
+        if (!client.http_get_binary(cover_url, img_bytes))
+            continue;
+        int w = 0, h = 0;
+        uint8_t *rgba = TextureLoader::decode_image_rgba(img_bytes.data(), img_bytes.size(), &w, &h);
+        if (!rgba || w <= 0 || h <= 0)
+            continue;
+        if (person_epoch.load() != epoch) {
+            TextureLoader::free_decoded_image(rgba);
+            return;
+        }
+        PendingTexture pt;
+        pt.person_movie_index = i;
+        pt.bind_url = cover_url;
+        pt.width = w;
+        pt.height = h;
+        pt.rgba.assign(rgba, rgba + static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
+        TextureLoader::free_decoded_image(rgba);
+        std::lock_guard<std::mutex> p_lock(pending_mutex);
+        pending_textures.push_back(std::move(pt));
+    }
+}
+
 void App::person_select_career(int career_idx)
 {
-    uint32_t ver = 0;
-    std::vector<std::pair<int, std::string>> jobs;
+    uint32_t epoch = 0;
     {
         std::lock_guard<std::mutex> lock(catalog_mutex);
         if (person.careers.empty()) {
@@ -837,46 +961,19 @@ void App::person_select_career(int career_idx)
             return;
         }
         person_career_idx = std::clamp(career_idx, 0, static_cast<int>(person.careers.size()) - 1);
-        person_movies.clear();
-        const auto &career = person.careers[static_cast<std::size_t>(person_career_idx)];
-        person_movies.reserve(career.movies.size());
-        for (const CatalogItem &it : career.movies)
-            person_movies.push_back(movie_from_catalog(it, career.title));
-        for (int i = 0; i < static_cast<int>(person_movies.size()); ++i)
-            if (!person_movies[static_cast<std::size_t>(i)].cover_url.empty())
-                jobs.emplace_back(i, person_movies[static_cast<std::size_t>(i)].cover_url);
+        person_more_loading = false;
+        person_epoch++;
+        epoch = person_epoch.load();
+        sync_person_movies_locked(this);
         person_version++;
-        ver = person_version.load();
     }
-    if (jobs.empty())
-        return;
-    BigThread([this, jobs, ver]() {
-        for (const auto &job : jobs) {
-            if (stop_worker_ || person_version.load() != ver)
-                return;
-            std::vector<uint8_t> img_bytes;
-            if (!client.http_get_binary(job.second, img_bytes))
-                continue;
-            int w = 0, h = 0;
-            uint8_t *rgba =
-                TextureLoader::decode_image_rgba(img_bytes.data(), img_bytes.size(), &w, &h);
-            if (!rgba || w <= 0 || h <= 0)
-                continue;
-            PendingTexture pt;
-            pt.person_movie_index = job.first;
-            pt.width = w;
-            pt.height = h;
-            pt.rgba.assign(rgba, rgba + w * h * 4);
-            TextureLoader::free_decoded_image(rgba);
-            std::lock_guard<std::mutex> p_lock(pending_mutex);
-            pending_textures.push_back(std::move(pt));
-        }
-    }).detach();
+    BigThread([this, epoch]() { queue_person_posters(epoch, 0); }).detach();
 }
 
 void App::person_async(const std::string &url, const std::string &name)
 {
     const std::string full = photo_address(url, client.get_mirror());
+    uint32_t epoch = 0;
     {
         std::lock_guard<std::mutex> lock(catalog_mutex);
         person = {};
@@ -885,8 +982,13 @@ void App::person_async(const std::string &url, const std::string &name)
         person_movies.clear();
         person_career_titles.clear();
         person_career_idx = 0;
+        person_page = 1;
+        person_has_next = false;
+        person_more_loading = false;
         person_status = "Загрузка фильмографии...";
         person_loading = true;
+        person_epoch++;
+        epoch = person_epoch.load();
         person_version++;
     }
 
@@ -896,20 +998,26 @@ void App::person_async(const std::string &url, const std::string &name)
         stop_worker_ = false;
     }
 
-    worker_thread_ = BigThread([this, full, name]() {
+    worker_thread_ = BigThread([this, full, name, epoch]() {
         if (!client.pick_mirror()) {
             std::lock_guard<std::mutex> lock(catalog_mutex);
-            person_status = "HDRezka не отвечает";
-            person_loading = false;
-            person_version++;
+            if (person_epoch.load() == epoch) {
+                person_status = "HDRezka не отвечает";
+                person_loading = false;
+                person_version++;
+            }
             return;
         }
+        bool has_next = false;
         PersonDetails details;
-        if (!client.get_person(full, details)) {
+        if (!client.get_person(full, details, &has_next) || person_epoch.load() != epoch) {
             std::lock_guard<std::mutex> lock(catalog_mutex);
-            person_status = "Страница актёра недоступна";
-            person_loading = false;
-            person_version++;
+            if (person_epoch.load() == epoch) {
+                person_status = "Страница актёра недоступна";
+                person_loading = false;
+                person_has_next = false;
+                person_version++;
+            }
             return;
         }
         if (details.name.empty())
@@ -917,58 +1025,78 @@ void App::person_async(const std::string &url, const std::string &name)
 
         {
             std::lock_guard<std::mutex> lock(catalog_mutex);
+            if (person_epoch.load() != epoch)
+                return;
             person = details;
-            person_career_titles.clear();
-            for (const PersonCareer &c : person.careers)
-                person_career_titles.push_back(c.title + " (" + std::to_string(c.movies.size()) + ")");
             person_career_idx = 0;
+            person_page = 1;
+            person_has_next = has_next;
             person_movies.clear();
-            const std::vector<CatalogItem> *src = &person.movies;
-            std::string genre = "Фильмография";
-            if (!person.careers.empty()) {
-                src = &person.careers[0].movies;
-                genre = person.careers[0].title;
-            }
-            person_movies.reserve(src->size());
-            for (const CatalogItem &it : *src)
-                person_movies.push_back(movie_from_catalog(it, genre));
+            sync_person_movies_locked(this);
             person_status = person_movies.empty() ? "Фильмы не найдены" : "";
             person_loading = false;
             person_version++;
         }
 
-        if (!person.photo.empty())
+        if (!person.photo.empty() && person_epoch.load() == epoch)
             request_photo(person.photo_hq.empty() ? person.photo : person.photo_hq);
-
-        // Posters for the active career (first chip).
-        for (size_t i = 0; i < person_movies.size(); ++i) {
-            if (stop_worker_)
-                break;
-            std::string cover_url;
-            {
-                std::lock_guard<std::mutex> lock(catalog_mutex);
-                if (i < person_movies.size())
-                    cover_url = person_movies[i].cover_url;
-            }
-            if (cover_url.empty())
-                continue;
-            std::vector<uint8_t> img_bytes;
-            if (!client.http_get_binary(cover_url, img_bytes))
-                continue;
-            int w = 0, h = 0;
-            uint8_t *rgba = TextureLoader::decode_image_rgba(img_bytes.data(), img_bytes.size(), &w, &h);
-            if (!rgba || w <= 0 || h <= 0)
-                continue;
-            PendingTexture pt;
-            pt.person_movie_index = static_cast<int>(i);
-            pt.width = w;
-            pt.height = h;
-            pt.rgba.assign(rgba, rgba + w * h * 4);
-            TextureLoader::free_decoded_image(rgba);
-            std::lock_guard<std::mutex> p_lock(pending_mutex);
-            pending_textures.push_back(std::move(pt));
-        }
+        queue_person_posters(epoch, 0);
     });
+}
+
+void App::person_load_more_async()
+{
+    if (person_loading.load() || person_more_loading.exchange(true))
+        return;
+    int page = 0;
+    int career = 0;
+    std::string url;
+    uint32_t epoch = 0;
+    {
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        if (!person_has_next.load() || person.url.empty()) {
+            person_more_loading = false;
+            return;
+        }
+        page = person_page + 1;
+        career = person_career_idx;
+        url = person.url;
+        epoch = person_epoch.load();
+    }
+
+    BigThread([this, page, career, url, epoch]() {
+        bool has_next = false;
+        PersonDetails more;
+        const bool ok = client.get_person_page(url, page, more, &has_next);
+        int poster_from = -1;
+        bool stale = false;
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            if (person_epoch.load() != epoch) {
+                stale = true;
+            } else {
+                int added = 0;
+                if (ok)
+                    added = merge_person_page(person, more);
+                if (!ok || added == 0) {
+                    person_has_next = false;
+                } else {
+                    person_page = page;
+                    person_has_next = has_next;
+                    person_career_idx = career;
+                    poster_from = static_cast<int>(person_movies.size());
+                    sync_person_movies_locked(this);
+                    if (poster_from > static_cast<int>(person_movies.size()))
+                        poster_from = static_cast<int>(person_movies.size());
+                }
+                person_version++;
+            }
+        }
+        if (!stale)
+            person_more_loading = false;
+        if (poster_from >= 0)
+            queue_person_posters(epoch, poster_from);
+    }).detach();
 }
 
 void App::person_films_async(const std::string &url, const std::string &name)
@@ -1524,9 +1652,84 @@ void App::save_continue_progress()
               e.translator_id.c_str(), e.quality.c_str());
 }
 
+static std::string quality_key(std::string q)
+{
+    std::string out;
+    out.reserve(q.size());
+    for (unsigned char c : q) {
+        if (c == ' ' || c == '\t')
+            continue;
+        out.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return out;
+}
+
+static int quality_rank_label(const std::string &q)
+{
+    const std::string k = quality_key(q);
+    if (k.find("2160") != std::string::npos || k.find("4k") != std::string::npos)
+        return 6000;
+    if (k.find("ultra") != std::string::npos || k.find("1080p+") != std::string::npos)
+        return 1180;
+    if (k.find("1080") != std::string::npos)
+        return 1080;
+    if (k.find("720") != std::string::npos)
+        return 720;
+    if (k.find("480") != std::string::npos)
+        return 480;
+    if (k.find("360") != std::string::npos)
+        return 360;
+    if (k.find("240") != std::string::npos)
+        return 240;
+    return 0;
+}
+
+static int pick_stream_index(const std::vector<StreamQuality> &streams, const std::string &wanted)
+{
+    if (streams.empty())
+        return 0;
+    if (!wanted.empty()) {
+        const std::string key = quality_key(wanted);
+        for (int i = 0; i < static_cast<int>(streams.size()); ++i) {
+            if (quality_key(streams[static_cast<std::size_t>(i)].quality) == key)
+                return i;
+        }
+        for (int i = 0; i < static_cast<int>(streams.size()); ++i) {
+            const std::string have = quality_key(streams[static_cast<std::size_t>(i)].quality);
+            if (!key.empty() && (have.find(key) != std::string::npos || key.find(have) != std::string::npos))
+                return i;
+        }
+        const int want_rank = quality_rank_label(wanted);
+        if (want_rank > 0) {
+            int best = 0;
+            int best_delta = 100000;
+            for (int i = 0; i < static_cast<int>(streams.size()); ++i) {
+                const int delta =
+                    std::abs(quality_rank_label(streams[static_cast<std::size_t>(i)].quality) - want_rank);
+                if (delta < best_delta) {
+                    best_delta = delta;
+                    best = i;
+                }
+            }
+            return best;
+        }
+    }
+    int best = 0;
+    int best_rank = -1;
+    for (int i = 0; i < static_cast<int>(streams.size()); ++i) {
+        const int rank = quality_rank_label(streams[static_cast<std::size_t>(i)].quality);
+        if (rank > best_rank) {
+            best_rank = rank;
+            best = i;
+        }
+    }
+    return best;
+}
+
 void App::play_title_async(int movie_idx, int translator_idx, int quality_idx, int season_idx,
                            int episode_idx, double start_time)
 {
+    const uint32_t serial = ++play_serial_;
     {
         std::lock_guard<std::mutex> lock(catalog_mutex);
         if (movie_idx >= 0 && movie_idx < static_cast<int>(movies.size())) {
@@ -1538,22 +1741,26 @@ void App::play_title_async(int movie_idx, int translator_idx, int quality_idx, i
     }
     is_buffering = true;
 
-    BigThread([this, movie_idx, translator_idx, quality_idx, season_idx, episode_idx, start_time]() {
-        write_log("[DEBUG] play_title_async thread started movie_idx=%d tr=%d q=%d s=%d e=%d seek=%.1f\n",
-                  movie_idx, translator_idx, quality_idx, season_idx, episode_idx, start_time);
+    BigThread([this, movie_idx, translator_idx, quality_idx, season_idx, episode_idx, start_time, serial]() {
+        write_log("[DEBUG] play_title_async thread started movie_idx=%d tr=%d q=%d s=%d e=%d seek=%.1f serial=%u\n",
+                  movie_idx, translator_idx, quality_idx, season_idx, episode_idx, start_time, serial);
         std::string url, title, voice = "HDRezka", item_url;
         VideoDetails det;
         bool have = false;
         std::string tr_id = "238";
         std::string s_id = "1";
         std::string e_id = "1";
-        int q_idx = quality_idx;
-        auto fail_buffering = [this](const char *status) {
+        std::string wanted_quality;
+        auto fail_buffering = [this, serial](const char *status) {
+            if (play_serial_.load() != serial)
+                return;
             std::lock_guard<std::mutex> lock(catalog_mutex);
             catalog_status = status;
             catalog_version++;
             is_buffering = false;
         };
+        if (play_serial_.load() != serial)
+            return;
         {
             std::lock_guard<std::mutex> lock(catalog_mutex);
             if (movie_idx < 0 || movie_idx >= static_cast<int>(movies.size())) {
@@ -1565,14 +1772,23 @@ void App::play_title_async(int movie_idx, int translator_idx, int quality_idx, i
             const auto &m = movies[movie_idx];
             title = m.title;
             item_url = m.url;
+            static const char *kDefaultQualities[] = {"1080p Ultra", "1080p", "720p", "480p", "360p"};
+            if (quality_idx >= 0 && quality_idx < static_cast<int>(m.streams.size()))
+                wanted_quality = m.streams[static_cast<std::size_t>(quality_idx)].quality;
+            else if (quality_idx >= 0 && quality_idx < 5)
+                wanted_quality = kDefaultQualities[quality_idx];
             if (m.details_loaded && !m.details.id.empty()) {
                 det = m.details;
                 have = true;
             }
             catalog_status = "Открытие потока...";
             catalog_version++;
+            write_log("[DEBUG] play_title_async wanted_quality='%s' from q_idx=%d streams=%zu\n",
+                      wanted_quality.c_str(), quality_idx, m.streams.size());
         }
         if (!have) {
+            if (play_serial_.load() != serial)
+                return;
             VideoDetails fetched;
             if (item_url.empty() || !client.get_details(item_url, fetched)) {
                 fail_buffering("Не удалось открыть страницу фильма");
@@ -1616,10 +1832,15 @@ void App::play_title_async(int movie_idx, int translator_idx, int quality_idx, i
                 det = m.details;
             }
         }
-        write_log("[DEBUG] play_title_async before get_streams id=%s tr=%s s=%s e=%s is_series=%d\n",
-                  det.id.c_str(), tr_id.c_str(), s_id.c_str(), e_id.c_str(), (int)det.is_series);
+        if (play_serial_.load() != serial)
+            return;
+        write_log("[DEBUG] play_title_async before get_streams id=%s tr=%s s=%s e=%s is_series=%d wanted=%s\n",
+                  det.id.c_str(), tr_id.c_str(), s_id.c_str(), e_id.c_str(), (int)det.is_series,
+                  wanted_quality.c_str());
         auto streams = client.get_streams(det, tr_id, s_id, e_id);
         write_log("[DEBUG] play_title_async after get_streams count=%zu\n", streams.size());
+        if (play_serial_.load() != serial)
+            return;
         {
             std::lock_guard<std::mutex> lock(catalog_mutex);
             if (movie_idx < static_cast<int>(movies.size()))
@@ -1629,68 +1850,67 @@ void App::play_title_async(int movie_idx, int translator_idx, int quality_idx, i
             fail_buffering("Поток недоступен");
             return;
         }
-        int best = 0;
-        if (!streams.empty()) {
-            if (quality_idx >= 0 && quality_idx < static_cast<int>(streams.size())) {
-                best = quality_idx;
-            } else {
-                static const char* kTargets[] = {"1080p Ultra", "1080p", "720p", "480p", "360p"};
-                const char* target = (quality_idx >= 0 && quality_idx < 5) ? kTargets[quality_idx] : "1080";
-                bool found = false;
-                for (size_t i = 0; i < streams.size(); ++i) {
-                    if (streams[i].quality.find(target) != std::string::npos) {
-                        best = static_cast<int>(i);
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    int best_rank = -1;
-                    for (int i = 0; i < static_cast<int>(streams.size()); ++i) {
-                        const auto &q = streams[i].quality;
-                        int rank = 0;
-                        if (q.find("2160") != std::string::npos || q.find("4K") != std::string::npos) rank = 4;
-                        else if (q.find("1080") != std::string::npos) rank = 3;
-                        else if (q.find("720") != std::string::npos) rank = 2;
-                        else if (q.find("480") != std::string::npos) rank = 1;
-                        if (rank >= best_rank) {
-                            best_rank = rank;
-                            best = i;
-                        }
-                    }
-                }
-            }
+        const int best = pick_stream_index(streams, wanted_quality);
+        if (play_serial_.load() != serial)
+            return;
+        {
+            std::lock_guard<std::mutex> pl(play_mu_);
+            if (play_serial_.load() != serial)
+                return;
+            pending_play_url_ = streams[static_cast<std::size_t>(best)].url;
+            pending_play_title_ = title;
+            pending_play_voice_ = voice;
+            pending_play_quality_ = streams[static_cast<std::size_t>(best)].quality;
+            pending_play_item_url_ = item_url;
+            pending_seek_ = start_time;
+            playing_movie_idx = movie_idx;
+            playing_translator_idx = translator_idx;
+            playing_quality_idx = best;
+            playing_season_idx = season_idx;
+            playing_episode_idx = episode_idx;
+            write_log("[DEBUG] play_title_async chosen best=%d quality=%s wanted=%s url=%s\n",
+                      best, pending_play_quality_.c_str(), wanted_quality.c_str(), pending_play_url_.c_str());
         }
-        std::lock_guard<std::mutex> pl(play_mu_);
-        pending_play_url_ = streams[best].url;
-        pending_play_title_ = title;
-        pending_play_voice_ = voice;
-        pending_play_quality_ = streams[best].quality;
-        pending_play_item_url_ = item_url;
-        pending_seek_ = start_time;
-        playing_movie_idx = movie_idx;
-        playing_translator_idx = translator_idx;
-        playing_quality_idx = best;
-        playing_season_idx = season_idx;
-        playing_episode_idx = episode_idx;
-        write_log("[DEBUG] play_title_async chosen best=%d quality=%s url=%s\n",
-                  best, pending_play_quality_.c_str(), pending_play_url_.c_str());
-        std::lock_guard<std::mutex> lock(catalog_mutex);
-        catalog_status.clear();
-        catalog_version++;
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            catalog_status.clear();
+            catalog_version++;
+        }
     }).detach();
+}
+
+void App::halt_decoder()
+{
+    player.close();
+    if (mixer) {
+        mixer->swap_stream(1, nullptr);
+        mixer->set_stream_gain(0, 0.0f, 0.1f);
+    }
+    if (device && device->logicalDevice)
+        vkDeviceWaitIdle(device->logicalDevice);
+    if (video_texture.hui_handle != 0 && renderer) {
+        renderer->destroy_texture(video_texture.hui_handle);
+        video_texture.hui_handle = 0;
+    }
+    video_texture.release();
 }
 
 void App::play_stream(const std::string &title, const std::string &voice, const std::string &url)
 {
-    stop_playback();
+    const std::string quality = pending_play_quality_.empty() ? std::string("HD") : pending_play_quality_;
+    const std::string item_url = pending_play_item_url_;
+    const double seek_to = pending_seek_;
+    pending_seek_ = -1.0;
+
+    if (is_playing)
+        save_continue_progress();
+    halt_decoder();
+    is_playing = false;
 
     playing_title = title;
     playing_voice = voice;
-    playing_quality = pending_play_quality_.empty() ? "HD" : pending_play_quality_;
-    playing_url = pending_play_item_url_;
-    const double seek_to = pending_seek_;
-    pending_seek_ = -1.0;
+    playing_quality = quality;
+    playing_url = item_url;
 
     write_log("[DEBUG] play_stream calling player.open(%s) seek=%.1f\n", url.c_str(), seek_to);
     is_buffering = true;
@@ -1717,23 +1937,23 @@ void App::play_stream(const std::string &title, const std::string &voice, const 
 
 void App::stop_playback()
 {
-    if (is_playing || is_buffering) {
-        write_log("[DEBUG] stop_playback\n");
-        if (is_playing)
-            save_continue_progress();
-        player.close();
-        if (mixer) {
-            mixer->swap_stream(1, nullptr);
-            mixer->set_stream_gain(0, 0.0f, 0.1f);
-        }
-        if (video_texture.hui_handle != 0 && renderer) {
-            renderer->destroy_texture(video_texture.hui_handle);
-            video_texture.hui_handle = 0;
-        }
-        video_texture.release();
-        is_playing = false;
-        is_buffering = false;
+    const uint32_t serial = ++play_serial_;
+    write_log("[DEBUG] stop_playback serial=%u playing=%d buffering=%d\n", serial,
+              (int)is_playing.load(), (int)is_buffering.load());
+    {
+        std::lock_guard<std::mutex> pl(play_mu_);
+        pending_play_url_.clear();
+        pending_play_title_.clear();
+        pending_play_voice_.clear();
+        pending_play_quality_.clear();
+        pending_play_item_url_.clear();
+        pending_seek_ = -1.0;
     }
+    if (is_playing)
+        save_continue_progress();
+    halt_decoder();
+    is_playing = false;
+    is_buffering = false;
 }
 
 void App::update(float dt)
@@ -1792,10 +2012,13 @@ void App::update(float dt)
                 }
                 if (pt.person_movie_index >= 0) {
                     if (pt.person_movie_index < static_cast<int>(person_movies.size())) {
-                        uint32_t handle = renderer->create_texture(pt.width, pt.height, pt.rgba.data());
-                        if (handle != 0) {
-                            person_movies[pt.person_movie_index].texture_id = handle;
-                            person_movies[pt.person_movie_index].texture_ready = true;
+                        MovieData &movie = person_movies[static_cast<std::size_t>(pt.person_movie_index)];
+                        if (pt.bind_url.empty() || movie.cover_url == pt.bind_url) {
+                            uint32_t handle = renderer->create_texture(pt.width, pt.height, pt.rgba.data());
+                            if (handle != 0) {
+                                movie.texture_id = handle;
+                                movie.texture_ready = true;
+                            }
                         }
                     }
                     person_version++;
@@ -1821,23 +2044,23 @@ void App::update(float dt)
         }
 
         std::vector<uint8_t> frame_rgba;
-        if (player.get_frame(frame_rgba)) {
-            uint32_t vw = player.get_width();
-            uint32_t vh = player.get_height();
-            if (vw > 0 && vh > 0) {
-                if (video_texture.image == VK_NULL_HANDLE || video_texture.width != vw || video_texture.height != vh) {
-                    if (video_texture.hui_handle != 0 && renderer) {
-                        renderer->destroy_texture(video_texture.hui_handle);
-                        video_texture.hui_handle = 0;
-                    }
-                    video_texture.init(device, queue, vw, vh);
-                    if (renderer) {
-                        video_texture.hui_handle = renderer->import_texture(video_texture.view);
-                    }
+        uint32_t vw = 0, vh = 0;
+        if (player.get_frame(frame_rgba, vw, vh) && vw > 0 && vh > 0 &&
+            frame_rgba.size() == static_cast<size_t>(vw) * static_cast<size_t>(vh) * 4) {
+            if (video_texture.image == VK_NULL_HANDLE || video_texture.width != vw || video_texture.height != vh) {
+                if (device && device->logicalDevice)
+                    vkDeviceWaitIdle(device->logicalDevice);
+                if (video_texture.hui_handle != 0 && renderer) {
+                    renderer->destroy_texture(video_texture.hui_handle);
+                    video_texture.hui_handle = 0;
                 }
-                video_texture.update_frame(frame_rgba.data());
-                is_buffering = false;
+                video_texture.init(device, queue, vw, vh);
+                if (renderer && video_texture.view != VK_NULL_HANDLE) {
+                    video_texture.hui_handle = renderer->import_texture(video_texture.view);
+                }
             }
+            if (video_texture.update_frame(frame_rgba.data(), frame_rgba.size()))
+                is_buffering = false;
         }
     }
 }

@@ -789,68 +789,259 @@ std::string Client::clear_trash(const std::string &data)
     return !decoded.empty() ? decoded : data;
 }
 
+static std::string trim_stream_token(std::string s)
+{
+    while (!s.empty() && (std::isspace(static_cast<unsigned char>(s.front())) || s.front() == ',' ||
+                          s.front() == '"' || s.front() == '\''))
+        s.erase(s.begin());
+    while (!s.empty() && (std::isspace(static_cast<unsigned char>(s.back())) || s.back() == ',' ||
+                          s.back() == '"' || s.back() == '\'' || s.back() == '\\'))
+        s.pop_back();
+    return s;
+}
+
+static bool stream_is_teaser(const std::string &u)
+{
+    return u.find("/zrkms.mp4") != std::string::npos || u.find("trailer") != std::string::npos;
+}
+
+static bool stream_is_hls(const std::string &u)
+{
+    return u.find("m3u8") != std::string::npos || u.find(":hls") != std::string::npos;
+}
+
+static bool stream_is_mp4(const std::string &u)
+{
+    return u.find(".mp4") != std::string::npos && !stream_is_hls(u);
+}
+
+static std::string strip_hls_wrapper(std::string u)
+{
+    const char *kMarks[] = {":hls:manifest.m3u8", ":hls:manifest", ":hls"};
+    for (const char *mark : kMarks) {
+        const size_t at = u.find(mark);
+        if (at != std::string::npos)
+            u.erase(at);
+    }
+    return trim_stream_token(std::move(u));
+}
+
+static int stream_url_score(const std::string &u)
+{
+    if (u.rfind("http", 0) != 0)
+        return -1;
+    if (stream_is_teaser(u))
+        return 0;
+    if (stream_is_mp4(u))
+        return 400;
+    if (u.find(".mp4") != std::string::npos && !u.ends_with(".m3u8"))
+        return 300;
+    if (!stream_is_hls(u))
+        return 200;
+    return 50;
+}
+
+static std::string pick_direct_stream_url(const std::string &blob)
+{
+    std::vector<std::string> parts;
+    std::string lower = blob;
+    for (char &c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    size_t start = 0;
+    while (start <= blob.size()) {
+        size_t split = std::string::npos;
+        size_t skip = 0;
+        const size_t or_at = lower.find(" or ", start);
+        const size_t comma_at = blob.find(',', start);
+        if (or_at != std::string::npos) {
+            split = or_at;
+            skip = 4;
+        }
+        if (comma_at != std::string::npos && (split == std::string::npos || comma_at < split)) {
+            split = comma_at;
+            skip = 1;
+        }
+        if (split == std::string::npos) {
+            parts.push_back(blob.substr(start));
+            break;
+        }
+        parts.push_back(blob.substr(start, split - start));
+        start = split + skip;
+    }
+
+    auto consider_into = [](std::string u, std::string &best, int &best_score) {
+        u = trim_stream_token(std::move(u));
+        if (u.rfind("//", 0) == 0)
+            u = "https:" + u;
+        if (u.rfind("http", 0) != 0)
+            return;
+        const int score = stream_url_score(u);
+        if (score > best_score) {
+            best_score = score;
+            best = std::move(u);
+        }
+    };
+
+    std::string best;
+    int best_score = -1;
+    auto consider = [&](const std::string &u) {
+        consider_into(u, best, best_score);
+        const std::string stripped = strip_hls_wrapper(u);
+        if (stripped != u)
+            consider_into(stripped, best, best_score);
+    };
+    for (const std::string &part : parts)
+        consider(part);
+
+    // Also pick bare http(s) tokens in case the CDN list used an odd separator.
+    size_t http_at = 0;
+    while ((http_at = blob.find("http", http_at)) != std::string::npos) {
+        if (blob.compare(http_at, 7, "http://") != 0 && blob.compare(http_at, 8, "https://") != 0) {
+            ++http_at;
+            continue;
+        }
+        size_t end = http_at;
+        while (end < blob.size()) {
+            const unsigned char c = static_cast<unsigned char>(blob[end]);
+            if (std::isspace(c) || c == ',' || c == '[' || c == '"' || c == '\'')
+                break;
+            ++end;
+        }
+        consider(blob.substr(http_at, end - http_at));
+        http_at = end;
+    }
+    return best;
+}
+
+static std::string json_unescape_string(const std::string &json, size_t start, size_t *end_out)
+{
+    std::string out;
+    size_t i = start;
+    while (i < json.size()) {
+        const char c = json[i];
+        if (c == '"') {
+            if (end_out)
+                *end_out = i;
+            return out;
+        }
+        if (c == '\\' && i + 1 < json.size()) {
+            const char n = json[i + 1];
+            if (n == '/' || n == '\\' || n == '"') {
+                out.push_back(n);
+                i += 2;
+                continue;
+            }
+            if (n == 'n') {
+                out.push_back('\n');
+                i += 2;
+                continue;
+            }
+            if (n == 'r') {
+                out.push_back('\r');
+                i += 2;
+                continue;
+            }
+            if (n == 't') {
+                out.push_back('\t');
+                i += 2;
+                continue;
+            }
+            if (n == 'u' && i + 6 <= json.size()) {
+                unsigned code = 0;
+                bool ok = true;
+                for (int k = 0; k < 4; ++k) {
+                    const char h = json[i + 2 + k];
+                    code <<= 4;
+                    if (h >= '0' && h <= '9')
+                        code += static_cast<unsigned>(h - '0');
+                    else if (h >= 'a' && h <= 'f')
+                        code += static_cast<unsigned>(h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F')
+                        code += static_cast<unsigned>(h - 'A' + 10);
+                    else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) {
+                    if (code < 0x80)
+                        out.push_back(static_cast<char>(code));
+                    else if (code < 0x800) {
+                        out.push_back(static_cast<char>(0xc0 | (code >> 6)));
+                        out.push_back(static_cast<char>(0x80 | (code & 0x3f)));
+                    } else {
+                        out.push_back(static_cast<char>(0xe0 | (code >> 12)));
+                        out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3f)));
+                        out.push_back(static_cast<char>(0x80 | (code & 0x3f)));
+                    }
+                    i += 6;
+                    continue;
+                }
+            }
+            out.push_back(n);
+            i += 2;
+            continue;
+        }
+        out.push_back(c);
+        ++i;
+    }
+    if (end_out)
+        *end_out = i;
+    return out;
+}
+
+static int stream_quality_rank(const std::string &q)
+{
+    auto has = [&](const char *s) { return q.find(s) != std::string::npos; };
+    if (has("2160") || has("4K") || has("4k"))
+        return 6000;
+    if (has("Ultra") || has("ultra") || has("1080p+"))
+        return 1180;
+    if (has("1080"))
+        return 1080;
+    if (has("720"))
+        return 720;
+    if (has("480"))
+        return 480;
+    if (has("360"))
+        return 360;
+    if (has("240"))
+        return 240;
+    return 0;
+}
+
 std::vector<StreamQuality> Client::parse_stream_string(const std::string &raw)
 {
     std::vector<StreamQuality> qualities;
-    if (raw.empty()) return qualities;
+    if (raw.empty())
+        return qualities;
 
-    std::regex re("\\[([^\\]]+)\\]([^,\\[]+)");
-    std::sregex_iterator next(raw.begin(), raw.end(), re);
-    std::sregex_iterator end;
+    size_t pos = 0;
+    while ((pos = raw.find('[', pos)) != std::string::npos) {
+        const size_t label_end = raw.find(']', pos + 1);
+        if (label_end == std::string::npos)
+            break;
+        std::string quality_label = strip_tags(raw.substr(pos + 1, label_end - (pos + 1)));
+        const size_t next = raw.find('[', label_end + 1);
+        std::string blob = raw.substr(label_end + 1,
+                                      (next == std::string::npos ? raw.size() : next) - (label_end + 1));
+        pos = next == std::string::npos ? raw.size() : next;
 
-    while (next != end) {
-        std::smatch match = *next;
-        std::string quality_label = match[1].str();
-        std::string urls_str = match[2].str();
-
-        // clean label tags
-        quality_label = strip_tags(quality_label);
-
-        // URLs may have " or "
-        std::string best_url;
-        auto is_teaser = [](const std::string &u) {
-            return u.find("/zrkms.mp4") != std::string::npos;
-        };
-
-        size_t or_idx = urls_str.find(" or ");
-        if (or_idx != std::string::npos) {
-            std::string p1 = urls_str.substr(0, or_idx);
-            std::string p2 = urls_str.substr(or_idx + 4);
-            size_t h1 = p1.find(":hls:manifest.m3u8");
-            if (h1 != std::string::npos) p1.erase(h1, 18);
-            size_t h2 = p2.find(":hls:manifest.m3u8");
-            if (h2 != std::string::npos) p2.erase(h2, 18);
-            while (!p1.empty() && (isspace((unsigned char)p1.front()) || p1.front() == ',')) p1.erase(0, 1);
-            while (!p1.empty() && (isspace((unsigned char)p1.back()) || p1.back() == ',')) p1.pop_back();
-            while (!p2.empty() && (isspace((unsigned char)p2.front()) || p2.front() == ',')) p2.erase(0, 1);
-            while (!p2.empty() && (isspace((unsigned char)p2.back()) || p2.back() == ',')) p2.pop_back();
-
-            if (!is_teaser(p2) && p2.rfind("http", 0) == 0) best_url = p2;
-            else if (!is_teaser(p1) && p1.rfind("http", 0) == 0) best_url = p1;
-            else best_url = p2.empty() ? p1 : p2;
-        } else {
-            best_url = urls_str;
-            size_t hls_pos = best_url.find(":hls:manifest.m3u8");
-            if (hls_pos != std::string::npos) {
-                best_url.erase(hls_pos, 18);
-            }
-        }
-
-        // trim whitespace and commas
-        while (!best_url.empty() && (isspace((unsigned char)best_url.front()) || best_url.front() == ',')) best_url.erase(0, 1);
-        while (!best_url.empty() && (isspace((unsigned char)best_url.back()) || best_url.back() == ',')) best_url.pop_back();
-
-        if (best_url.rfind("http", 0) == 0) {
-            StreamQuality sq;
-            sq.quality = quality_label;
-            sq.url = best_url;
-            sq.is_premium = (quality_label.find("Ultra") != std::string::npos || quality_label.find("2160p") != std::string::npos);
-            qualities.push_back(sq);
-        }
-
-        ++next;
+        const std::string best_url = pick_direct_stream_url(blob);
+        if (best_url.rfind("http", 0) != 0)
+            continue;
+        StreamQuality sq;
+        sq.quality = quality_label;
+        sq.url = best_url;
+        sq.is_premium = (quality_label.find("Ultra") != std::string::npos ||
+                         quality_label.find("2160") != std::string::npos ||
+                         quality_label.find("4K") != std::string::npos);
+        qualities.push_back(std::move(sq));
     }
 
+    std::stable_sort(qualities.begin(), qualities.end(), [](const StreamQuality &a, const StreamQuality &b) {
+        return stream_quality_rank(a.quality) > stream_quality_rank(b.quality);
+    });
     return qualities;
 }
 
@@ -859,16 +1050,24 @@ static std::vector<CatalogItem> parse_catalog_html(const std::string &html, cons
     std::vector<CatalogItem> items;
     if (html.empty()) return items;
 
-    // Match the item card itself. A search for the bare class name also hits
-    // b-content__inline_item-cover and -link, which splits the poster away
-    // from the title so every card is dropped or left without a cover.
-    const std::string mark = "class=\"b-content__inline_item\"";
+    // The card class, as a whole token. "Показать все" leaves the rest of a
+    // filmography in the same list with an extra class (b-content__inline_item
+    // is_hidden); a search for the exact attribute misses those. The token
+    // match still skips -cover, -link and -quality, which share the prefix.
     size_t pos = 0;
-    while ((pos = html.find(mark, pos)) != std::string::npos) {
-        size_t end_item = html.find(mark, pos + mark.size());
-        if (end_item == std::string::npos) end_item = html.length();
+    while ((pos = find_class(html, "b-content__inline_item", pos)) != std::string::npos) {
+        const size_t tag_at = html.rfind('<', pos);
+        const size_t start = tag_at == std::string::npos ? pos : tag_at;
+        const size_t next = find_class(html, "b-content__inline_item", pos + 1);
+        size_t end_item = html.size();
+        if (next != std::string::npos) {
+            const size_t next_tag = html.rfind('<', next);
+            end_item = next_tag == std::string::npos ? next : next_tag;
+            if (end_item < start)
+                end_item = next;
+        }
 
-        std::string chunk = html.substr(pos, end_item - pos);
+        std::string chunk = html.substr(start, end_item - start);
         pos = end_item;
 
         CatalogItem item;
@@ -1336,15 +1535,147 @@ Client::HomePage Client::get_home_page(const std::string &filter)
     return page;
 }
 
-bool Client::get_person(const std::string &person_url, PersonDetails &out)
+// Integers in "В базе 10 фильмов и 1 мультфильм" — the site's own total.
+static int sum_numbers(const std::string &s)
 {
+    int sum = 0;
+    for (size_t i = 0; i < s.size();) {
+        if (std::isdigit(static_cast<unsigned char>(s[i]))) {
+            int value = 0;
+            while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
+                value = value * 10 + (s[i] - '0');
+                ++i;
+            }
+            sum += value;
+        } else {
+            ++i;
+        }
+    }
+    return sum;
+}
+
+// /person/<id>-<slug>/  and  /person/<id>-<slug>/page/N/
+static std::string person_page_url(std::string url, int page)
+{
+    const size_t hash = url.find('#');
+    if (hash != std::string::npos)
+        url.erase(hash);
+    const size_t query = url.find('?');
+    if (query != std::string::npos)
+        url.erase(query);
+    const size_t page_at = url.find("/page/");
+    if (page_at != std::string::npos)
+        url.erase(page_at);
+    while (!url.empty() && url.back() == '/')
+        url.pop_back();
+    if (page > 1)
+        url += "/page/" + std::to_string(page) + "/";
+    else if (!url.empty())
+        url += "/";
+    return url;
+}
+
+static bool person_document(const std::string &html)
+{
+    return find_class(html, "b-person__career") != std::string::npos ||
+           html.find("b-post b-person") != std::string::npos ||
+           html.find("schema.org/Person") != std::string::npos;
+}
+
+// The next arrow of a person page, and only when it stays on /person/.../page/N/.
+// A bare /page/N/ is the home list, which this mirror serves for a missing person page.
+static bool person_nav_has_next(const std::string &html)
+{
+    const size_t next = html.find("b-navigation__next");
+    if (next == std::string::npos)
+        return false;
+    const size_t from = next > 220 ? next - 220 : 0;
+    const size_t no_page = html.rfind("no-page", next);
+    if (no_page != std::string::npos && no_page >= from)
+        return false;
+    const size_t a = html.rfind("<a", next);
+    if (a == std::string::npos || next - a > 500)
+        return false;
+    const size_t aend = html.find('>', a);
+    if (aend == std::string::npos)
+        return false;
+    const std::string href = attr_of(html.substr(a, aend - a), "href");
+    return href.find("/person/") != std::string::npos && href.find("/page/") != std::string::npos;
+}
+
+static int merge_person_careers(PersonDetails &dst, const PersonDetails &src)
+{
+    int added = 0;
+    auto take = [&](PersonCareer &into, const std::vector<CatalogItem> &movies, int expected) {
+        std::set<std::string> seen;
+        for (const CatalogItem &m : into.movies)
+            if (!m.url.empty())
+                seen.insert(m.url);
+        for (const CatalogItem &m : movies) {
+            if (m.url.empty() || !seen.insert(m.url).second)
+                continue;
+            into.movies.push_back(m);
+            ++added;
+        }
+        if (expected > into.expected)
+            into.expected = expected;
+    };
+    if (src.careers.empty()) {
+        if (!src.movies.empty()) {
+            if (dst.careers.empty()) {
+                PersonCareer career;
+                career.title = "Фильмография";
+                dst.careers.push_back(std::move(career));
+            }
+            take(dst.careers.front(), src.movies, 0);
+        }
+    } else {
+        for (const PersonCareer &career : src.careers) {
+            PersonCareer *into = nullptr;
+            for (PersonCareer &have : dst.careers) {
+                if (have.title == career.title) {
+                    into = &have;
+                    break;
+                }
+            }
+            if (!into) {
+                dst.careers.push_back(career);
+                added += static_cast<int>(career.movies.size());
+            } else {
+                take(*into, career.movies, career.expected);
+            }
+        }
+    }
+    dst.movies.clear();
+    std::set<std::string> seen;
+    for (const PersonCareer &career : dst.careers) {
+        for (const CatalogItem &m : career.movies) {
+            if (!m.url.empty() && seen.insert(m.url).second)
+                dst.movies.push_back(m);
+        }
+    }
+    return added;
+}
+
+bool Client::get_person(const std::string &person_url, PersonDetails &out, bool *has_next)
+{
+    return get_person_page(person_url, 1, out, has_next);
+}
+
+bool Client::get_person_page(const std::string &person_url, int page, PersonDetails &out, bool *has_next)
+{
+    if (has_next)
+        *has_next = false;
     out = {};
     out.url = person_url;
     if (out.url.rfind("http", 0) != 0 && !mirror_.empty())
         out.url = mirror_ + (out.url.empty() || out.url.front() == '/' ? "" : "/") + out.url;
+    if (page < 1)
+        page = 1;
+    out.url = person_page_url(out.url, 1);
 
-    std::string html = http_get(out.url);
-    if (html.empty())
+    std::string html = http_get(person_page_url(out.url, page));
+    if (html.empty() || !person_document(html))
         return false;
 
     auto take_between = [&](const std::string &open_mark, const std::string &close_tag) -> std::string {
@@ -1360,7 +1691,23 @@ bool Client::get_person(const std::string &person_url, PersonDetails &out)
         return strip_tags(html.substr(gt + 1, end - (gt + 1)));
     };
 
-    out.name = take_between("b-post__title", "</h1>");
+    // HDrezkaTV reads span.t1 (name) and span.t2 (original) inside the title.
+    {
+        const size_t title_at = html.find("b-post__title");
+        const size_t h1_end =
+            title_at == std::string::npos ? std::string::npos : html.find("</h1>", title_at);
+        if (title_at != std::string::npos && h1_end != std::string::npos) {
+            const std::string head = html.substr(title_at, h1_end - title_at);
+            const size_t t1 = find_class(head, "t1");
+            if (t1 != std::string::npos)
+                out.name = strip_tags(inner_after(head, t1, "</span>"));
+            const size_t t2 = find_class(head, "t2");
+            if (t2 != std::string::npos)
+                out.name_orig = strip_tags(inner_after(head, t2, "</span>"));
+        }
+    }
+    if (out.name.empty())
+        out.name = take_between("b-post__title", "</h1>");
     if (out.name.empty())
         out.name = take_between("b-person__name", "</");
     if (out.name.empty()) {
@@ -1372,7 +1719,8 @@ bool Client::get_person(const std::string &person_url, PersonDetails &out)
                 out.name = strip_tags(html.substr(gt + 1, end - (gt + 1)));
         }
     }
-    out.name_orig = take_between("b-post__origtitle", "</div>");
+    if (out.name_orig.empty())
+        out.name_orig = take_between("b-post__origtitle", "</div>");
     if (out.name_orig.empty())
         out.name_orig = take_between("b-person__orig_name", "</");
 
@@ -1429,57 +1777,66 @@ bool Client::get_person(const std::string &person_url, PersonDetails &out)
             out.id = m[1].str();
     }
 
-    // Careers -- each .b-person__career block (HDrezkaTV + browser client).
+    // Each role is its own div.b-person__career (Актёр, Режиссёр, …). The class
+    // token stops at the element: b-person__career_stats and _more sit inside
+    // the same block and must not split it. Cards with is_hidden are the rest
+    // of the list the site reveals with "Показать все".
     std::set<std::string> seen_urls;
     size_t pos = 0;
-    while ((pos = html.find("b-person__career", pos)) != std::string::npos) {
-        // Prefer career content blocks, skip header-only class hits when possible.
-        size_t block_start = pos;
-        size_t next = html.find("b-person__career", pos + 16);
-        size_t block_end = next == std::string::npos ? html.size() : next;
-        std::string block = html.substr(block_start, block_end - block_start);
-
-        std::string career_title = "Фильмография";
-        for (const char *mark : {"b-person__career_header", "b-person__career_title", "<h2",
-                                 "class=\"title\""}) {
-            size_t t = block.find(mark);
-            if (t == std::string::npos)
-                continue;
-            size_t gt = block.find('>', t);
-            size_t end = block.find('<', gt == std::string::npos ? t : gt + 1);
-            if (gt != std::string::npos && end != std::string::npos && end > gt) {
-                std::string title = strip_tags(block.substr(gt + 1, end - (gt + 1)));
-                if (!title.empty() && title != out.name) {
-                    career_title = title;
-                    break;
-                }
+    while ((pos = find_class(html, "b-person__career", pos)) != std::string::npos) {
+        const size_t tag_at = html.rfind('<', pos);
+        const size_t block_start = tag_at == std::string::npos ? pos : tag_at;
+        const size_t next = find_class(html, "b-person__career", pos + 1);
+        size_t block_end = html.size();
+        if (next != std::string::npos) {
+            const size_t next_tag = html.rfind('<', next);
+            block_end = next_tag == std::string::npos ? next : next_tag;
+            if (block_end < block_start)
+                block_end = next;
+        } else {
+            for (const char *mark : {"b-footer", "<footer", "id=\"footer\""}) {
+                const size_t at = html.find(mark, block_start + 1);
+                if (at != std::string::npos && at < block_end)
+                    block_end = at;
             }
         }
+        const std::string block = html.substr(block_start, block_end - block_start);
+        pos = block_end;
 
-        auto films = parse_catalog_html(block, "person", mirror_);
+        std::string career_title = "Фильмография";
+        const size_t h2 = block.find("<h2");
+        if (h2 != std::string::npos) {
+            const std::string title = strip_tags(inner_after(block, h2, "</h2>"));
+            if (!title.empty() && title != out.name)
+                career_title = title;
+        }
+
         PersonCareer career;
         career.title = career_title;
-        for (const CatalogItem &item : films) {
-            career.movies.push_back(item);
+        const size_t stats_at = find_class(block, "b-person__career_stats");
+        if (stats_at != std::string::npos)
+            career.expected = sum_numbers(strip_tags(inner_after(block, stats_at, "</span>")));
+        career.movies = parse_catalog_html(block, "person", mirror_);
+        for (const CatalogItem &item : career.movies) {
             if (seen_urls.insert(item.url).second)
                 out.movies.push_back(item);
         }
-        if (!career.movies.empty())
+        if (!career.movies.empty() || career_title != "Фильмография")
             out.careers.push_back(std::move(career));
-        pos = block_end;
     }
 
     if (out.movies.empty()) {
         auto films = parse_catalog_html(html, "person", mirror_);
-        for (const CatalogItem &item : films)
-            if (seen_urls.insert(item.url).second)
+        PersonCareer career;
+        career.title = "Фильмография";
+        for (const CatalogItem &item : films) {
+            if (seen_urls.insert(item.url).second) {
+                career.movies.push_back(item);
                 out.movies.push_back(item);
-        if (!out.movies.empty()) {
-            PersonCareer career;
-            career.title = "Фильмография";
-            career.movies = out.movies;
-            out.careers.push_back(std::move(career));
+            }
         }
+        if (!career.movies.empty())
+            out.careers.push_back(std::move(career));
     }
 
     // Info table: date/place of birth, height, …
@@ -1535,14 +1892,38 @@ bool Client::get_person(const std::string &person_url, PersonDetails &out)
     fill_info("b-person__info");
     fill_info("b-person__infotable");
 
+    bool more = person_nav_has_next(html);
+    if (!more) {
+        for (const PersonCareer &career : out.careers) {
+            if (career.expected > static_cast<int>(career.movies.size())) {
+                more = true;
+                break;
+            }
+        }
+    }
+    if (has_next)
+        *has_next = more;
+    write_log("[DEBUG] get_person page %d %s -> %zu careers, %zu films, more %d\n", page,
+              out.name.c_str(), out.careers.size(), out.movies.size(), more ? 1 : 0);
     return !out.name.empty() || !out.movies.empty();
 }
 
 std::vector<CatalogItem> Client::get_person_films(const std::string &person_url)
 {
     PersonDetails details;
-    if (!get_person(person_url, details))
+    bool has_next = false;
+    if (!get_person_page(person_url, 1, details, &has_next))
         return {};
+    for (int page = 2; has_next && page <= 40; ++page) {
+        PersonDetails more;
+        bool next = false;
+        const std::string base = details.url.empty() ? person_url : details.url;
+        if (!get_person_page(base, page, more, &next))
+            break;
+        if (merge_person_careers(details, more) == 0)
+            break;
+        has_next = next;
+    }
     return details.movies;
 }
 
@@ -2474,47 +2855,45 @@ std::vector<StreamQuality> Client::get_streams(const VideoDetails &video,
               video.id.c_str(), translator_id.c_str(), season_id.c_str(), episode_id.c_str(),
               video.favs.c_str(), response.size());
 
-    if (response.empty()) {
-        if (!video.is_series && !video.embedded_streams.empty()) {
-            std::string decoded = clear_trash(video.embedded_streams);
-            return parse_stream_string(decoded);
+    auto finish = [](std::vector<StreamQuality> streams, size_t raw_n, size_t decoded_n) {
+        write_log("[DEBUG] get_streams decoded %zu qualities (raw %zu -> %zu bytes)\n", streams.size(),
+                  raw_n, decoded_n);
+        for (size_t i = 0; i < streams.size(); ++i) {
+            write_log("[DEBUG] get_streams q[%zu]=%s url=%s mp4=%d hls=%d\n", i,
+                      streams[i].quality.c_str(), streams[i].url.c_str(),
+                      (int)stream_is_mp4(streams[i].url), (int)stream_is_hls(streams[i].url));
         }
-        return {};
-    }
+        return streams;
+    };
+
+    auto from_embedded = [&]() -> std::vector<StreamQuality> {
+        if (video.is_series || video.embedded_streams.empty())
+            return {};
+        std::string decoded = clear_trash(video.embedded_streams);
+        return finish(parse_stream_string(decoded), video.embedded_streams.size(), decoded.size());
+    };
+
+    if (response.empty())
+        return from_embedded();
 
     // Response is JSON: { "success": true, "url": "...", "subtitle": "..." }
     size_t url_key = response.find("\"url\":\"");
     if (url_key == std::string::npos) {
         url_key = response.find("\"url\": \"");
     }
-    if (url_key == std::string::npos) {
-        if (!video.is_series && !video.embedded_streams.empty()) {
-            std::string decoded = clear_trash(video.embedded_streams);
-            return parse_stream_string(decoded);
-        }
-        return {};
-    }
+    if (url_key == std::string::npos)
+        return from_embedded();
 
-    size_t val_start = response.find("\"", url_key + 6) + 1;
-    size_t val_end = response.find("\"", val_start);
-    if (val_end == std::string::npos) return {};
+    const size_t val_start = response.find('"', url_key + 6);
+    if (val_start == std::string::npos)
+        return from_embedded();
+    size_t val_end = std::string::npos;
+    const std::string obfuscated = json_unescape_string(response, val_start + 1, &val_end);
+    if (obfuscated.empty())
+        return from_embedded();
 
-    std::string obfuscated = response.substr(val_start, val_end - val_start);
-    // Unescape forward slashes if \/
-    std::string clean_obf;
-    for (size_t i = 0; i < obfuscated.length(); ++i) {
-        if (obfuscated[i] == '\\' && i + 1 < obfuscated.length() && obfuscated[i + 1] == '/') {
-            clean_obf.push_back('/');
-            i++;
-        } else {
-            clean_obf.push_back(obfuscated[i]);
-        }
-    }
-
-    std::string decoded = clear_trash(clean_obf);
-    auto streams = parse_stream_string(decoded);
-    write_log("[DEBUG] get_streams decoded %zu qualities\n", streams.size());
-    return streams;
+    std::string decoded = clear_trash(obfuscated);
+    return finish(parse_stream_string(decoded), obfuscated.size(), decoded.size());
 }
 
 } // namespace rezka

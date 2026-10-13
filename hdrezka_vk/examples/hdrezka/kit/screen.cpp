@@ -35,6 +35,7 @@
 #include "ui/glyphs.hpp"
 #include "ui/motion.hpp"
 #include "../hdrezka_app.hpp"
+#include "../logger.hpp"
 #include "../qr_code.hpp"
 #include "platform.h"
 struct pad &ps5_pad();
@@ -774,6 +775,8 @@ class Store final : public app::Concept
                     const int voice = app.playing_translator_idx;
                     const int season = app.playing_season_idx;
                     const int episode = app.playing_episode_idx;
+                    write_log("[DEBUG] player quality change focus=%d playing=%d pos=%.1f\n",
+                              pl_quality_focus_, app.playing_quality_idx, position);
                     app.stop_playback();
                     app.play_title_async(index, voice, pl_quality_focus_, season, episode, position);
                 }
@@ -1734,8 +1737,63 @@ class Store final : public app::Concept
                  gfx::Align::center);
     }
 
-    // Separate actor page (HDrezkaTV-style): photo, careers, film grid.
-    // Does not replace the home catalogue; Circle returns to the movie page.
+    // Actor page, measured like HDrezkaTV's PersonDetails / PersonMovies:
+    // a full-screen Material sheet, the portrait beside the name, then the
+    // same 2:3 poster grid as the home list. Circle (or Закрыть) returns to
+    // the title. Does not replace the home catalogue.
+    struct PersonMetrics
+    {
+        float pad = 0.0f;
+        float gap = 0.0f;
+        float photo_x = 0.0f;
+        float photo_y = 0.0f;
+        float photo_w = 0.0f;
+        float photo_h = 0.0f;
+        float text_x = 0.0f;
+        float grid_top = 0.0f;
+        float card_w = 0.0f;
+        float cover_h = 0.0f;
+        float row_pitch = 0.0f;
+        float view_bottom = 0.0f;
+        int cols = 7;
+        Rect close{};
+    };
+
+    static const char *person_films_word(int count)
+    {
+        const int n10 = count % 10;
+        const int n100 = count % 100;
+        if (n10 == 1 && n100 != 11)
+            return "фильм";
+        if (n10 >= 2 && n10 <= 4 && (n100 < 12 || n100 > 14))
+            return "фильма";
+        return "фильмов";
+    }
+
+    PersonMetrics person_metrics() const
+    {
+        PersonMetrics m;
+        m.pad = 48.0f * kTvDp;
+        m.gap = 12.0f * kTvDp;
+        m.cols = 7;
+        m.photo_y = 24.0f * kTvDp;
+        m.photo_x = m.pad;
+        m.photo_w = 112.0f * kTvDp;
+        m.photo_h = m.photo_w * 1.5f;
+        m.text_x = m.photo_x + m.photo_w + 24.0f * kTvDp;
+        m.grid_top = m.photo_y + m.photo_h + 16.0f * kTvDp;
+        m.card_w = (kWidth - 2.0f * m.pad - static_cast<float>(m.cols - 1) * m.gap) /
+                   static_cast<float>(m.cols);
+        m.cover_h = m.card_w * 1.5f;
+        const float text_h = 12.0f * kTvDp + 2.0f * (14.0f * kTvDp) + 4.0f * kTvDp + 2.0f * (12.0f * kTvDp);
+        m.row_pitch = m.cover_h + text_h + m.gap;
+        m.view_bottom = kHeight - 28.0f * kTvDp;
+        const float close_w =
+            tv_medium().measure("Закрыть", 14.0f * kTvDp, 0.1f * kTvDp) + 32.0f * kTvDp;
+        m.close = {kWidth - m.pad - close_w, m.photo_y, close_w, 36.0f * kTvDp};
+        return m;
+    }
+
     void open_filmography(const std::string &url, const std::string &name, app::Feedback &feedback)
     {
         if (url.empty())
@@ -1746,8 +1804,9 @@ class Store final : public app::Concept
         }
         person_open_ = true;
         person_focus_ = 0;
-        person_zone_chips_ = false;
+        person_zone_ = 0;
         person_scroll_ = 0.0f;
+        person_nav_key_.clear();
         person_return_page_item_ = page_item_;
         rezka::App::instance().person_async(url, name);
         feedback.play(audio::Cue::open);
@@ -1768,135 +1827,144 @@ class Store final : public app::Concept
     void update_person(const InputFrame &input, app::Feedback &feedback)
     {
         auto &app = rezka::App::instance();
-        const uint32_t ver = app.person_version.load();
-        if (ver != last_person_version_)
+        std::string nav_key;
+        int career_count = 0;
+        int film_count = 0;
+        const bool loading = app.person_loading.load();
         {
-            last_person_version_ = ver;
+            std::lock_guard<std::mutex> lock(app.catalog_mutex);
+            nav_key = app.person.url;
+            career_count = static_cast<int>(app.person_career_titles.size());
+            film_count = static_cast<int>(app.person_movies.size());
+        }
+        if (nav_key != person_nav_key_)
+        {
+            person_nav_key_ = nav_key;
             person_focus_ = 0;
             person_scroll_ = 0.0f;
+            person_zone_ = 0;
         }
 
-        if (input.is_pressed(Action::back))
+        if (input.is_pressed(Action::back) ||
+            (person_zone_ == 2 && input.is_pressed(Action::confirm)))
         {
             close_person(feedback);
             return;
         }
 
-        int career_count = 0;
-        int film_count = 0;
-        bool loading = app.person_loading.load();
-        {
-            std::lock_guard<std::mutex> lock(app.catalog_mutex);
-            career_count = static_cast<int>(app.person_career_titles.size());
-            film_count = static_cast<int>(app.person_movies.size());
-        }
-
+        auto step_career = [&](int delta) {
+            if (career_count <= 1)
+                return;
+            int cur = 0;
+            {
+                std::lock_guard<std::mutex> lock(app.catalog_mutex);
+                cur = app.person_career_idx;
+            }
+            app.person_select_career((cur + delta + career_count) % career_count);
+            person_focus_ = 0;
+            person_scroll_ = 0.0f;
+            person_zone_ = 1;
+            feedback.play(audio::Cue::tab);
+        };
         if (input.is_pressed(Action::page_prev) || input.is_pressed(Action::jump_prev))
         {
-            if (career_count > 1)
-            {
-                int cur = 0;
-                {
-                    std::lock_guard<std::mutex> lock(app.catalog_mutex);
-                    cur = app.person_career_idx;
-                }
-                app.person_select_career((cur - 1 + career_count) % career_count);
-                person_focus_ = 0;
-                person_zone_chips_ = true;
-                feedback.play(audio::Cue::tab);
-            }
+            step_career(-1);
             return;
         }
         if (input.is_pressed(Action::page_next) || input.is_pressed(Action::jump_next))
         {
-            if (career_count > 1)
-            {
-                int cur = 0;
-                {
-                    std::lock_guard<std::mutex> lock(app.catalog_mutex);
-                    cur = app.person_career_idx;
-                }
-                app.person_select_career((cur + 1) % career_count);
-                person_focus_ = 0;
-                person_zone_chips_ = true;
-                feedback.play(audio::Cue::tab);
-            }
+            step_career(1);
             return;
         }
 
-        if (loading || film_count <= 0)
-            return;
+        const PersonMetrics m = person_metrics();
+        const bool chips = career_count > 1;
+        const int cols = m.cols;
 
-        constexpr int kPersonCols = 6;
-        if (person_zone_chips_)
+        if (person_zone_ == 2)
         {
             if (input.nav == Direction::down)
             {
-                person_zone_chips_ = false;
+                person_zone_ = chips ? 1 : (film_count > 0 ? 0 : 2);
+                if (person_zone_ != 2)
+                    feedback.play(audio::Cue::focus);
+            }
+            return;
+        }
+
+        if (person_zone_ == 1)
+        {
+            if (input.nav == Direction::left || input.nav == Direction::right)
+                step_career(input.nav == Direction::right ? 1 : -1);
+            else if (input.nav == Direction::up)
+            {
+                person_zone_ = 2;
                 feedback.play(audio::Cue::focus);
             }
-            else if (input.nav == Direction::left || input.nav == Direction::right)
+            else if (input.nav == Direction::down && film_count > 0)
             {
-                int cur = 0;
-                {
-                    std::lock_guard<std::mutex> lock(app.catalog_mutex);
-                    cur = app.person_career_idx;
-                }
-                const int next =
-                    (cur + (input.nav == Direction::right ? 1 : -1) + career_count) % career_count;
-                app.person_select_career(next);
-                feedback.play(audio::Cue::tab);
+                person_zone_ = 0;
+                person_focus_ = std::clamp(person_focus_, 0, film_count - 1);
+                feedback.play(audio::Cue::focus);
             }
             return;
         }
 
-        if (input.nav == Direction::up && person_focus_ < kPersonCols && career_count > 1)
+        if (film_count <= 0)
         {
-            person_zone_chips_ = true;
-            feedback.play(audio::Cue::focus);
+            if (input.nav == Direction::up)
+            {
+                person_zone_ = chips ? 1 : 2;
+                feedback.play(audio::Cue::focus);
+            }
             return;
         }
 
-        int row = person_focus_ / kPersonCols;
-        int col = person_focus_ % kPersonCols;
-        const int rows = (film_count + kPersonCols - 1) / kPersonCols;
+        if (person_focus_ >= film_count)
+            person_focus_ = film_count - 1;
+        const int rows = (film_count + cols - 1) / cols;
+        int row = person_focus_ / cols;
+        const int col = person_focus_ % cols;
+        int next = person_focus_;
         if (input.nav == Direction::left)
-            col = (col + kPersonCols - 1) % kPersonCols;
+            next = col == 0 ? person_focus_ : person_focus_ - 1;
         else if (input.nav == Direction::right)
-            col = (col + 1) % kPersonCols;
+            next = (col == cols - 1 || person_focus_ + 1 >= film_count) ? person_focus_ : person_focus_ + 1;
         else if (input.nav == Direction::up)
-            row = std::max(0, row - 1);
-        else if (input.nav == Direction::down)
-            row = std::min(rows - 1, row + 1);
-        if (input.nav != Direction::none)
         {
-            int next = row * kPersonCols + col;
-            if (next >= film_count)
-                next = film_count - 1;
-            if (next != person_focus_)
+            if (row == 0)
             {
-                person_focus_ = next;
+                person_zone_ = chips ? 1 : 2;
                 feedback.play(audio::Cue::focus);
+                return;
             }
+            next = person_focus_ - cols;
+        }
+        else if (input.nav == Direction::down)
+        {
+            next = person_focus_ + cols;
+            if (next >= film_count && next / cols == (film_count - 1) / cols)
+                next = film_count - 1;
+            else if (next >= film_count)
+                next = person_focus_;
+        }
+        if (input.nav != Direction::none && next != person_focus_)
+        {
+            person_focus_ = next;
+            row = person_focus_ / cols;
+            feedback.play(audio::Cue::focus);
         }
 
-        // Keep the focused poster in the clipped grid window.
-        {
-            constexpr float kGap = 18.0f;
-            constexpr float kPanelW = kWidth - 144.0f;
-            const float card_w =
-                (kPanelW - 80.0f - (kPersonCols - 1) * kGap) / static_cast<float>(kPersonCols);
-            const float card_h = card_w * 1.5f;
-            const float view_h = kHeight - 112.0f - (56.0f + 36.0f + 292.0f + 64.0f) - 48.0f;
-            const int frow = person_focus_ / kPersonCols;
-            const float y0 = static_cast<float>(frow) * (card_h + 56.0f);
-            if (y0 - person_scroll_ < 0.0f)
-                person_scroll_ = y0;
-            if (y0 + card_h - person_scroll_ > view_h)
-                person_scroll_ = y0 + card_h - view_h;
-            if (person_scroll_ < 0.0f)
-                person_scroll_ = 0.0f;
-        }
+        const float view_h = m.view_bottom - m.grid_top;
+        const float y0 = static_cast<float>(row) * m.row_pitch;
+        const float card_bottom = y0 + m.row_pitch - m.gap;
+        if (y0 < person_scroll_)
+            person_scroll_ = y0;
+        if (card_bottom - person_scroll_ > view_h)
+            person_scroll_ = card_bottom - view_h;
+        const float content = static_cast<float>(rows) * m.row_pitch - m.gap;
+        const float max_scroll = std::max(0.0f, content - view_h);
+        person_scroll_ = std::clamp(person_scroll_, 0.0f, max_scroll);
 
         if (input.is_pressed(Action::confirm))
         {
@@ -1909,7 +1977,13 @@ class Store final : public app::Concept
             person_open_ = false;
             open_page(idx, false, feedback);
             rezka::App::instance().load_details_async(idx);
+            return;
         }
+
+        const bool short_page = content <= view_h + 1.0f;
+        const bool near_end = short_page || row >= rows - 2;
+        if (near_end && !loading && app.person_has_next.load() && !app.person_more_loading.load())
+            app.person_load_more_async();
     }
 
     void draw_person(gfx::DrawList &list) const
@@ -1922,7 +1996,8 @@ class Store final : public app::Concept
         std::vector<std::string> careers;
         int career_idx = 0;
         std::string status;
-        bool loading = app.person_loading.load();
+        const bool loading = app.person_loading.load();
+        const bool more = app.person_more_loading.load();
         {
             std::lock_guard<std::mutex> lock(app.catalog_mutex);
             person = app.person;
@@ -1932,99 +2007,167 @@ class Store final : public app::Concept
             status = app.person_status;
         }
 
-        list.rounded_rect({0, 0, kWidth, kHeight}, 0, Color::rgb(0x000000, 0.82f));
-        const Rect panel{72.0f, 56.0f, kWidth - 144.0f, kHeight - 112.0f};
-        list.rounded_rect(panel, 28.0f, kCoal);
-        list.bordered_rect(panel, 28.0f, kClear, 2.0f, kAccent.with_alpha(0.55f));
-
+        const PersonMetrics m = person_metrics();
         const ui::Fonts &fonts = context_.fonts;
-        const float head_y = panel.y + 36.0f;
-        const Rect photo{panel.x + 40.0f, head_y, 180.0f, 270.0f};
+        list.rounded_rect({0, 0, kWidth, kHeight}, 0.0f, tv_surface());
+
+        const bool close_on = person_zone_ == 2;
+        list.rounded_rect(m.close, m.close.h * 0.5f,
+                          close_on ? tv_on_surface() : tv_secondary_container());
+        tv_text(list, tv_medium(), "Закрыть", m.close.cx(), m.close.y + 8.0f * kTvDp, 14.0f * kTvDp,
+                20.0f * kTvDp, close_on ? tv_inverse_on_surface() : tv_on_secondary_container(),
+                gfx::Align::center, 0.1f * kTvDp);
+
+        const Rect photo{m.photo_x, m.photo_y, m.photo_w, m.photo_h};
         const std::uint32_t photo_tex =
             app.photo_texture(person.photo_hq.empty() ? person.photo : person.photo_hq);
+        const float photo_r = 8.0f * kTvDp;
         if (photo_tex != 0)
-            list.image(photo_tex, photo, cover_uv(photo), kWhite, 16.0f);
+            list.image(photo_tex, photo, cover_uv(photo), kWhite, photo_r);
         else
-            list.rounded_rect(photo, 16.0f, kPanel);
+            list.rounded_rect(photo, photo_r, tv_surface_variant());
+        list.bordered_rect(photo, photo_r, kClear, 2.0f * kTvDp, tv_border().with_alpha(0.65f));
 
-        float tx = photo.x + photo.w + 36.0f;
-        ui::text(list, fonts.display, fonts.display.font->fit(person.name.c_str(), 48, 900.0f), tx,
-                 head_y + 36.0f, 48, kInk);
+        const float text_w = m.close.x - m.text_x - 16.0f * kTvDp;
+        float ty = m.photo_y + 4.0f * kTvDp;
+        const std::string name = person.name.empty() ? "Фильмография" : person.name;
+        tv_text(list, tv_medium(), fonts.hand.font->fit(name, 28.0f * kTvDp, text_w), m.text_x, ty,
+                28.0f * kTvDp, 36.0f * kTvDp, tv_on_surface());
+        ty += 40.0f * kTvDp;
         if (!person.name_orig.empty())
-            ui::text(list, fonts.regular, person.name_orig.c_str(), tx, head_y + 92.0f, 24,
-                     kInk.with_alpha(0.65f));
-        float meta_y = head_y + 140.0f;
-        auto meta_line = [&](const char *label, const std::string &value) {
-            if (value.empty())
-                return;
-            ui::text(list, fonts.regular, (std::string(label) + value).c_str(), tx, meta_y, 22,
-                     kInk.with_alpha(0.8f));
-            meta_y += 32.0f;
-        };
-        meta_line("Дата рождения: ", person.date_of_birth);
-        meta_line("Место рождения: ", person.place_of_birth);
-        meta_line("Дата смерти: ", person.date_of_death);
-        meta_line("Рост: ", person.height);
-
-        float chip_y = head_y + 292.0f;
-        float chip_x = panel.x + 40.0f;
-        for (int i = 0; i < static_cast<int>(careers.size()); ++i)
         {
-            const float w = fonts.semibold.measure(careers[static_cast<std::size_t>(i)].c_str(), 20) + 28.0f;
-            const Rect chip{chip_x, chip_y, w, 40.0f};
-            const bool on = (i == career_idx);
-            const bool focus = person_zone_chips_ && on;
-            list.rounded_rect(chip, 20.0f, on ? kAccent : kPanel);
-            if (focus)
-                list.bordered_rect(chip, 20.0f, kClear, 2.0f, kWhite);
-            ui::text(list, fonts.semibold, careers[static_cast<std::size_t>(i)].c_str(), chip.cx(),
-                     centred(chip.cy(), 20), 20, on ? kOnAccent : kInk.with_alpha(0.8f),
-                     gfx::Align::center);
-            chip_x += w + 12.0f;
+            tv_text(list, tv_regular(), fonts.pixel.font->fit(person.name_orig, 16.0f * kTvDp, text_w),
+                    m.text_x, ty, 16.0f * kTvDp, 24.0f * kTvDp, tv_on_surface().with_alpha(0.7f));
+            ty += 28.0f * kTvDp;
+        }
+        int expected = 0;
+        std::string role;
+        if (career_idx >= 0 && career_idx < static_cast<int>(person.careers.size()))
+        {
+            expected = person.careers[static_cast<std::size_t>(career_idx)].expected;
+            role = person.careers[static_cast<std::size_t>(career_idx)].title;
+        }
+        const int shown = static_cast<int>(films.size());
+        std::string count = role.empty() ? "" : role + "  ·  ";
+        if (expected > shown)
+            count += std::to_string(shown) + " из " + std::to_string(expected) + " " +
+                     person_films_word(expected);
+        else
+            count += std::to_string(shown) + " " + person_films_word(shown);
+        if (more)
+            count += "  ·  загрузка";
+        tv_text(list, tv_regular(), count, m.text_x, ty, 14.0f * kTvDp, 20.0f * kTvDp,
+                tv_on_surface_variant());
+        ty += 28.0f * kTvDp;
+        if (careers.size() <= 1 && !person.date_of_birth.empty())
+            tv_text(list, tv_regular(),
+                    fonts.pixel.font->fit("Дата рождения: " + person.date_of_birth, 14.0f * kTvDp, text_w),
+                    m.text_x, ty, 14.0f * kTvDp, 20.0f * kTvDp, tv_on_surface().with_alpha(0.8f));
+
+        if (careers.size() > 1)
+        {
+            float chip_x = m.text_x;
+            const float chip_y = m.photo_y + m.photo_h - 36.0f * kTvDp;
+            for (int i = 0; i < static_cast<int>(careers.size()); ++i)
+            {
+                const float w =
+                    tv_medium().measure(careers[static_cast<std::size_t>(i)], 14.0f * kTvDp, 0.1f * kTvDp) +
+                    24.0f * kTvDp;
+                if (chip_x + w > kWidth - m.pad)
+                    break;
+                const Rect chip{chip_x, chip_y, w, 36.0f * kTvDp};
+                const bool on = i == career_idx;
+                const bool focus = person_zone_ == 1 && on;
+                list.rounded_rect(chip, chip.h * 0.5f,
+                                  focus ? tv_on_surface()
+                                        : (on ? tv_secondary_container()
+                                              : tv_surface_variant().with_alpha(0.45f)));
+                const Color ink = focus ? tv_inverse_on_surface()
+                                        : (on ? tv_on_secondary_container()
+                                              : tv_on_surface().with_alpha(0.8f));
+                tv_text(list, tv_medium(), careers[static_cast<std::size_t>(i)], chip.cx(),
+                        chip.y + 8.0f * kTvDp, 14.0f * kTvDp, 20.0f * kTvDp, ink, gfx::Align::center,
+                        0.1f * kTvDp);
+                chip_x += w + 8.0f * kTvDp;
+            }
         }
 
-        const float grid_top = chip_y + 64.0f;
-        if (loading || (!status.empty() && films.empty()))
+        if (loading && films.empty())
         {
-            ui::text(list, fonts.semibold, loading ? "Загрузка фильмографии..." : status.c_str(),
-                     panel.cx(), grid_top + 120.0f, 28, kInk, gfx::Align::center);
+            tv_text(list, tv_medium(), "Загрузка фильмографии...", kWidth * 0.5f, m.grid_top + 48.0f * kTvDp,
+                    18.0f * kTvDp, 28.0f * kTvDp, tv_on_surface(), gfx::Align::center);
+        }
+        else if (films.empty())
+        {
+            tv_text(list, tv_medium(), status.empty() ? "Фильмы не найдены" : status, kWidth * 0.5f,
+                    m.grid_top + 48.0f * kTvDp, 18.0f * kTvDp, 28.0f * kTvDp, tv_on_surface(),
+                    gfx::Align::center);
         }
         else
         {
-            constexpr int kPersonCols = 6;
-            constexpr float kGap = 18.0f;
-            const float card_w =
-                (panel.w - 80.0f - (kPersonCols - 1) * kGap) / static_cast<float>(kPersonCols);
-            const float card_h = card_w * 1.5f;
-            const float ox = panel.x + 40.0f;
-            list.push_clip({panel.x + 20.0f, grid_top - 8.0f, panel.w - 40.0f,
-                            panel.y + panel.h - grid_top - 48.0f});
-            for (int i = 0; i < static_cast<int>(films.size()); ++i)
+            const float radius = 8.0f * kTvDp;
+            const float view_h = m.view_bottom - m.grid_top;
+            const int count = static_cast<int>(films.size());
+            const int first_row = std::max(0, static_cast<int>((person_scroll_ - m.gap) / m.row_pitch) - 1);
+            const int last_row = static_cast<int>((person_scroll_ + view_h) / m.row_pitch) + 1;
+            const int first = first_row * m.cols;
+            const int last = std::min(count, (last_row + 1) * m.cols);
+            const int focused = person_zone_ == 0 ? person_focus_ : -1;
+            list.push_clip({0.0f, m.grid_top, kWidth, view_h});
+            for (int pass = 0; pass < 2; ++pass)
             {
-                const int row = i / kPersonCols;
-                const int col = i % kPersonCols;
-                const Rect card{ox + col * (card_w + kGap),
-                                grid_top + row * (card_h + 56.0f) - person_scroll_, card_w, card_h};
-                const bool on = !person_zone_chips_ && i == person_focus_;
-                const auto &m = films[static_cast<std::size_t>(i)];
-                if (m.texture_id != 0)
-                    list.image(m.texture_id, card, cover_uv(card), kWhite, 12.0f);
-                else
-                    list.rounded_rect(card, 12.0f, kPanel);
-                if (on)
+                for (int i = first; i < last; ++i)
                 {
-                    list.bordered_rect(card.inset(-4.0f), 14.0f, kClear, 3.0f, kAccent);
-                    list.glow(card, 12.0f, 18.0f, kAccent.with_alpha(0.35f));
+                    if ((i == focused) != (pass == 1))
+                        continue;
+                    const int col = i % m.cols;
+                    const int row = i / m.cols;
+                    const float x = m.pad + static_cast<float>(col) * (m.card_w + m.gap);
+                    const float y = m.grid_top + static_cast<float>(row) * m.row_pitch - person_scroll_;
+                    const auto &movie = films[static_cast<std::size_t>(i)];
+                    const Rect cover{x, y, m.card_w, m.cover_h};
+                    if (movie.texture_id != 0)
+                        list.image(movie.texture_id, cover, cover_uv(cover), kWhite, radius);
+                    else
+                        list.rounded_rect(cover, radius, tv_surface_variant());
+                    if (i == focused)
+                        list.bordered_rect(cover, radius, kClear, 3.0f * kTvDp, tv_on_surface());
+
+                    std::string title_lines[2];
+                    tv_two_lines(*tv_medium().font, movie.title, 14.0f * kTvDp, m.card_w, title_lines);
+                    float ty_card = cover.y + m.cover_h + 8.0f * kTvDp;
+                    for (const std::string &line : title_lines)
+                    {
+                        if (!line.empty())
+                            tv_text(list, tv_medium(), line, x, ty_card, 14.0f * kTvDp, 14.0f * kTvDp,
+                                    tv_on_surface());
+                        ty_card += 14.0f * kTvDp;
+                    }
+                    ty_card += 4.0f * kTvDp;
+                    std::string sub = movie.info;
+                    if (sub.empty() && movie.year > 0)
+                        sub = std::to_string(movie.year);
+                    std::string part = movie.cover_info;
+                    if (part == sub)
+                        part.clear();
+                    if (!sub.empty())
+                        tv_text(list, tv_regular(), tv_regular().font->fit(sub, 12.0f * kTvDp, m.card_w), x,
+                                ty_card, 12.0f * kTvDp, 12.0f * kTvDp, tv_on_surface().with_alpha(0.6f));
+                    ty_card += 12.0f * kTvDp;
+                    if (!part.empty())
+                        tv_text(list, tv_regular(), tv_regular().font->fit(part, 12.0f * kTvDp, m.card_w), x,
+                                ty_card, 12.0f * kTvDp, 12.0f * kTvDp, tv_on_surface().with_alpha(0.6f));
                 }
-                ui::text(list, fonts.regular,
-                         fonts.regular.font->fit(m.title.c_str(), 18, card.w), card.x,
-                         card.y + card.h + 26.0f, 18, kInk.with_alpha(0.9f));
             }
+            if (more)
+                tv_text(list, tv_regular(), "Загрузка…", kWidth * 0.5f, m.grid_top + view_h - 22.0f * kTvDp,
+                        12.0f * kTvDp, 18.0f * kTvDp, tv_on_surface_variant(), gfx::Align::center);
             list.pop_clip();
         }
 
-        ui::text(list, fonts.regular, "○ Назад     ✕ Открыть     L1/R1 амплуа", panel.cx(),
-                 panel.y + panel.h - 28.0f, 20, kInk.with_alpha(0.7f), gfx::Align::center);
+        tv_text(list, tv_regular(), "○ Закрыть     ✕ Открыть     L1/R1 амплуа", kWidth * 0.5f,
+                kHeight - 22.0f * kTvDp, 12.0f * kTvDp, 18.0f * kTvDp, tv_on_surface().with_alpha(0.55f),
+                gfx::Align::center);
     }
 
     void submit_search(app::Feedback &feedback)
@@ -5494,7 +5637,10 @@ class Store final : public app::Concept
         {
             // The qualities next, as the app asks by default
             wd_quality_ = true;
-            wd_quality_focus_ = 0;
+            {
+                const int count = std::max(1, static_cast<int>(wd_qualities().size()));
+                wd_quality_focus_ = std::clamp(quality_idx_, 0, count - 1);
+            }
             feedback.play(audio::Cue::select);
             return;
         }
@@ -6789,8 +6935,10 @@ class Store final : public app::Concept
     {
         press_.trigger();
         feedback.play(audio::Cue::select);
-        // Streams are not known yet, so quality_idx_ is passed on as the
-        // default-list index (1080p Ultra, 1080p, ...); play_title_async maps it.
+        write_log("[DEBUG] start_watch movie=%d tr=%d q=%d s=%d e=%d\n", page_item_, translator_idx_,
+                  quality_idx_, season_idx_, episode_idx_);
+        // quality_idx_ is the row in the quality dialog (1080p Ultra, 1080p, … or
+        // the title's streams once they are known). play_title_async matches by label.
         rezka::App::instance().play_title_async(page_item_, translator_idx_, quality_idx_, season_idx_,
                                                episode_idx_);
     }
@@ -9062,11 +9210,11 @@ class Store final : public app::Concept
     bool search_open_ = false;
     bool profile_open_ = false;
     bool person_open_ = false;
-    bool person_zone_chips_ = false;
+    int person_zone_ = 0; // 0 grid, 1 career chips, 2 close
     int person_focus_ = 0;
     int person_return_page_item_ = -1;
     float person_scroll_ = 0.0f;
-    uint32_t last_person_version_ = 0;
+    std::string person_nav_key_;
     std::string search_query_;
     std::string login_email_;
     std::string login_password_;

@@ -110,6 +110,8 @@ struct PersonCareer
 {
     std::string title;
     std::vector<CatalogItem> movies;
+    // "В базе N фильмов …" when the page states a total. 0 when it doesn't.
+    int expected = 0;
 };
 
 struct PersonDetails
@@ -296,8 +298,15 @@ public:
     std::string stt_recognize(const std::string &endpoint, const std::vector<unsigned char> &wav);
 
     // Actor page: careers + filmography (HDrezkaTV / browser .b-person__career).
-    bool get_person(const std::string &person_url, PersonDetails &out);
-    // The titles on an actor's page, each once.
+    // Page 1 is the person URL. Later pages are /person/<id>-<slug>/page/N/
+    // when the site paginates; a page that is not a person document is refused.
+    // has_next is set when the stats ("В базе N") still exceed the cards, or
+    // the page's own next link points at another person page.
+    bool get_person(const std::string &person_url, PersonDetails &out, bool *has_next = nullptr);
+    bool get_person_page(const std::string &person_url, int page, PersonDetails &out,
+                         bool *has_next = nullptr);
+    // Every title on an actor's page, each once, following /page/N/ while the
+    // site still has a person page to give.
     std::vector<CatalogItem> get_person_films(const std::string &person_url);
 
     // Get item details

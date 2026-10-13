@@ -50,8 +50,9 @@ public:
 
     void set_audio_ring(hui::audio::StreamRing *ring) { audio_ring_ = ring; }
 
-    // Returns true if a new decoded frame is available for uploading to GPU
-    bool get_frame(std::vector<uint8_t> &out_rgba);
+    // Returns true if a new decoded frame is available for uploading to GPU.
+    // out_w/out_h match the pixel buffer; do not use get_width/get_height with it.
+    bool get_frame(std::vector<uint8_t> &out_rgba, uint32_t &out_w, uint32_t &out_h);
 
 private:
     void decode_loop();
@@ -62,6 +63,9 @@ private:
     bool wait_interruptible(double seconds);
     double packet_pts_seconds(const AVFrame *frame, int stream_idx) const;
     bool apply_pending_seek(double *last_video_pts);
+    void free_codec_state();
+    void clear_frame_buffer();
+    static int ffmpeg_interrupt(void *opaque);
 
     std::atomic<bool> is_open_{false};
     std::atomic<bool> playing_{false};
@@ -80,6 +84,8 @@ private:
     BigThread worker_thread_;
     std::mutex frame_mutex_;
     std::vector<uint8_t> frame_buffer_;
+    uint32_t frame_w_ = 0;
+    uint32_t frame_h_ = 0;
     bool new_frame_ready_ = false;
 
     // Wall-clock master synced to media PTS (frozen while paused).
