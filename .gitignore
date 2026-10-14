@@ -27,3 +27,7 @@ build/
 
 # Assistant workspace
 .claude/
+
+# Local assistant instructions: kept on disk, never committed
+CLAUDE.md
+**/CLAUDE.md
