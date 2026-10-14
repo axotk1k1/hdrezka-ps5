@@ -147,11 +147,19 @@ if(PS5_HOST_REFERENCE)
 	return()
 endif()
 
-# Link, sign and package: the title folder in dist/<TITLE_ID>/
+# Link, sign and package: the title folder in dist/<TITLE_ID>/. The launcher
+# art and the identity (sce_sys/) are packaged too, so a new icon0.png,
+# pic0.dds or pic1.dds alone repackages the title.
+file(GLOB PS5_SCE_SYS_FILES CONFIGURE_DEPENDS
+	${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/param.json
+	${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/icon0.png
+	${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/pic0.dds
+	${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/pic1.dds
+	${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/snd0.at9)
 add_custom_command(
 	OUTPUT ${CMAKE_BINARY_DIR}/eboot.elf
 	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tools/link-title.sh ${CMAKE_BINARY_DIR} ${PS5_VULKAN_DIR} ${PS5_PAYLOAD_SDK} "$<TARGET_OBJECTS:samples>"
-	DEPENDS samples "$<TARGET_OBJECTS:samples>" ${CMAKE_CURRENT_SOURCE_DIR}/tools/link-title.sh
+	DEPENDS samples "$<TARGET_OBJECTS:samples>" ${CMAKE_CURRENT_SOURCE_DIR}/tools/link-title.sh ${PS5_SCE_SYS_FILES}
 	COMMAND_EXPAND_LISTS
 	VERBATIM)
 add_custom_target(title ALL DEPENDS ${CMAKE_BINARY_DIR}/eboot.elf)

@@ -189,9 +189,12 @@ void App::init(vks::VulkanDevice *dev, VkQueue q, hui::gfx::VkRenderer *rend, hu
 void App::shutdown()
 {
     stop_worker_ = true;
+    stop_hero_ = true;
     if (worker_thread_.joinable()) {
         worker_thread_.join();
     }
+    if (hero_thread_.joinable())
+        hero_thread_.join();
     stop_playback();
 }
 
@@ -606,14 +609,19 @@ void App::load_movie_list_async(int tab, int type, int kind)
 void App::load_movie_list_more_async()
 {
     int tab = 0, type = 0, kind = 0, page = 0;
+    std::function<std::string(Client &, int)> path_of;
     {
         std::lock_guard<std::mutex> lock(catalog_mutex);
-        if (!home_layout || !list_has_next || list_page < 1)
+        // The home tabs, Новинки and Анонсы, or a paged list (search, filter, country)
+        const bool paged = list_kind == 3 && list_path;
+        if ((!home_layout && !paged) || !list_has_next || list_page < 1)
             return;
         tab = list_tab;
         type = list_type;
         kind = list_kind;
         page = list_page + 1;
+        if (paged)
+            path_of = list_path;
     }
     if (catalog_loading || list_more_loading.exchange(true))
         return;
@@ -624,21 +632,26 @@ void App::load_movie_list_more_async()
         stop_worker_ = false;
     }
 
-    worker_thread_ = BigThread([this, tab, type, kind, page]() {
+    worker_thread_ = BigThread([this, tab, type, kind, page, path_of]() {
         bool has_next = false;
-        auto items = fetch_list_page(client, tab, type, kind, page, &has_next);
+        auto items = path_of ? client.get_list_page(path_of(client, page), &has_next)
+                             : fetch_list_page(client, tab, type, kind, page, &has_next);
         if (!stop_worker_) {
             std::lock_guard<std::mutex> lock(catalog_mutex);
             // The site's lists shift between requests: skip what is already here
             std::set<std::string> known;
             for (const auto &m : movies)
                 known.insert(m.url);
+            bool fresh = false; // a page of what is here already ends the list
             for (const auto &it : items) {
-                if (known.insert(it.url).second && !hidden_by_filter(it.info))
+                if (!known.insert(it.url).second)
+                    continue;
+                fresh = true;
+                if (!hidden_by_filter(it.info))
                     movies.push_back(movie_from_catalog(it, ""));
             }
             list_page = page;
-            list_has_next = has_next && !items.empty();
+            list_has_next = has_next && fresh;
             catalog_version++;
         }
         list_more_loading = false;
@@ -650,7 +663,111 @@ static std::string photo_address(const std::string &raw, const std::string &mirr
 
 void App::search_async(const std::string &query)
 {
-    list_async([query](Client &c) { return c.search(query); }, "Поиск");
+    // The app's SearchResult screen: the query is its title, the site's pages follow
+    paged_list_async(query, [query](Client &c, int page) { return c.search_path(query, page); });
+}
+
+void App::paged_list_async(const std::string &title, std::function<std::string(Client &, int)> path_of)
+{
+    write_log("[DEBUG] App::paged_list_async '%s'\n", title.c_str());
+    current_category = -1;
+    catalog_loading = true;
+    if (worker_thread_.joinable()) {
+        stop_worker_ = true;
+        worker_thread_.join();
+        stop_worker_ = false;
+    }
+    {
+        std::lock_guard<std::mutex> p_lock(pending_mutex);
+        pending_textures.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        list_kind = 3;
+        list_path = path_of;
+    }
+    worker_thread_ = BigThread([this, path_of]() {
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            home_layout = false;
+            home_sections.clear();
+            featured_indices.clear();
+            featured_movies.clear();
+            movies.clear();
+            list_page = 0;
+            list_has_next = false;
+            catalog_status = "Загрузка...";
+            catalog_version++;
+        }
+        if (!client.pick_mirror()) {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            catalog_status = "Ошибка сети";
+            catalog_loading = false;
+            catalog_version++;
+            return;
+        }
+        bool has_next = false;
+        const std::vector<CatalogItem> items = client.get_list_page(path_of(client, 1), &has_next);
+        if (stop_worker_) {
+            catalog_loading = false;
+            return;
+        }
+        std::vector<MovieData> new_movies;
+        for (const CatalogItem &it : items)
+            if (!hidden_by_filter(it.info))
+                new_movies.push_back(movie_from_catalog(it, ""));
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            movies = std::move(new_movies);
+            list_page = 1;
+            list_has_next = has_next && !items.empty();
+            catalog_status = movies.empty() ? "Ничего не найдено" : "";
+            catalog_version++;
+        }
+        catalog_loading = false;
+        queue_missing_posters(this, stop_worker_);
+    });
+}
+
+void App::load_search_filters_async()
+{
+    int expected = 0;
+    if (!filters_state.compare_exchange_strong(expected, 1)) {
+        expected = 3; // a failed load is tried again
+        if (!filters_state.compare_exchange_strong(expected, 1))
+            return;
+    }
+    BigThread([this]() {
+        UrgentRequest urgent(urgent_requests);
+        SearchFilters found;
+        const bool ok = client.pick_mirror() && client.get_search_filters(found);
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            if (ok)
+                search_filters = std::move(found);
+        }
+        filters_state = ok ? 2 : 3;
+    }).detach();
+}
+
+void App::extended_search_async(const std::string &title, const std::string &link_part)
+{
+    paged_list_async(title, [link_part](Client &, int page) { return Client::extended_search_path(link_part, page); });
+}
+
+void App::country_search_async(const std::string &country)
+{
+    paged_list_async(country, [country](Client &c, int page) { return c.country_path(country, page); });
+}
+
+void App::remove_search_history(const std::string &query)
+{
+    {
+        std::lock_guard<std::mutex> lock(history_mutex_);
+        search_history_.erase(std::remove(search_history_.begin(), search_history_.end(), query),
+                              search_history_.end());
+    }
+    persist_search_history();
 }
 
 void App::suggest_async(const std::string &query)
@@ -780,8 +897,22 @@ std::vector<unsigned char> wav_of(const std::vector<int16_t> &samples, int rate)
 }
 } // namespace
 
+#if defined(PS5_HOST_REFERENCE)
+// The reference build has no microphone: HDREZKA_HOST_VOICE stands for what
+// was said, so the voice search's turns (Говорите…, the search) can be seen.
+static const char *host_voice_text()
+{
+    const char *text = std::getenv("HDREZKA_HOST_VOICE");
+    return text && *text ? text : nullptr;
+}
+#endif
+
 bool App::voice_available()
 {
+#if defined(PS5_HOST_REFERENCE)
+    if (host_voice_text())
+        return true;
+#endif
     return !stt_address(client.get_cookie_file()).empty();
 }
 
@@ -789,6 +920,12 @@ bool App::voice_start()
 {
     if (voice_state.load() == 1 || voice_state.load() == 2)
         return false;
+#if defined(PS5_HOST_REFERENCE)
+    if (host_voice_text()) {
+        voice_state = 1;
+        return true;
+    }
+#endif
     if (!voice_available() || !mic_start_recording())
         return false;
     voice_state = 1;
@@ -806,6 +943,16 @@ void App::voice_finish_async()
 {
     if (voice_state.exchange(2) != 1)
         return;
+#if defined(PS5_HOST_REFERENCE)
+    if (const char *said = host_voice_text()) {
+        {
+            std::lock_guard<std::mutex> lock(history_mutex_);
+            voice_text_ = said;
+        }
+        voice_state = 3;
+        return;
+    }
+#endif
     BigThread([this]() {
         UrgentRequest urgent(urgent_requests);
         mic_stop_recording();
@@ -1224,6 +1371,151 @@ void App::request_photo(const std::string &raw)
     });
 }
 
+// "2026 - ..., Канада, Ужасы": the first part is the year, the second the
+// country, the last the genre.
+static void split_info(const std::string &info, std::string &year, std::string &country, std::string &genre)
+{
+    std::vector<std::string> parts;
+    std::size_t at = 0;
+    while (at <= info.size()) {
+        std::size_t comma = info.find(',', at);
+        if (comma == std::string::npos)
+            comma = info.size();
+        std::size_t b = at, e = comma;
+        while (b < e && info[b] == ' ')
+            ++b;
+        while (e > b && info[e - 1] == ' ')
+            --e;
+        if (e > b)
+            parts.push_back(info.substr(b, e - b));
+        at = comma + 1;
+    }
+    if (!parts.empty())
+        year = parts.front().substr(0, parts.front().find(' '));
+    if (parts.size() > 1)
+        country = parts[1];
+    if (parts.size() > 2)
+        genre = parts.back();
+}
+
+// Halves a picture until it is at most max_w wide: a full cover can be
+// 2000 px tall, and the banner shows a third of the screen's height.
+static void shrink_rgba(std::vector<uint8_t> &rgba, int &w, int &h, int max_w)
+{
+    while (w > max_w && w >= 2 && h >= 2) {
+        const int nw = w / 2, nh = h / 2;
+        std::vector<uint8_t> out(static_cast<size_t>(nw) * nh * 4);
+        for (int y = 0; y < nh; ++y) {
+            const uint8_t *r0 = rgba.data() + (static_cast<size_t>(2 * y) * w) * 4;
+            const uint8_t *r1 = r0 + static_cast<size_t>(w) * 4;
+            uint8_t *o = out.data() + static_cast<size_t>(y) * nw * 4;
+            for (int x = 0; x < nw; ++x)
+                for (int c = 0; c < 4; ++c)
+                    o[x * 4 + c] = static_cast<uint8_t>(
+                        (r0[x * 8 + c] + r0[x * 8 + 4 + c] + r1[x * 8 + c] + r1[x * 8 + 4 + c] + 2) / 4);
+        }
+        rgba.swap(out);
+        w = nw;
+        h = nh;
+    }
+}
+
+void App::load_hero_async()
+{
+    if (hero_thread_.joinable())
+        hero_thread_.join();
+    hero_state = 1;
+    hero_thread_ = BigThread([this]() {
+        // The catalogue and the pages the player waits for go first: one
+        // connection serves them all.
+        const auto wait_turn = [this]() {
+            while (!stop_hero_ && (urgent_requests > 0 || catalog_loading))
+                usleep(50000);
+            return !stop_hero_;
+        };
+        if (!wait_turn())
+            return;
+        bool has_next = false;
+        const std::vector<CatalogItem> items = fetch_list_page(client, 0, 1, 0, 1, &has_next);
+        std::vector<HeroSlide> slides;
+        for (const CatalogItem &it : items) {
+            if (slides.size() >= 10)
+                break;
+            if (it.url.empty() || hidden_by_filter(it.info))
+                continue;
+            HeroSlide s;
+            s.item = it;
+            s.title = it.title;
+            s.quality = it.quality;
+            s.description = it.description;
+            split_info(it.info, s.year, s.country, s.genre);
+            if (it.year > 0)
+                s.year = std::to_string(it.year);
+            slides.push_back(std::move(s));
+        }
+        write_log("[DEBUG] hero: %zu slides\n", slides.size());
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            hero_slides = slides;
+        }
+        hero_state = slides.empty() ? 3 : 2;
+        hero_version++;
+
+        for (size_t i = 0; i < slides.size(); ++i) {
+            if (!wait_turn())
+                return;
+            const std::string page = slides[i].item.url;
+            std::string cover = slides[i].item.cover_url;
+            VideoDetails det;
+            if (client.get_details(page, det)) {
+                HeroSlide &s = slides[i];
+                if (!det.name.empty())
+                    s.title = det.name;
+                if (!det.description.empty())
+                    s.description = det.description;
+                if (!det.year.empty())
+                    s.year = det.year;
+                if (!det.genres.empty())
+                    s.genre = det.genres.front();
+                if (!det.countries.empty())
+                    s.country = det.countries.front();
+                if (!det.full_cover_url.empty())
+                    cover = det.full_cover_url;
+                std::lock_guard<std::mutex> lock(catalog_mutex);
+                if (i < hero_slides.size() && hero_slides[i].item.url == page) {
+                    const uint32_t texture = hero_slides[i].texture;
+                    const int tw = hero_slides[i].tex_w, th = hero_slides[i].tex_h;
+                    hero_slides[i] = s;
+                    hero_slides[i].texture = texture;
+                    hero_slides[i].tex_w = tw;
+                    hero_slides[i].tex_h = th;
+                }
+                hero_version++;
+            }
+            if (!wait_turn())
+                return;
+            const std::string address = photo_address(cover, client.get_mirror());
+            std::vector<uint8_t> bytes;
+            if (address.empty() || !client.http_get_binary(address, bytes))
+                continue;
+            int w = 0, h = 0;
+            uint8_t *rgba = TextureLoader::decode_image_rgba(bytes.data(), bytes.size(), &w, &h);
+            if (!rgba || w <= 0 || h <= 0)
+                continue;
+            HeroPending hp;
+            hp.index = static_cast<int>(i);
+            hp.url = page;
+            hp.rgba.assign(rgba, rgba + static_cast<size_t>(w) * h * 4);
+            TextureLoader::free_decoded_image(rgba);
+            shrink_rgba(hp.rgba, w, h, 900);
+            hp.width = w;
+            hp.height = h;
+            std::lock_guard<std::mutex> p_lock(pending_mutex);
+            hero_pending_.push_back(std::move(hp));
+        }
+    });
+}
+
 uint32_t App::photo_texture(const std::string &raw)
 {
     const std::string url = photo_address(raw, client.get_mirror());
@@ -1242,6 +1534,12 @@ void App::list_async(std::function<std::vector<CatalogItem>(Client &)> fetch, co
         stop_worker_ = false;
     }
 
+    {
+        // A list of one page: nothing for load_movie_list_more_async to follow
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        list_kind = -1;
+        list_has_next = false;
+    }
     worker_thread_ = BigThread([this, fetch, genre_label]() {
         {
             std::lock_guard<std::mutex> lock(catalog_mutex);
@@ -1473,19 +1771,24 @@ void App::logout_async()
 
 void App::load_account_lists_async()
 {
+    // Asked for while a load is on its way (a bookmark or a save just made):
+    // that load goes round once more, so what the site has now is shown.
+    account_lists_again = true;
     if (account_lists_loading.exchange(true))
         return;
     BigThread([this]() {
         UrgentRequest urgent(urgent_requests);
-        std::vector<WatchLaterItem> later = client.get_watch_later();
-        std::vector<BookmarkFolder> folders = client.get_bookmark_folders();
-        {
-            std::lock_guard<std::mutex> lock(catalog_mutex);
-            watch_later = std::move(later);
-            bookmark_folders = std::move(folders);
+        while (account_lists_again.exchange(false)) {
+            std::vector<WatchLaterItem> later = client.get_watch_later();
+            std::vector<BookmarkFolder> folders = client.get_bookmark_folders();
+            {
+                std::lock_guard<std::mutex> lock(catalog_mutex);
+                watch_later = std::move(later);
+                bookmark_folders = std::move(folders);
+            }
+            account_version++;
         }
         account_lists_loading = false;
-        account_version++;
     }).detach();
 }
 
@@ -1503,6 +1806,82 @@ void App::remove_watch_later_async(const std::string &id)
     BigThread([this, id]() {
         UrgentRequest urgent(urgent_requests);
         client.remove_watch_later(id);
+    }).detach();
+}
+
+bool App::signed_in()
+{
+    std::lock_guard<std::mutex> lock(catalog_mutex);
+    return account.logged_in;
+}
+
+void App::load_bookmark_choices_async(int movie_idx)
+{
+    std::string post_id;
+    {
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        if (!account.logged_in || movie_idx < 0 || movie_idx >= static_cast<int>(movies.size()))
+            return;
+        const MovieData &m = movies[static_cast<size_t>(movie_idx)];
+        if (!m.details.bookmarks.empty())
+            return;
+        post_id = m.details.id;
+    }
+    if (bookmark_choices_loading_.exchange(true))
+        return;
+    BigThread([this, movie_idx, post_id]() {
+        UrgentRequest urgent(urgent_requests);
+        std::vector<BookmarkFolder> folders = client.get_bookmark_folders();
+        bookmark_choices_loading_ = false;
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        bookmark_folders = folders;
+        if (movie_idx < static_cast<int>(movies.size()) && movies[static_cast<size_t>(movie_idx)].details.id == post_id &&
+            movies[static_cast<size_t>(movie_idx)].details.bookmarks.empty())
+            movies[static_cast<size_t>(movie_idx)].details.bookmarks = std::move(folders);
+        catalog_version++;
+        account_version++;
+    }).detach();
+}
+
+void App::toggle_bookmark_folder_async(int movie_idx, const std::string &cat_id)
+{
+    std::string post_id;
+    {
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        if (movie_idx < 0 || movie_idx >= static_cast<int>(movies.size()))
+            return;
+        MovieData &m = movies[static_cast<size_t>(movie_idx)];
+        post_id = m.details.id;
+        for (BookmarkFolder &f : m.details.bookmarks)
+            if (f.id == cat_id) {
+                if (f.pending)
+                    return;
+                f.pending = true;
+            }
+        catalog_version++;
+    }
+    BigThread([this, movie_idx, post_id, cat_id]() {
+        UrgentRequest urgent(urgent_requests);
+        std::string error;
+        const bool ok = !post_id.empty() && client.add_to_bookmarks(post_id, cat_id, error);
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            if (movie_idx < static_cast<int>(movies.size()) && movies[static_cast<size_t>(movie_idx)].details.id == post_id)
+                for (BookmarkFolder &f : movies[static_cast<size_t>(movie_idx)].details.bookmarks)
+                    if (f.id == cat_id) {
+                        f.pending = false;
+                        if (ok)
+                            f.checked = !f.checked;
+                    }
+            if (!ok) {
+                bookmark_error = error.empty() ? "Не удалось изменить закладки" : error;
+                bookmark_error_version++;
+            }
+            catalog_version++;
+        }
+        // The profile's folders count the title now
+        if (ok)
+            load_account_lists_async();
     }).detach();
 }
 
@@ -1885,6 +2264,17 @@ void App::play_title_async(int movie_idx, int translator_idx, int quality_idx, i
             fail_buffering("Поток недоступен");
             return;
         }
+        // "Досмотреть" is the site's: as the app does when a stream starts, the
+        // signed-in account is told the title, the voice and the episode, and
+        // the profile's list is asked for again once the site has it.
+        if (signed_in() && !det.id.empty()) {
+            const std::string season = det.is_series ? s_id : "0";
+            const std::string episode = det.is_series ? e_id : "0";
+            BigThread([this, post_id = det.id, tr_id, season, episode]() {
+                if (client.send_save(post_id, tr_id, season, episode))
+                    load_account_lists_async();
+            }).detach();
+        }
         const int best = pick_stream_index(streams, wanted_quality);
         if (play_serial_.load() != serial)
             return;
@@ -2117,6 +2507,42 @@ void App::update(float dt)
                 }
             }
             catalog_version++;
+        }
+    }
+
+    // The banner, once the first page of the catalogue is in (the mirror is
+    // chosen by then); a failed one is asked for again after a while.
+    if (hero_state == 3) {
+        hero_retry_ += dt;
+        if (hero_retry_ > 20.0f) {
+            hero_retry_ = 0.0f;
+            hero_state = 0;
+        }
+    }
+    if (hero_state == 0 && network_started_ && !catalog_loading)
+        load_hero_async();
+    {
+        HeroPending hp;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> p_lock(pending_mutex);
+            if (!hero_pending_.empty()) {
+                hp = std::move(hero_pending_.front());
+                hero_pending_.erase(hero_pending_.begin());
+                have = true;
+            }
+        }
+        if (have && renderer) {
+            const uint32_t handle = renderer->create_texture(hp.width, hp.height, hp.rgba.data());
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            if (handle != 0 && hp.index < static_cast<int>(hero_slides.size()) &&
+                hero_slides[static_cast<size_t>(hp.index)].item.url == hp.url) {
+                HeroSlide &s = hero_slides[static_cast<size_t>(hp.index)];
+                s.texture = handle;
+                s.tex_w = hp.width;
+                s.tex_h = hp.height;
+                hero_version++;
+            }
         }
     }
 

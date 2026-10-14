@@ -41,6 +41,30 @@ struct BookmarkFolder
     std::string name;
     std::string count;
     std::string url;
+    bool checked = false; // on a title's page: the title is in this folder
+    bool pending = false; // an add_post for it is on its way (the app's spinner)
+};
+
+// "Расширенный поиск" (HDrezkaTV's ExtendedSearch, m8.e0.c): what the site's
+// top menu offers. Each category of li.b-topnav__item (not "single") with the
+// genres of its select.select-category (value: the genre's list path, "Любой"
+// for "любого жанра"), and the years of select.select-year ("Все" for "за все
+// время").
+struct SearchGenre
+{
+    std::string name;
+    std::string value; // the list's path, e.g. /films/best/fiction/
+};
+struct SearchCategory
+{
+    std::string name; // Фильмы, Сериалы, ...
+    std::string url;
+    std::vector<SearchGenre> genres;
+};
+struct SearchFilters
+{
+    std::vector<SearchCategory> categories;
+    std::vector<std::string> years; // "Все" first, then 2026, 2025, ...
 };
 
 struct CatalogItem
@@ -233,6 +257,9 @@ struct VideoDetails
     std::vector<Season> seasons;
     std::string favs;
     std::string embedded_streams;
+    // The account's bookmark folders as the title's page lists them, each
+    // checked when the title is in it (HDrezkaTV's "bookmarks" of the page).
+    std::vector<BookmarkFolder> bookmarks;
 };
 
 class Client
@@ -261,6 +288,15 @@ public:
     bool remove_watch_later(const std::string &id);
     // The account's bookmark folders (/favorites/), and a folder's titles.
     std::vector<BookmarkFolder> get_bookmark_folders();
+    // A title in a folder, or out of it: the site toggles it. POST
+    // /ajax/favorites/ with post_id, cat_id and action=add_post, as the app
+    // does; error is the site's message when it refuses.
+    bool add_to_bookmarks(const std::string &post_id, const std::string &cat_id, std::string &error);
+    // "Досмотреть": the site is told what is being watched when it starts,
+    // POST /ajax/send_save/ with post_id, translator_id, season, episode and
+    // current_time=1 (0 for a film's season and episode), as the app does.
+    bool send_save(const std::string &post_id, const std::string &translator_id, const std::string &season,
+                   const std::string &episode);
 
     // Fetch slider premiere content (id: 1 films, 2 series, 3 cartoons, 82 anime)
     // Parses div.b-newest_slider__list like HDrezkaTV.
@@ -294,8 +330,20 @@ public:
     };
     HomePage get_home_page(const std::string &filter = "last");
 
-    // Quick search or full search
-    std::vector<CatalogItem> search(const std::string &query);
+    // The full search, a page at a time, as the app asks for it:
+    // /search/?do=search&subaction=search&q=<query>[&page=N].
+    std::vector<CatalogItem> search(const std::string &query, int page = 1, bool *has_next = nullptr);
+    // Any list of the site by its path or address, with whether a page follows
+    // (the app's rule: div.b-navigation without a disabled "next" arrow).
+    std::vector<CatalogItem> get_list_page(const std::string &path, bool *has_next = nullptr);
+    // The page paths of the app's lists: the full search's, Расширенный
+    // поиск's (a genre's path and a year, /page/N after them) and a country's
+    // (/country/<name, spaces as +>/page/N).
+    std::string search_path(const std::string &query, int page) const;
+    static std::string extended_search_path(const std::string &link_part, int page);
+    std::string country_path(const std::string &country, int page) const;
+    // Расширенный поиск's choices, from the site's front page (m8.e0.c).
+    bool get_search_filters(SearchFilters &out);
     // The live suggestions of the search box (POST /engine/ajax/search.php):
     // a few titles with their kind, rating and year, as HDrezkaTV shows them
     // under the field. Each carries url, title, entity, rating and info.

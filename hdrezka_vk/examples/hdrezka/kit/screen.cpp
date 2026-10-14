@@ -424,6 +424,9 @@ struct PageModel
     std::vector<rezka::CatalogItem> related;
     std::vector<rezka::ScheduleSeason> schedule;
     std::vector<rezka::VoiceStat> voice_stats;
+    // The account's bookmark folders, checked where the title is (signed in)
+    std::vector<rezka::BookmarkFolder> bookmarks;
+    bool signed_in = false;
 };
 
 // One fact row of the page: its kind (0 slogan, 1 release date, 2 country,
@@ -1239,6 +1242,8 @@ class Store final : public app::Concept
                 else if (key == "back") input.pressed |= action_bit(Action::back);
                 else if (key == "menu") input.pressed |= action_bit(Action::menu);
                 else if (key == "west") input.pressed |= action_bit(Action::west);
+                else if (key == "l1") input.pressed |= action_bit(Action::page_prev);
+                else if (key == "r1") input.pressed |= action_bit(Action::page_next);
                 // "type=text": into the field the keyboard sheet is open for
                 else if (key.rfind("type=", 0) == 0 && kb_open_ && kb_target_) *kb_target_ += key.substr(5);
             }
@@ -1260,7 +1265,7 @@ class Store final : public app::Concept
         }
 
         const bool triangle_pressed = input.is_pressed(Action::north) || ((ps5_pad().pressed & PAD_TRIANGLE) != 0);
-        if (!search_open_ && triangle_pressed)
+        if (!search_open_ && sx_screen_ == SxScreen::none && triangle_pressed)
         {
             search_open_ = true;
             search_query_.clear();
@@ -1277,6 +1282,20 @@ class Store final : public app::Concept
             last_catalog_version_ = cur_ver;
             refresh_catalog_from_app();
         }
+        if (app.hero_version.load() != tv_hero_version_ || app.hero_state.load() != tv_hero_state_)
+            tv_refresh_hero();
+        // The site refused a bookmark: its word, once
+        if (app.bookmark_error_version.load() != bookmark_error_version_)
+        {
+            bookmark_error_version_ = app.bookmark_error_version.load();
+            std::string error;
+            {
+                std::lock_guard<std::mutex> lock(app.catalog_mutex);
+                error = app.bookmark_error;
+            }
+            if (!error.empty())
+                show_message(error);
+        }
 
         age_ += dt;
         clock_ += dt;
@@ -1287,6 +1306,8 @@ class Store final : public app::Concept
         if (kb_active())
             kb_update(input, feedback);
         // The topmost layer takes the input; the layers under it only animate.
+        else if (sx_screen_ != SxScreen::none)
+            sx_update(input, dt, feedback);
         else if (search_open_)
             update_search(input, dt, feedback);
         else if (settings_open_)
@@ -1350,6 +1371,7 @@ class Store final : public app::Concept
         draw_person(overlay);
         draw_qr(overlay);
         draw_search(overlay);
+        sx_draw(overlay);
         draw_profile(overlay);
         draw_settings(overlay);
         wd_draw(overlay);
@@ -2358,14 +2380,29 @@ class Store final : public app::Concept
                 gfx::Align::center);
     }
 
-    void submit_search(app::Feedback &feedback)
+    // The screens over the search: Расширенный поиск (O8) and the countries (N8).
+    enum class SxScreen : std::uint8_t
     {
-        if (search_query_.empty())
-        {
-            feedback.play(audio::Cue::error, 1.0f, 0.0f, 0.6f);
-            return;
-        }
+        none,
+        extended,
+        country,
+    };
+    // Where Circle takes a list of results.
+    enum class SearchBack : std::uint8_t
+    {
+        home,
+        search,
+        extended,
+        country,
+    };
+
+    // The grid takes a list of results, headed by its title; Circle goes back
+    // to the screen it came from (the app's back stack: search, Расширенный
+    // поиск, the countries).
+    void tv_show_results(const std::string &title, SearchBack back)
+    {
         search_open_ = false;
+        sx_screen_ = SxScreen::none;
         page_open_ = false;
         zone_ = Zone::grid;
         focus_ = 0;
@@ -2375,8 +2412,19 @@ class Store final : public app::Concept
         tv_tab_delay_ = -1.0f;
         tv_scroll_.snap(0.0f);
         tv_cards_.clear();
-        tv_list_title_.clear();
+        tv_list_title_ = title;
+        tv_results_back_ = back;
         home_layout_ = false;
+    }
+
+    void submit_search(app::Feedback &feedback)
+    {
+        if (search_query_.empty())
+        {
+            feedback.play(audio::Cue::error, 1.0f, 0.0f, 0.6f);
+            return;
+        }
+        tv_show_results(search_query_, SearchBack::search);
         {
             auto &app = rezka::App::instance();
             std::lock_guard<std::mutex> lock(app.catalog_mutex);
@@ -2398,12 +2446,14 @@ class Store final : public app::Concept
     // otherwise opens the keyboard titled "Голосовой поиск", whose dictation
     // takes the pad's microphone.
 
+    // The field row, left to right as the app has it (L8.a.b): the microphone,
+    // the field, Расширенный поиск and the countries; the list under it.
     enum SearchZone : int
     {
-        kSearchField,
-        kSearchKeyboard,
         kSearchMic,
-        kSearchClear,
+        kSearchField,
+        kSearchExtended,
+        kSearchCountry,
         kSearchList,
     };
     enum SearchRowKind : int
@@ -2576,13 +2626,12 @@ class Store final : public app::Concept
             return;
         }
 
-        const int last_top = search_query_.empty() ? kSearchMic : kSearchClear;
         if (search_zone_ != kSearchList)
         {
             if (input.nav == Direction::left || input.nav == Direction::right)
             {
-                const int next = std::clamp(search_zone_ + (input.nav == Direction::right ? 1 : -1), 0, last_top);
-                if (next == search_zone_)
+                const int next = search_zone_ + (input.nav == Direction::right ? 1 : -1);
+                if (next < kSearchMic || next > kSearchCountry)
                     tv_refuse(feedback, input.nav_repeat);
                 else
                 {
@@ -2599,37 +2648,56 @@ class Store final : public app::Concept
                 {
                     search_zone_ = kSearchList;
                     search_row_ = 0;
+                    search_row_del_ = false;
                     feedback.play(audio::Cue::focus);
                 }
+                return;
+            }
+            if (input.nav == Direction::up)
+            {
+                tv_refuse(feedback, input.nav_repeat);
                 return;
             }
             if (!input.is_pressed(Action::confirm))
                 return;
             switch (search_zone_)
             {
-            case kSearchField:
-                search_text_entry("Поиск фильмов и сериалов", feedback);
-                break;
-            case kSearchKeyboard:
-                search_text_entry("Поиск фильмов и сериалов", feedback);
-                break;
             case kSearchMic:
                 search_voice(feedback);
                 break;
+            case kSearchExtended:
+                sx_open(SxScreen::extended, feedback);
+                break;
+            case kSearchCountry:
+                sx_open(SxScreen::country, feedback);
+                break;
             default:
-                search_query_.clear();
-                search_zone_ = kSearchField;
-                feedback.play(audio::Cue::toggle);
+                search_text_entry("Поиск фильмов и сериалов", feedback);
                 break;
             }
             return;
         }
 
+        const SearchRow &here = rows[static_cast<std::size_t>(search_row_)];
+        if (input.nav == Direction::left || input.nav == Direction::right)
+        {
+            // A history row has its delete button at its right end (M8.b.f)
+            const bool to_delete = input.nav == Direction::right;
+            if (here.kind != kRowHistory || to_delete == search_row_del_)
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                search_row_del_ = to_delete;
+                feedback.play(audio::Cue::focus);
+            }
+            return;
+        }
         if (input.nav == Direction::up || input.nav == Direction::down)
         {
             if (input.nav == Direction::up && search_row_ == 0)
             {
                 search_zone_ = kSearchField;
+                search_row_del_ = false;
                 feedback.play(audio::Cue::focus);
                 return;
             }
@@ -2639,16 +2707,31 @@ class Store final : public app::Concept
             else
             {
                 search_row_ = next;
+                if (rows[static_cast<std::size_t>(next)].kind != kRowHistory)
+                    search_row_del_ = false;
                 feedback.play(audio::Cue::focus);
             }
             return;
         }
         if (count == 0 || !input.is_pressed(Action::confirm))
             return;
-        const SearchRow &row = rows[static_cast<std::size_t>(search_row_)];
+        const SearchRow &row = here;
         switch (row.kind)
         {
         case kRowHistory:
+            if (search_row_del_)
+            {
+                // The last one gone, the focus goes back to the field, as in the app (C8.C0140q)
+                const bool last = app.get_search_history().size() <= 1;
+                app.remove_search_history(row.text);
+                if (last)
+                {
+                    search_zone_ = kSearchField;
+                    search_row_del_ = false;
+                }
+                feedback.play(audio::Cue::toggle);
+                break;
+            }
             search_query_ = row.text;
             submit_search(feedback);
             break;
@@ -2669,7 +2752,8 @@ class Store final : public app::Concept
                 tv_refuse(feedback, false);
                 break;
             }
-            app.add_search_history(search_query_);
+            // The app keeps the suggestion's title in the history (L8.h)
+            app.add_search_history(item.title);
             search_open_ = false;
             dp_stack_.clear();
             open_page(index, false, feedback);
@@ -2678,28 +2762,48 @@ class Store final : public app::Concept
         }
     }
 
-    // A circle button of the field row.
+    // A button of the field row: the app's OutlinedIconButton, 48 dp, its icon
+    // 24 dp; filled under the focus. The microphone's rings pulse while it
+    // listens (M8.b.a: two circles of the primary colour at a quarter, scaled
+    // 1.5..1.7 and 1.5..1.3).
     void draw_search_button(gfx::DrawList &list, float cx, float cy, bool focused, int what) const
     {
         const float dp = kTvDp;
         const float r = 24.0f * dp;
-        list.circle(cx, cy, r, focused ? tv_primary() : tv_surface_variant().with_alpha(0.4f));
-        const Color ink = focused ? tv_on_primary() : tv_on_surface();
         if (what == kSearchMic)
-            draw_mic_icon(list, cx, cy, 1.0f, ink);
-        else if (what == kSearchKeyboard)
         {
-            list.bordered_rect({cx - 12.0f * dp, cy - 8.0f * dp, 24.0f * dp, 16.0f * dp}, 3.0f * dp, kClear, 1.5f * dp,
-                               ink);
-            for (int row = 0; row < 2; ++row)
-                for (int col = 0; col < 4; ++col)
-                    list.rounded_rect({cx - 8.5f * dp + static_cast<float>(col) * 4.5f * dp,
-                                       cy - 5.0f * dp + static_cast<float>(row) * 4.0f * dp, 2.5f * dp, 2.0f * dp},
-                                      0.5f * dp, ink);
-            list.rounded_rect({cx - 6.0f * dp, cy + 3.0f * dp, 12.0f * dp, 2.0f * dp}, 0.5f * dp, ink);
+            const int voice = rezka::App::instance().voice_state.load();
+            if (voice == 1 || voice == 2)
+            {
+                const float s1 = 1.6f + 0.1f * std::sin(clock_ * 6.28f);
+                const float s2 = 1.4f + 0.1f * std::sin(clock_ * 3.14f);
+                list.circle(cx, cy, r * s1, tv_primary().with_alpha(0.25f));
+                list.circle(cx, cy, r * s2, tv_primary().with_alpha(0.25f));
+            }
         }
+        if (focused)
+            list.circle(cx, cy, r, tv_on_surface());
         else
-            tv_text(list, tv_medium(), "×", cx, cy - 16.0f * dp, 28.0f * dp, 32.0f * dp, ink, gfx::Align::center);
+            list.ring(cx, cy, r, 1.0f * dp, tv_border());
+        const Color ink = focused ? tv_inverse_on_surface() : tv_on_surface();
+        if (what == kSearchMic)
+            draw_mic_icon(list, cx, cy, 0.85f, ink);
+        else if (what == kSearchCountry)
+            tv_icon(list, kTvIconLanguage, cx - 12.0f * dp, cy - 12.0f * dp, 24.0f * dp, ink);
+        else
+            draw_manage_search_icon(list, cx, cy, ink);
+    }
+
+    // Material's ManageSearch: three lines on the left, a lens on the right.
+    void draw_manage_search_icon(gfx::DrawList &list, float cx, float cy, Color ink) const
+    {
+        const float u = kTvDp;
+        const float x0 = cx - 10.0f * u;
+        list.rounded_rect({x0, cy - 6.0f * u, 7.0f * u, 2.0f * u}, 1.0f * u, ink);
+        list.rounded_rect({x0, cy - 1.0f * u, 7.0f * u, 2.0f * u}, 1.0f * u, ink);
+        list.rounded_rect({x0, cy + 4.0f * u, 9.0f * u, 2.0f * u}, 1.0f * u, ink);
+        list.ring(cx + 2.5f * u, cy - 1.5f * u, 5.0f * u, 2.0f * u, ink);
+        list.line(cx + 6.0f * u, cy + 2.0f * u, cx + 10.0f * u, cy + 6.0f * u, 2.0f * u, ink);
     }
 
     // The microphone, drawn: a capsule, the cup round it, a stem and a foot.
@@ -2729,12 +2833,20 @@ class Store final : public app::Concept
         const std::vector<SearchRow> rows = search_rows(history, suggestions);
         list.rounded_rect({0, 0, kWidth, kHeight}, 0.0f, tv_surface());
 
-        // The field row
+        // The field row (L8.a.b): 24 dp from the top, 48 dp in from the sides,
+        // 16 dp apart: the microphone, the field, Расширенный поиск, the countries.
         const float left = 48.0f * dp;
+        const float gap16 = 16.0f * dp;
+        const float button = 48.0f * dp;
         const bool has_query = !search_query_.empty();
-        const int buttons = has_query ? 3 : 2;
-        const float field_w = kWidth - 2.0f * left - static_cast<float>(buttons) * 60.0f * dp;
-        const Rect field{left, 24.0f * dp, field_w, 56.0f * dp};
+        const float field_x = left + button + gap16;
+        const float field_w = kWidth - 2.0f * left - 3.0f * (button + gap16);
+        const Rect field{field_x, 24.0f * dp, field_w, 56.0f * dp};
+        draw_search_button(list, left + button * 0.5f, field.cy(), search_zone_ == kSearchMic, kSearchMic);
+        draw_search_button(list, field.x + field.w + gap16 + button * 0.5f, field.cy(),
+                           search_zone_ == kSearchExtended, kSearchExtended);
+        draw_search_button(list, field.x + field.w + 2.0f * gap16 + button * 1.5f, field.cy(),
+                           search_zone_ == kSearchCountry, kSearchCountry);
         const bool field_on = search_zone_ == kSearchField;
         list.rounded_rect(field, 28.0f * dp, tv_surface_variant().with_alpha(0.3f));
         list.bordered_rect(field, 28.0f * dp, kClear, (field_on ? 2.0f : 1.0f) * dp,
@@ -2753,16 +2865,6 @@ class Store final : public app::Concept
         else
             tv_text(list, tv_regular(), "Поиск фильмов и сериалов", text_x, field.cy() - 14.0f * dp, 18.0f * dp,
                     28.0f * dp, tv_on_surface_variant());
-        float bx = field.x + field.w + 12.0f * dp + 24.0f * dp;
-        draw_search_button(list, bx, field.cy(), search_zone_ == kSearchKeyboard, kSearchKeyboard);
-        bx += 60.0f * dp;
-        draw_search_button(list, bx, field.cy(), search_zone_ == kSearchMic, kSearchMic);
-        if (has_query)
-        {
-            bx += 60.0f * dp;
-            draw_search_button(list, bx, field.cy(), search_zone_ == kSearchClear, kSearchClear);
-        }
-
         // The rows
         const float list_w = 560.0f * dp;
         float top = 104.0f * dp;
@@ -2786,6 +2888,12 @@ class Store final : public app::Concept
             tv_text(list, tv_regular(), loading ? "Поиск…" : "Ничего не найдено", left, top, 16.0f * dp, 24.0f * dp,
                     tv_on_surface_variant());
             top += 32.0f * dp;
+            if (!loading)
+            {
+                tv_text(list, tv_regular(), "Попробуйте изменить поисковой запрос", left, top - 4.0f * dp,
+                        14.0f * dp, 20.0f * dp, tv_on_surface_variant().with_alpha(0.7f));
+                top += 28.0f * dp;
+            }
         }
         const float row_h = 56.0f * dp;
         const float gap = 8.0f * dp;
@@ -2795,8 +2903,20 @@ class Store final : public app::Concept
         for (int i = first; i < count && i < first + visible; ++i)
         {
             const SearchRow &row = rows[static_cast<std::size_t>(i)];
-            const Rect r{left, top + static_cast<float>(i - first) * (row_h + gap), list_w, row_h};
-            const bool on = search_zone_ == kSearchList && i == search_row_;
+            Rect r{left, top + static_cast<float>(i - first) * (row_h + gap), list_w, row_h};
+            const bool row_focus = search_zone_ == kSearchList && i == search_row_;
+            if (row.kind == kRowHistory)
+            {
+                // The row, and its delete button 12 dp after it (M8.b.f)
+                r.w -= row_h + 12.0f * dp;
+                const bool del_on = row_focus && search_row_del_;
+                const float cx = r.x + r.w + 12.0f * dp + row_h * 0.5f;
+                if (del_on)
+                    list.circle(cx, r.cy(), 24.0f * dp, tv_on_surface());
+                tv_text(list, tv_medium(), "×", cx, r.cy() - 16.0f * dp, 28.0f * dp, 32.0f * dp,
+                        del_on ? tv_inverse_on_surface() : tv_on_surface_variant(), gfx::Align::center);
+            }
+            const bool on = row_focus && !(row.kind == kRowHistory && search_row_del_);
             list.rounded_rect(r, 16.0f * dp, on ? tv_secondary_container() : tv_surface_variant().with_alpha(0.3f));
             if (on)
                 list.bordered_rect(r, 16.0f * dp, kClear, 2.0f * dp, tv_primary());
@@ -2844,17 +2964,545 @@ class Store final : public app::Concept
         if (state != 1 && state != 2)
             return;
         const float dp = kTvDp;
-        list.rounded_rect({0, 0, kWidth, kHeight}, 0.0f, kBlack.with_alpha(0.75f));
-        const float cx = kWidth * 0.5f, cy = kHeight * 0.5f - 40.0f * dp;
-        const float pulse = state == 1 ? 0.5f + 0.5f * std::sin(clock_ * 5.0f) : 0.0f;
-        list.circle(cx, cy, (56.0f + 14.0f * pulse) * dp, tv_primary_container().with_alpha(0.5f));
-        list.circle(cx, cy, 48.0f * dp, tv_primary());
-        draw_mic_icon(list, cx, cy, 2.0f, tv_on_primary());
-        tv_text(list, tv_regular(), state == 1 ? "Говорите…" : "Распознаём…", cx, cy + 76.0f * dp, 24.0f * dp,
+        // The app shows it in the screen's body, under the field row (M8.b.d):
+        // a wave 300 x 64 dp over "Говорите…", 16 dp apart, centred.
+        const float body_top = 104.0f * dp;
+        list.rounded_rect({0, body_top, kWidth, kHeight - body_top}, 0.0f, tv_surface());
+        const float cx = kWidth * 0.5f;
+        const float cy = body_top + (kHeight - body_top) * 0.5f;
+        const Rect wave{cx - 150.0f * dp, cy - 64.0f * dp, 300.0f * dp, 64.0f * dp};
+        const int bars = 30;
+        const float bar_w = wave.w / static_cast<float>(bars);
+        for (int i = 0; i < bars; ++i)
+        {
+            // No level from the pad's microphone here: the wave breathes while it listens
+            const float phase = clock_ * 7.0f + static_cast<float>(i) * 0.55f;
+            const float level = state == 1 ? 0.25f + 0.75f * std::fabs(std::sin(phase) * std::cos(phase * 0.37f)) : 0.15f;
+            const float h = std::max(4.0f * dp, wave.h * level);
+            list.rounded_rect({wave.x + static_cast<float>(i) * bar_w + bar_w * 0.2f, wave.cy() - h * 0.5f, bar_w * 0.6f, h},
+                              bar_w * 0.3f, tv_primary());
+        }
+        tv_text(list, tv_regular(), state == 1 ? "Говорите…" : "Распознаём…", cx, wave.y + wave.h + 16.0f * dp, 24.0f * dp,
                 32.0f * dp, tv_on_surface(), gfx::Align::center);
         if (state == 1)
-            tv_text(list, tv_regular(), "Крестик — готово     Кружок — отмена", cx, cy + 116.0f * dp, 14.0f * dp, 20.0f * dp,
+            tv_text(list, tv_regular(), "Крестик — готово     Кружок — отмена", cx, wave.y + wave.h + 60.0f * dp, 14.0f * dp,
+                    20.0f * dp, tv_on_surface_variant(), gfx::Align::center);
+    }
+
+    // ---- Расширенный поиск (O8) and the countries (N8) ------------------------
+    //
+    // Расширенный поиск: its title centred on top (24 dp down, 48 dp in), then a
+    // column 24 dp padded, its items 12 dp apart: "Выберите категорию:" over the
+    // site's categories, "Выберите жанр:" over the chosen category's genres
+    // (both FlowRows of FilterChips, 8 dp apart), "Выберите год:" over a row of
+    // the years that scrolls sideways, and "Поехали!". The headers are the app's
+    // sticky headers, 16 dp by 8 dp of padding. The list it makes is
+    // "<category> <genre> <year>", at the genre's path and the year (B8.C0071j).
+    //
+    // The countries: the title, a field that narrows the list as it is typed,
+    // and the countries of N8.a as chips; one chosen lists /country/<name>.
+
+    enum SxKind : int
+    {
+        kSxCategory,
+        kSxGenre,
+        kSxYear,
+        kSxGo,
+        kSxField,
+        kSxCountry,
+    };
+    struct SxItem
+    {
+        int kind = kSxCategory;
+        int index = 0;
+        Rect r; // on the screen, the column's scroll applied
+    };
+    struct SxHeader
+    {
+        const char *text = "";
+        float y = 0.0f;
+    };
+    struct SxLayout
+    {
+        std::vector<SxItem> items;
+        std::vector<SxHeader> headers;
+        float content_h = 0.0f; // the column's height, unscrolled
+        float view_top = 0.0f;
+        float years_y = 0.0f;   // the year row's top, -1 when none
+        float years_w = 0.0f;   // the year row's whole width
+    };
+    static float sx_chip_h() { return 36.0f * kTvDp; }
+
+    void sx_open(SxScreen screen, app::Feedback &feedback)
+    {
+        sx_screen_ = screen;
+        sx_focus_ = 0;
+        sx_scroll_.snap(0.0f);
+        if (screen == SxScreen::extended)
+            rezka::App::instance().load_search_filters_async();
+        feedback.play(audio::Cue::open);
+    }
+
+    rezka::SearchFilters sx_filters() const
+    {
+        auto &app = rezka::App::instance();
+        std::lock_guard<std::mutex> lock(app.catalog_mutex);
+        return app.search_filters;
+    }
+
+    // The countries the field lets through, by their index in kCountryFilterChoices.
+    std::vector<int> sx_countries() const
+    {
+        std::vector<int> out;
+        const std::string query = sx_lower(sx_country_query_);
+        for (int i = 0; i < static_cast<int>(std::size(rezka::kCountryFilterChoices)); ++i)
+            if (query.empty() || sx_lower(rezka::kCountryFilterChoices[i]).find(query) != std::string::npos)
+                out.push_back(i);
+        return out;
+    }
+    // Lower case for Russian and English, to match what is typed.
+    static std::string sx_lower(const std::string &text)
+    {
+        std::string out;
+        out.reserve(text.size());
+        for (std::size_t i = 0; i < text.size(); ++i)
+        {
+            const unsigned char c = static_cast<unsigned char>(text[i]);
+            const unsigned char n = i + 1 < text.size() ? static_cast<unsigned char>(text[i + 1]) : 0;
+            if (c < 0x80)
+                out.push_back(static_cast<char>(std::tolower(c)));
+            else if (c == 0xd0 && n >= 0x90 && n <= 0x9f) // А..П
+            {
+                out.push_back(static_cast<char>(0xd0));
+                out.push_back(static_cast<char>(n + 0x20));
+                ++i;
+            }
+            else if (c == 0xd0 && n >= 0xa0 && n <= 0xaf) // Р..Я
+            {
+                out.push_back(static_cast<char>(0xd1));
+                out.push_back(static_cast<char>(n - 0x20));
+                ++i;
+            }
+            else if (c == 0xd0 && n == 0x81) // Ё
+            {
+                out.push_back(static_cast<char>(0xd1));
+                out.push_back(static_cast<char>(0x91));
+                ++i;
+            }
+            else
+                out.push_back(static_cast<char>(c));
+        }
+        return out;
+    }
+
+    float sx_chip_w(const std::string &text) const
+    {
+        return tv_medium().measure(text, 14.0f * kTvDp, 0.1f * kTvDp) + 32.0f * kTvDp;
+    }
+    // Chips from x0 to x1, wrapping, from y; returns the y under the last line.
+    float sx_flow(SxLayout &L, int kind, const std::vector<std::string> &names, float x0, float x1, float y,
+                  float scroll) const
+    {
+        const float gap = 8.0f * kTvDp;
+        float x = x0;
+        for (int i = 0; i < static_cast<int>(names.size()); ++i)
+        {
+            const float w = sx_chip_w(names[static_cast<std::size_t>(i)]);
+            if (x > x0 && x + w > x1)
+            {
+                x = x0;
+                y += sx_chip_h() + gap;
+            }
+            L.items.push_back({kind, i, {x, y - scroll, w, sx_chip_h()}});
+            x += w + gap;
+        }
+        return names.empty() ? y : y + sx_chip_h();
+    }
+
+    SxLayout sx_layout(const rezka::SearchFilters &f) const
+    {
+        const float dp = kTvDp;
+        SxLayout L;
+        const float left = 48.0f * dp + 2.0f * dp;
+        const float right = kWidth - 48.0f * dp - 2.0f * dp;
+        L.view_top = 72.0f * dp;
+        const float scroll = sx_scroll_.value;
+        float y = L.view_top + 24.0f * dp;
+        const float header_h = 36.0f * dp;
+        const float spacing = 12.0f * dp;
+        L.years_y = -1.0f;
+        if (sx_screen_ == SxScreen::extended)
+        {
+            if (f.categories.empty())
+                return L;
+            const int cat = std::clamp(sx_cat_, 0, static_cast<int>(f.categories.size()) - 1);
+            std::vector<std::string> names;
+            for (const auto &c : f.categories)
+                names.push_back(c.name);
+            L.headers.push_back({"Выберите категорию:", y});
+            y += header_h + spacing;
+            y = sx_flow(L, kSxCategory, names, left, right, y, scroll) + spacing;
+            names.clear();
+            for (const auto &g : f.categories[static_cast<std::size_t>(cat)].genres)
+                names.push_back(g.name);
+            L.headers.push_back({"Выберите жанр:", y});
+            y += header_h + spacing;
+            y = sx_flow(L, kSxGenre, names, left, right, y, scroll) + spacing;
+            if (!f.years.empty())
+            {
+                L.headers.push_back({"Выберите год:", y});
+                y += header_h + spacing;
+                // One row, sideways: the years scroll under the column's edges
+                L.years_y = y;
+                float x = left - sx_year_scroll_.value;
+                for (int i = 0; i < static_cast<int>(f.years.size()); ++i)
+                {
+                    const float w = sx_chip_w(f.years[static_cast<std::size_t>(i)]);
+                    L.items.push_back({kSxYear, i, {x, y - scroll, w, sx_chip_h()}});
+                    x += w + 8.0f * dp;
+                }
+                L.years_w = x + sx_year_scroll_.value - left;
+                y += sx_chip_h() + spacing;
+            }
+            const float go_w = tv_medium().measure("Поехали!", 14.0f * dp, 0.1f * dp) + 48.0f * dp;
+            L.items.push_back({kSxGo, 0, {left, y - scroll, go_w, 40.0f * dp}});
+            y += 40.0f * dp + 24.0f * dp;
+        }
+        else
+        {
+            L.items.push_back({kSxField, 0, {left, y - scroll, right - left, 56.0f * dp}});
+            y += 56.0f * dp + 24.0f * dp;
+            std::vector<std::string> names;
+            for (int i : sx_countries())
+                names.push_back(rezka::kCountryFilterChoices[i]);
+            y = sx_flow(L, kSxCountry, names, left, right, y, scroll) + 24.0f * dp;
+        }
+        L.content_h = y - L.view_top;
+        return L;
+    }
+
+    // The item nearest in a direction, as the TV's focus search finds it: ahead
+    // of the edge, the distance along the way plus twice the offset across.
+    static int sx_neighbour(const std::vector<SxItem> &items, int from, Direction nav)
+    {
+        if (from < 0 || from >= static_cast<int>(items.size()))
+            return items.empty() ? -1 : 0;
+        const Rect a = items[static_cast<std::size_t>(from)].r;
+        int best = -1;
+        float best_score = 1e30f;
+        for (int i = 0; i < static_cast<int>(items.size()); ++i)
+        {
+            if (i == from)
+                continue;
+            const Rect b = items[static_cast<std::size_t>(i)].r;
+            float along = 0.0f, across = 0.0f;
+            if (nav == Direction::down)
+            {
+                if (b.y < a.y + a.h * 0.5f)
+                    continue;
+                along = b.y - (a.y + a.h);
+                across = std::fabs(b.cx() - a.cx());
+            }
+            else if (nav == Direction::up)
+            {
+                if (b.y + b.h > a.y + a.h * 0.5f)
+                    continue;
+                along = a.y - (b.y + b.h);
+                across = std::fabs(b.cx() - a.cx());
+            }
+            else if (nav == Direction::right)
+            {
+                if (b.x < a.x + a.w * 0.5f || std::fabs(b.cy() - a.cy()) > a.h * 0.5f)
+                    continue;
+                along = b.x - (a.x + a.w);
+            }
+            else
+            {
+                if (b.x + b.w > a.x + a.w * 0.5f || std::fabs(b.cy() - a.cy()) > a.h * 0.5f)
+                    continue;
+                along = a.x - (b.x + b.w);
+            }
+            const float score = std::max(0.0f, along) + 2.0f * across;
+            if (score < best_score)
+            {
+                best_score = score;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    void sx_update(const InputFrame &input, float dt, app::Feedback &feedback)
+    {
+        auto &app = rezka::App::instance();
+        const rezka::SearchFilters f = sx_filters();
+        SxLayout L = sx_layout(f);
+        const int count = static_cast<int>(L.items.size());
+        sx_focus_ = std::clamp(sx_focus_, 0, std::max(0, count - 1));
+
+        if (input.is_pressed(Action::back))
+        {
+            sx_screen_ = SxScreen::none;
+            feedback.play(audio::Cue::back);
+            return;
+        }
+        if (sx_screen_ == SxScreen::extended && f.categories.empty())
+        {
+            // Loading, or failed: ✕ asks again
+            if (input.is_pressed(Action::confirm) && app.filters_state.load() == 3)
+            {
+                app.load_search_filters_async();
+                feedback.play(audio::Cue::select);
+            }
+            sx_animate(L, dt);
+            return;
+        }
+        if (input.nav != Direction::none && count > 0)
+        {
+            const int next = sx_neighbour(L.items, sx_focus_, input.nav);
+            if (next < 0)
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                sx_focus_ = next;
+                tv_tick(feedback, L.items[static_cast<std::size_t>(next)].r.cx());
+            }
+        }
+        if (input.is_pressed(Action::confirm) && sx_focus_ < count)
+        {
+            const SxItem &it = L.items[static_cast<std::size_t>(sx_focus_)];
+            switch (it.kind)
+            {
+            case kSxCategory:
+            {
+                // The genre chosen stays when the new category has it (O8.l)
+                const auto &cats = f.categories;
+                const int old_cat = std::clamp(sx_cat_, 0, static_cast<int>(cats.size()) - 1);
+                const std::string genre = sx_genre_ < static_cast<int>(cats[static_cast<std::size_t>(old_cat)].genres.size())
+                                              ? cats[static_cast<std::size_t>(old_cat)].genres[static_cast<std::size_t>(sx_genre_)].name
+                                              : std::string();
+                sx_cat_ = it.index;
+                sx_genre_ = 0;
+                const auto &genres = cats[static_cast<std::size_t>(it.index)].genres;
+                for (int g = 0; g < static_cast<int>(genres.size()); ++g)
+                    if (genres[static_cast<std::size_t>(g)].name == genre)
+                        sx_genre_ = g;
+                feedback.play(audio::Cue::select);
+                break;
+            }
+            case kSxGenre:
+                sx_genre_ = it.index;
+                feedback.play(audio::Cue::select);
+                break;
+            case kSxYear:
+                sx_year_ = it.index;
+                feedback.play(audio::Cue::select);
+                break;
+            case kSxGo:
+                sx_run_extended(f, feedback);
+                return;
+            case kSxField:
+                kb_begin(&sx_country_query_, "Поиск фильмов и сериалов по стране", false, feedback);
+                break;
+            default:
+            {
+                const std::string country = rezka::kCountryFilterChoices[it.index];
+                tv_show_results(country, SearchBack::country);
+                app.country_search_async(country);
+                feedback.play(audio::Cue::select);
+                return;
+            }
+            }
+        }
+        sx_animate(L, dt);
+    }
+
+    // The column follows the focus; the year row slides to keep its chip in view.
+    void sx_animate(const SxLayout &L, float dt)
+    {
+        const float dp = kTvDp;
+        if (sx_focus_ < static_cast<int>(L.items.size()))
+        {
+            const SxItem &it = L.items[static_cast<std::size_t>(sx_focus_)];
+            const float view_h = kHeight - L.view_top;
+            const float top = it.r.y + sx_scroll_.value - L.view_top; // in the column
+            float target = sx_scroll_.target;
+            if (top - target < 48.0f * dp)
+                target = top - 48.0f * dp;
+            if (top + it.r.h - target > view_h - 48.0f * dp)
+                target = top + it.r.h - view_h + 48.0f * dp;
+            sx_scroll_.target = std::clamp(target, 0.0f, std::max(0.0f, L.content_h - view_h));
+            if (it.kind == kSxYear)
+            {
+                const float left = 50.0f * dp, right = kWidth - 50.0f * dp;
+                const float x = it.r.x + sx_year_scroll_.value - left; // in the row
+                float ys = sx_year_scroll_.target;
+                if (x - ys < 0.0f)
+                    ys = x;
+                if (x + it.r.w - ys > right - left)
+                    ys = x + it.r.w - (right - left);
+                sx_year_scroll_.target = std::clamp(ys, 0.0f, std::max(0.0f, L.years_w - (right - left)));
+            }
+        }
+        sx_scroll_.update(dt, omega(12.0f));
+        sx_year_scroll_.update(dt, omega(12.0f));
+    }
+
+    void sx_run_extended(const rezka::SearchFilters &f, app::Feedback &feedback)
+    {
+        const int cat = std::clamp(sx_cat_, 0, static_cast<int>(f.categories.size()) - 1);
+        const rezka::SearchCategory &c = f.categories[static_cast<std::size_t>(cat)];
+        if (c.genres.empty())
+        {
+            tv_refuse(feedback, false);
+            return;
+        }
+        const rezka::SearchGenre &g = c.genres[static_cast<std::size_t>(std::clamp(sx_genre_, 0, static_cast<int>(c.genres.size()) - 1))];
+        std::string year = f.years.empty() ? std::string()
+                                           : f.years[static_cast<std::size_t>(std::clamp(sx_year_, 0, static_cast<int>(f.years.size()) - 1))];
+        if (year == "Все")
+            year.clear();
+        // "<category> <genre> <year>", the genre left out when "Любой" (B8.C0071j)
+        std::string title = c.name + " " + (g.name == "Любой" ? std::string() : g.name) + " " + year;
+        for (std::size_t at = title.find("  "); at != std::string::npos; at = title.find("  "))
+            title.erase(at, 1);
+        while (!title.empty() && title.back() == ' ')
+            title.pop_back();
+        // The year as the site's path takes it: its digits
+        std::string year_part;
+        for (char ch : year)
+            if (ch >= '0' && ch <= '9')
+                year_part.push_back(ch);
+        tv_show_results(title, SearchBack::extended);
+        rezka::App::instance().extended_search_async(title, g.value + year_part);
+        feedback.play(audio::Cue::select);
+    }
+
+    // A FilterChip of M8.b.e: outlined, tinted when chosen, light under the focus.
+    void sx_draw_chip(gfx::DrawList &list, const Rect &r, const std::string &text, bool selected, bool focused) const
+    {
+        const float dp = kTvDp;
+        const float radius = 8.0f * dp;
+        Color fill = kClear, content = tv_on_surface_variant(), border = tv_border();
+        float border_w = 1.0f * dp;
+        if (focused && selected)
+        {
+            fill = tv_on_primary_container();
+            content = tv_on_primary();
+            border = tv_on_primary_container();
+        }
+        else if (focused)
+        {
+            fill = tv_on_surface();
+            content = tv_inverse_on_surface();
+            border_w = 0.0f;
+        }
+        else if (selected)
+        {
+            fill = tv_secondary_container().with_alpha(0.4f);
+            content = tv_on_secondary_container();
+            border = tv_secondary();
+        }
+        const Rect g = focused ? scaled(r, 1.05f) : r;
+        if (border_w > 0.0f)
+            list.bordered_rect(g, radius, fill, border_w, border);
+        else
+            list.rounded_rect(g, radius, fill);
+        tv_text(list, tv_medium(), text, g.cx(), g.y + 8.0f * dp, 14.0f * dp, 20.0f * dp, content, gfx::Align::center,
+                0.1f * dp);
+    }
+
+    void sx_draw(gfx::DrawList &list) const
+    {
+        if (sx_screen_ == SxScreen::none)
+            return;
+        const float dp = kTvDp;
+        auto &app = rezka::App::instance();
+        list.rounded_rect({0, 0, kWidth, kHeight}, 0.0f, tv_surface());
+        const bool extended = sx_screen_ == SxScreen::extended;
+        tv_text(list, tv_regular(), extended ? "Расширенный поиск" : "Поиск фильмов и сериалов по стране", kWidth * 0.5f,
+                24.0f * dp, 24.0f * dp, 32.0f * dp, tv_on_surface(), gfx::Align::center);
+        const rezka::SearchFilters f = sx_filters();
+        const SxLayout L = sx_layout(f);
+        if (extended && f.categories.empty())
+        {
+            const int state = app.filters_state.load();
+            if (state == 3)
+            {
+                tv_text(list, tv_regular(), "Ошибка", kWidth * 0.5f, 220.0f * dp, 22.0f * dp, 28.0f * dp, tv_on_surface(),
+                        gfx::Align::center);
+                tv_text(list, tv_regular(), "Нажмите ✕, чтобы повторить", kWidth * 0.5f, 256.0f * dp, 14.0f * dp, 20.0f * dp,
+                        tv_on_surface_variant(), gfx::Align::center);
+            }
+            else
+                list.arc(kWidth * 0.5f, 240.0f * dp, 20.0f * dp, 4.0f * dp, clock_ * 5.0f, 4.4f, tv_primary());
+            kb_draw(list);
+            return;
+        }
+        const float view_top = L.view_top;
+        list.push_clip({0.0f, view_top, kWidth, kHeight - view_top});
+        const int cat = f.categories.empty() ? 0 : std::clamp(sx_cat_, 0, static_cast<int>(f.categories.size()) - 1);
+        const std::vector<int> countries = extended ? std::vector<int>() : sx_countries();
+        for (int i = 0; i < static_cast<int>(L.items.size()); ++i)
+        {
+            const SxItem &it = L.items[static_cast<std::size_t>(i)];
+            if (it.r.y + it.r.h < view_top - 8.0f * dp || it.r.y > kHeight)
+                continue;
+            const bool focused = i == sx_focus_;
+            switch (it.kind)
+            {
+            case kSxCategory:
+                sx_draw_chip(list, it.r, f.categories[static_cast<std::size_t>(it.index)].name, it.index == cat, focused);
+                break;
+            case kSxGenre:
+                sx_draw_chip(list, it.r, f.categories[static_cast<std::size_t>(cat)].genres[static_cast<std::size_t>(it.index)].name,
+                             it.index == sx_genre_, focused);
+                break;
+            case kSxYear:
+                if (it.r.x + it.r.w < 0.0f || it.r.x > kWidth)
+                    break;
+                sx_draw_chip(list, it.r, f.years[static_cast<std::size_t>(it.index)], it.index == sx_year_, focused);
+                break;
+            case kSxGo:
+            {
+                const Rect g = focused ? scaled(it.r, 1.05f) : it.r;
+                list.rounded_rect(g, g.h * 0.5f, focused ? tv_on_surface() : tv_secondary_container().with_alpha(0.6f));
+                tv_text(list, tv_medium(), "Поехали!", g.cx(), g.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp,
+                        focused ? tv_inverse_on_surface() : tv_on_secondary_container(), gfx::Align::center, 0.1f * dp);
+                break;
+            }
+            case kSxField:
+            {
+                list.rounded_rect(it.r, 28.0f * dp, tv_surface_variant().with_alpha(0.3f));
+                list.bordered_rect(it.r, 28.0f * dp, kClear, (focused ? 2.0f : 1.0f) * dp,
+                                   focused ? tv_primary() : tv_border_variant());
+                tv_icon(list, kTvIconSearch, it.r.x + 20.0f * dp, it.r.cy() - 12.0f * dp, 24.0f * dp, tv_on_surface_variant());
+                const bool empty = sx_country_query_.empty();
+                tv_text(list, tv_regular(), empty ? std::string("Поиск") : sx_country_query_, it.r.x + 60.0f * dp,
+                        it.r.cy() - 14.0f * dp, 18.0f * dp, 28.0f * dp, empty ? tv_on_surface_variant() : tv_on_surface());
+                break;
+            }
+            default:
+                sx_draw_chip(list, it.r, rezka::kCountryFilterChoices[it.index], false, focused);
+                break;
+            }
+        }
+        // The headers over the items, each held at the top while its own items scroll
+        for (std::size_t h = 0; h < L.headers.size(); ++h)
+        {
+            float y = L.headers[h].y - sx_scroll_.value;
+            const float next = h + 1 < L.headers.size() ? L.headers[h + 1].y - sx_scroll_.value : 1e9f;
+            if (y < view_top)
+                y = std::min(view_top, next - 36.0f * dp);
+            list.rounded_rect({0.0f, y, kWidth, 36.0f * dp}, 0.0f, tv_surface());
+            tv_text(list, tv_medium(), L.headers[h].text, 48.0f * dp + 16.0f * dp, y + 8.0f * dp, 16.0f * dp, 20.0f * dp,
+                    tv_on_surface(), gfx::Align::left, 0.1f * dp);
+        }
+        if (!extended && countries.empty())
+            tv_text(list, tv_regular(), "Ничего не найдено", kWidth * 0.5f, view_top + 140.0f * dp, 16.0f * dp, 24.0f * dp,
                     tv_on_surface_variant(), gfx::Align::center);
+        list.pop_clip();
+        kb_draw(list);
     }
 
     void type_into(std::string &target)
@@ -2978,8 +3626,8 @@ class Store final : public app::Concept
                 feedback.play(audio::Cue::select);
                 return;
             }
-            if (acc.logged_in && !app.account_lists_loading.load() && later_count == 0 && folder_count == 0)
-                app.load_account_lists_async();
+            // The list opened is the site's as it is now
+            app.load_account_lists_async();
             profile_view_ = profile_focus_ == kProfileContinue ? kProfileWatchLater : kProfileBookmarks;
             profile_list_focus_ = 0;
             feedback.play(audio::Cue::open);
@@ -3314,6 +3962,9 @@ class Store final : public app::Concept
     static constexpr float kTvGap = 12.0f * kTvDp;
     static constexpr float kTvTitleSize = 14.0f * kTvDp;
     static constexpr float kTvSubSize = 12.0f * kTvDp;
+    static constexpr float kTvHeroH = 280.0f * kTvDp;     // the banner on Главная
+    static constexpr float kTvHeroGap = 24.0f * kTvDp;    // ... and the space under it
+    static constexpr float kTvHeroSeconds = 7.0f;         // a slide's time when left alone
     // "Столбцы в списках" (5 to 9, the app's default 7) sets the grid.
     static int tv_columns() { return std::clamp(rezka::App::instance().settings().columns, 5, 9); }
     static float tv_card_w()
@@ -3363,7 +4014,21 @@ class Store final : public app::Concept
         drawer,
         tabs,
         chips,
+        hero, // the banner's buttons, between the chips and the grid
         grid,
+    };
+
+    // A banner slide, measured once per change: the title in capitals on at
+    // most two lines, the facts line, three lines of the description.
+    struct TvHero
+    {
+        rezka::CatalogItem item;
+        std::string title[2];
+        std::vector<std::string> facts; // year, genre, country
+        std::string quality;
+        std::vector<std::string> blurb;
+        std::uint32_t texture = 0;
+        float aspect = 0.0f; // the picture's width over its height
     };
 
     // What a card shows, measured once per title.
@@ -3461,8 +4126,121 @@ class Store final : public app::Concept
         tv_cards_ = std::move(cards);
         const int count = static_cast<int>(tv_cards_.size());
         tv_focus_ = std::clamp(tv_focus_, 0, std::max(0, count - 1));
-        if (count == 0 && tv_zone_ == TvZone::grid)
+        // A list of results still on its way keeps the grid's focus; an empty
+        // one gives it to the chips (home) or the drawer.
+        const bool waiting = !home_layout_ && rezka::App::instance().catalog_loading.load();
+        if (count == 0 && tv_zone_ == TvZone::grid && !waiting)
             tv_zone_ = home_layout_ ? TvZone::chips : TvZone::drawer;
+    }
+
+    // Russian and English capitals, in UTF-8.
+    static std::string tv_upper(const std::string &text)
+    {
+        std::string out;
+        out.reserve(text.size());
+        for (std::size_t i = 0; i < text.size(); ++i)
+        {
+            const unsigned char c = static_cast<unsigned char>(text[i]);
+            const unsigned char n = i + 1 < text.size() ? static_cast<unsigned char>(text[i + 1]) : 0;
+            if (c < 0x80)
+                out.push_back(static_cast<char>(std::toupper(c)));
+            else if (c == 0xd0 && n >= 0xb0 && n <= 0xbf) // а..п
+            {
+                out.push_back(static_cast<char>(0xd0));
+                out.push_back(static_cast<char>(n - 0x20));
+                ++i;
+            }
+            else if (c == 0xd1 && n >= 0x80 && n <= 0x8f) // р..я
+            {
+                out.push_back(static_cast<char>(0xd0));
+                out.push_back(static_cast<char>(n + 0x20));
+                ++i;
+            }
+            else if (c == 0xd1 && n == 0x91) // ё
+            {
+                out.push_back(static_cast<char>(0xd0));
+                out.push_back(static_cast<char>(0x81));
+                ++i;
+            }
+            else
+                out.push_back(static_cast<char>(c));
+        }
+        return out;
+    }
+    // The banner's text column: the left part, over the dark side of the picture.
+    static float tv_hero_text_w() { return tv_hero_rect().w * 0.46f; }
+    static constexpr float kTvHeroTitle = 32.0f * kTvDp;      // one line ...
+    static constexpr float kTvHeroTitleSmall = 24.0f * kTvDp; // ... or two, smaller
+    static constexpr float kTvHeroBlurb = 14.0f * kTvDp;
+
+    void tv_refresh_hero()
+    {
+        auto &app = rezka::App::instance();
+        std::vector<rezka::App::HeroSlide> slides;
+        {
+            std::lock_guard<std::mutex> lock(app.catalog_mutex);
+            slides = app.hero_slides;
+        }
+        tv_hero_version_ = app.hero_version.load();
+        tv_hero_state_ = app.hero_state.load();
+        const std::string shown = tv_hero_index_ < static_cast<int>(tv_hero_.size())
+                                      ? tv_hero_[static_cast<std::size_t>(tv_hero_index_)].item.url
+                                      : std::string();
+        std::vector<TvHero> hero(slides.size());
+        for (std::size_t i = 0; i < slides.size(); ++i)
+        {
+            const rezka::App::HeroSlide &s = slides[i];
+            TvHero &h = hero[i];
+            h.item = s.item;
+            const std::string upper = tv_upper(s.title);
+            if (tv_medium().measure(upper, kTvHeroTitle, 0.5f * kTvDp) <= tv_hero_text_w())
+                h.title[0] = upper;
+            else
+                tv_two_lines(*tv_medium().font, upper, kTvHeroTitleSmall, tv_hero_text_w(), h.title);
+            // A title on two lines leaves room for two lines of description.
+            const std::size_t most = h.title[1].empty() ? 3 : 2;
+            for (const std::string *part : {&s.year, &s.genre, &s.country})
+                if (!part->empty())
+                    h.facts.push_back(*part);
+            h.quality = s.quality.empty() ? "HD" : s.quality;
+            // Three lines at most, the last one ending in an ellipsis when text remains.
+            std::vector<std::string> lines = tv_regular().font->wrap(s.description, kTvHeroBlurb, tv_hero_text_w());
+            if (lines.size() > most)
+            {
+                std::string rest = lines[most - 1];
+                for (std::size_t k = most; k < lines.size(); ++k)
+                    rest += " " + lines[k];
+                lines.resize(most);
+                lines[most - 1] = tv_regular().font->fit(rest, kTvHeroBlurb, tv_hero_text_w());
+            }
+            h.blurb = std::move(lines);
+            h.texture = s.texture;
+            h.aspect = (s.tex_w > 0 && s.tex_h > 0) ? static_cast<float>(s.tex_w) / static_cast<float>(s.tex_h) : 0.0f;
+        }
+        tv_hero_ = std::move(hero);
+        // The slide on screen stays on screen when the list is filled in.
+        tv_hero_index_ = 0;
+        for (int i = 0; i < static_cast<int>(tv_hero_.size()); ++i)
+            if (tv_hero_[static_cast<std::size_t>(i)].item.url == shown)
+                tv_hero_index_ = i;
+        if (tv_hero_prev_ >= static_cast<int>(tv_hero_.size()))
+            tv_hero_prev_ = -1;
+        if (tv_zone_ == TvZone::hero && !tv_hero_shown())
+            tv_zone_ = TvZone::chips;
+    }
+    // Shows another slide: the new one fades in over the old one.
+    void tv_hero_show(int index)
+    {
+        const int count = static_cast<int>(tv_hero_.size());
+        if (count == 0)
+            return;
+        index = ((index % count) + count) % count;
+        if (index == tv_hero_index_)
+            return;
+        tv_hero_prev_ = tv_hero_index_;
+        tv_hero_index_ = index;
+        tv_hero_fade_ = 0.0f;
+        tv_hero_timer_ = 0.0f;
     }
 
     void tv_ensure_icons()
@@ -4435,23 +5213,43 @@ class Store final : public app::Concept
         }
     }
     // A card's place in the grid's content (before scrolling), from the page's left edge.
-    static Rect tv_card_rect(int index)
+    // On the home list the banner comes first in that content.
+    Rect tv_card_rect(int index) const
     {
         const int col = index % tv_columns();
         const int row = index / tv_columns();
         return {kTvPad + static_cast<float>(col) * (tv_card_w() + kTvGap),
-                kTvGridPad + static_cast<float>(row) * tv_row_pitch(), tv_card_w(), tv_card_h()};
+                kTvGridPad + tv_grid_offset() + static_cast<float>(row) * tv_row_pitch(), tv_card_w(),
+                tv_card_h()};
+    }
+    // The banner: Главная alone (the home tabs, not Новинки, Анонсы or a
+    // search), while its slides are loading or there.
+    bool tv_hero_shown() const
+    {
+        return home_layout_ && tv_kind_ == 0 && tv_hero_state_ != 3;
+    }
+    float tv_grid_offset() const
+    {
+        return tv_hero_shown() ? kTvHeroH + kTvHeroGap : 0.0f;
+    }
+    // The banner in the grid's content, before scrolling.
+    static Rect tv_hero_rect()
+    {
+        return {kTvPad, kTvGridPad, kWidth - kTvRail - 2.0f * kTvPad, kTvHeroH};
     }
     // Compose's bring-into-view on a TV: the focused row's top rests 30% down
     // the viewport, as far as the content allows.
     float tv_scroll_target() const
     {
         const int count = static_cast<int>(tv_cards_.size());
+        if (tv_zone_ == TvZone::hero)
+            return 0.0f;
         if (tv_zone_ != TvZone::grid || count == 0)
             return tv_scroll_.target;
         const float view = kHeight - kTvGridTop;
         const int rows = (count + tv_columns() - 1) / tv_columns();
-        const float content = 2.0f * kTvGridPad + static_cast<float>(rows) * tv_row_pitch() - kTvGap;
+        const float content =
+            2.0f * kTvGridPad + tv_grid_offset() + static_cast<float>(rows) * tv_row_pitch() - kTvGap;
         const float top = tv_card_rect(tv_focus_).y;
         return std::clamp(top - 0.3f * view, 0.0f, std::max(0.0f, content - view));
     }
@@ -4495,6 +5293,8 @@ class Store final : public app::Concept
                 to = TvZone::chips;
             if (to == TvZone::tabs && tv_kind_ != 0)
                 to = TvZone::chips;
+            if (to == TvZone::hero && !tv_hero_focusable())
+                to = TvZone::chips;
         }
         tv_zone_ = to;
     }
@@ -4524,14 +5324,16 @@ class Store final : public app::Concept
         profile_list_focus_ = 0;
         {
             auto &app = rezka::App::instance();
-            bool logged_in = false, empty = false;
+            bool logged_in = false;
             {
                 std::lock_guard<std::mutex> lock(app.catalog_mutex);
                 logged_in = app.account.logged_in;
-                empty = app.watch_later.empty() && app.bookmark_folders.empty();
             }
             profile_was_logged_ = logged_in;
-            if (logged_in && empty)
+            // As the app's screens do, the lists are asked for each time: what
+            // was watched or bookmarked since is the site's to tell. What was
+            // loaded before shows meanwhile.
+            if (logged_in)
                 app.load_account_lists_async();
             // The code of the site, for signing in on a phone
             if (!logged_in)
@@ -4604,6 +5406,44 @@ class Store final : public app::Concept
         }
     }
 
+    bool tv_hero_focusable() const
+    {
+        return tv_hero_shown() && !tv_hero_.empty();
+    }
+    // Смотреть opens the title's page, Мой список puts it in the bookmarks or takes it out.
+    void tv_hero_press(app::Feedback &feedback)
+    {
+        tv_hero_timer_ = 0.0f;
+        if (tv_hero_index_ >= static_cast<int>(tv_hero_.size()))
+        {
+            tv_refuse(feedback, false);
+            return;
+        }
+        const TvHero &h = tv_hero_[static_cast<std::size_t>(tv_hero_index_)];
+        auto &app = rezka::App::instance();
+        // Without an account, Мой список is this console's own bookmarks
+        if (tv_hero_focus_ == 1 && !app.signed_in())
+        {
+            const bool on = app.toggle_favorite(h.item.url, h.item.title);
+            show_message(on ? "Добавлено в закладки" : "Убрано из закладок");
+            feedback.play(audio::Cue::select);
+            return;
+        }
+        const int index = app.adopt_catalog_item(h.item);
+        if (index < 0)
+        {
+            tv_refuse(feedback, false);
+            return;
+        }
+        open_page(index, false, feedback);
+        // Signed in, the title's page opens on its folders, as its bookmark button does
+        if (tv_hero_focus_ == 1)
+        {
+            app.load_bookmark_choices_async(index);
+            dp_open_dialog(DpDialog::bookmarks, feedback);
+        }
+    }
+
     void tv_update_home(const InputFrame &input, app::Feedback &feedback)
     {
         tv_ensure_icons();
@@ -4624,13 +5464,27 @@ class Store final : public app::Concept
             tv_zone_ = count > 0 ? TvZone::grid : TvZone::drawer;
         if (listing && tv_kind_ != 0 && tv_zone_ == TvZone::tabs)
             tv_zone_ = TvZone::chips;
+        if (tv_zone_ == TvZone::hero && !tv_hero_focusable())
+            tv_zone_ = TvZone::chips;
 
         if (input.is_pressed(Action::back))
         {
             if (!listing)
             {
+                // Back where the results came from (the search, Расширенный
+                // поиск, the countries), the home list under it again
+                const SearchBack back = tv_results_back_;
+                tv_results_back_ = SearchBack::home;
                 tv_zone_ = TvZone::tabs;
+                tv_list_title_.clear();
                 tv_load(0);
+                if (back != SearchBack::home)
+                {
+                    search_open_ = true;
+                    sx_screen_ = back == SearchBack::extended ? SxScreen::extended
+                                 : back == SearchBack::country ? SxScreen::country
+                                                               : SxScreen::none;
+                }
                 feedback.play(audio::Cue::back);
             }
             else if (tv_zone_ == TvZone::grid && tv_focus_ >= tv_columns())
@@ -4638,7 +5492,7 @@ class Store final : public app::Concept
                 tv_focus_ %= tv_columns();
                 feedback.play(audio::Cue::back);
             }
-            else if (tv_zone_ == TvZone::grid)
+            else if (tv_zone_ == TvZone::grid || tv_zone_ == TvZone::hero)
             {
                 tv_zone_ = TvZone::chips;
                 tv_chip_focus_ = tv_type_;
@@ -4646,6 +5500,14 @@ class Store final : public app::Concept
             }
             else
                 tv_open_drawer(feedback);
+            return;
+        }
+        // L1 / R1 turn the banner's slides while it has the focus.
+        if (tv_zone_ == TvZone::hero &&
+            (input.is_pressed(Action::page_prev) || input.is_pressed(Action::page_next)))
+        {
+            tv_hero_show(tv_hero_index_ + (input.is_pressed(Action::page_next) ? 1 : -1));
+            tv_tick(feedback, tv_page_x() + tv_hero_rect().cx());
             return;
         }
 
@@ -4708,11 +5570,47 @@ class Store final : public app::Concept
                 else
                     tv_refuse(feedback, input.nav_repeat);
             }
+            else if (tv_hero_focusable())
+            {
+                tv_zone_ = TvZone::hero;
+                tv_hero_focus_ = 0;
+                tv_hero_timer_ = 0.0f;
+                tv_tick(feedback, tv_page_x() + kTvPad);
+            }
             else if (count > 0)
             {
                 // The card last left, or the one under the chip.
                 tv_zone_ = TvZone::grid;
                 tv_focus_ = std::clamp(tv_focus_, 0, count - 1);
+                tv_tick(feedback, tv_page_x() + tv_card_rect(tv_focus_).cx());
+            }
+            else
+                tv_refuse(feedback, input.nav_repeat);
+        }
+        else if (tv_zone_ == TvZone::hero && nav != Direction::none)
+        {
+            // Left and right go between the two buttons, and past them to
+            // the slide before or after; up is the chips, down the first row.
+            tv_hero_timer_ = 0.0f;
+            if (nav == Direction::left || nav == Direction::right)
+            {
+                const int next = tv_hero_focus_ + (nav == Direction::right ? 1 : -1);
+                if (next < 0 || next > 1)
+                    tv_hero_show(tv_hero_index_ + (next > 1 ? 1 : -1));
+                else
+                    tv_hero_focus_ = next;
+                tv_tick(feedback, tv_page_x() + kTvPad + 120.0f * kTvDp * static_cast<float>(tv_hero_focus_));
+            }
+            else if (nav == Direction::up)
+            {
+                tv_zone_ = TvZone::chips;
+                tv_chip_focus_ = tv_type_;
+                tv_tick(feedback, tv_page_x() + kTvPad);
+            }
+            else if (count > 0)
+            {
+                tv_zone_ = TvZone::grid;
+                tv_focus_ = std::min(tv_focus_ % tv_columns(), count - 1);
                 tv_tick(feedback, tv_page_x() + tv_card_rect(tv_focus_).cx());
             }
             else
@@ -4741,7 +5639,14 @@ class Store final : public app::Concept
                 tv_open_drawer(feedback);
             else if (nav == Direction::up && next < 0)
             {
-                if (listing)
+                if (tv_hero_focusable())
+                {
+                    tv_zone_ = TvZone::hero;
+                    tv_hero_focus_ = 0;
+                    tv_hero_timer_ = 0.0f;
+                    tv_tick(feedback, tv_page_x() + kTvPad);
+                }
+                else if (listing)
                 {
                     tv_zone_ = TvZone::chips;
                     tv_chip_focus_ = tv_type_;
@@ -4757,8 +5662,9 @@ class Store final : public app::Concept
                 tv_focus_ = next;
                 tv_tick(feedback, tv_page_x() + tv_card_rect(next).cx());
             }
-            // The app asks for the next page a page ahead of the focus.
-            if (listing && tv_focus_ + 2 * tv_columns() >= count)
+            // The app asks for the next page a page ahead of the focus (the
+            // home tabs, and the paged lists: search, filter, countries).
+            if (tv_focus_ + 2 * tv_columns() >= count)
                 rezka::App::instance().load_movie_list_more_async();
         }
 
@@ -4766,6 +5672,8 @@ class Store final : public app::Concept
             return;
         if (tv_zone_ == TvZone::grid && count > 0)
             open_page(tv_focus_, false, feedback);
+        else if (tv_zone_ == TvZone::hero)
+            tv_hero_press(feedback);
         else if (tv_zone_ == TvZone::chips)
         {
             if (tv_chip_focus_ != tv_type_)
@@ -4822,6 +5730,21 @@ class Store final : public app::Concept
         tv_pill_.update(dt, 22.0f);
         tv_tabs_lit_.target = tv_zone_ == TvZone::tabs ? 1.0f : 0.0f;
         tv_tabs_lit_.update(dt, 22.0f);
+        // The banner turns by itself while nothing is opened over the page.
+        tv_hero_fade_ = std::min(1.0f, tv_hero_fade_ + dt / 0.6f);
+        if (tv_hero_fade_ >= 1.0f)
+            tv_hero_prev_ = -1;
+        if (tv_hero_shown() && tv_hero_.size() > 1 && !covered && tv_zone_ != TvZone::drawer)
+        {
+            tv_hero_timer_ += dt;
+            if (tv_hero_timer_ >= kTvHeroSeconds)
+                tv_hero_show(tv_hero_index_ + 1);
+        }
+        for (int i = 0; i < 2; ++i)
+        {
+            const float want = (tv_zone_ == TvZone::hero && i == tv_hero_focus_) ? 1.0f : 0.0f;
+            tv_hero_lift_[i] += (want - tv_hero_lift_[i]) * rate;
+        }
     }
 
     // ---- drawing -----------------------------------------------------------
@@ -4925,8 +5848,8 @@ class Store final : public app::Concept
             }
             else if (!tv_status_.empty())
                 tv_text(list, tv_regular(), tv_status_, (kWidth - kTvRail) * 0.5f,
-                        kTvGridTop + view * 0.4f, 22.0f * kTvDp, 28.0f * kTvDp, tv_on_surface(),
-                        gfx::Align::center);
+                        kTvGridTop + tv_grid_offset() + (view - tv_grid_offset()) * 0.4f - scroll,
+                        22.0f * kTvDp, 28.0f * kTvDp, tv_on_surface(), gfx::Align::center);
             return;
         }
 
@@ -5046,6 +5969,217 @@ class Store final : public app::Concept
         }
     }
 
+    // ---- the banner ------------------------------------------------------
+    //
+    // A slide of "Фильмы — Смотрят сейчас": the large poster on the right,
+    // never stretched (its upper part is cut to the frame, where the faces
+    // are), dissolving into the page on the left and below; over the dark
+    // side the label, the title in capitals, the facts, the description and
+    // the two buttons; the slide's dots in the corner.
+
+    static Color tv_hero_red() { return Color::rgb(0xf2453d); }
+    static float tv_smooth(float t) { return t * t * (3.0f - 2.0f * t); }
+
+    // The picture's frame on the right, its width from its own proportions,
+    // and the part of the texture that fills it.
+    static void tv_hero_frame(const Rect &b, float aspect, Rect &frame, Rect &uv)
+    {
+        const float w = std::min(b.w * 0.62f, b.h * aspect * 1.75f);
+        frame = {b.x + b.w - w, b.y, w, b.h};
+        const float box = frame.w / frame.h;
+        if (box > aspect)
+        {
+            const float h = aspect / box;
+            uv = {0.0f, (1.0f - h) * 0.2f, 1.0f, h};
+        }
+        else
+        {
+            const float u = box / aspect;
+            uv = {(1.0f - u) * 0.5f, 0.0f, u, 1.0f};
+        }
+    }
+
+    void tv_draw_hero_picture(gfx::DrawList &list, const Rect &b, const TvHero &h, float alpha) const
+    {
+        if (h.texture == 0 || h.aspect <= 0.0f || alpha <= 0.0f)
+            return;
+        Rect frame, uv;
+        tv_hero_frame(b, h.aspect, frame, uv);
+        list.image(h.texture, frame, uv, kWhite.with_alpha(alpha), 16.0f * kTvDp);
+    }
+
+    // The label, the title, the facts and the description, from the top of the text block.
+    void tv_draw_hero_text(gfx::DrawList &list, float x, float y, const TvHero &h, float alpha) const
+    {
+        if (alpha <= 0.0f)
+            return;
+        const float dp = kTvDp;
+        list.push_opacity(alpha);
+        tv_text(list, tv_medium(), "Сейчас смотрят", x, y, 14.0f * dp, 20.0f * dp, tv_hero_red(), gfx::Align::left,
+                0.8f * dp);
+        y += 28.0f * dp;
+        const bool two = !h.title[1].empty();
+        const float size = two ? kTvHeroTitleSmall : kTvHeroTitle;
+        const float line = two ? 30.0f * dp : 40.0f * dp;
+        for (const std::string &part : h.title)
+        {
+            if (part.empty())
+                continue;
+            tv_text(list, tv_medium(), part, x, y, size, line, kWhite, gfx::Align::left, 0.5f * dp);
+            y += line;
+        }
+        y += 10.0f * dp;
+        // Год  •  Жанр  •  Страна  •  [HD]
+        float fx = x;
+        const float fact = 15.0f * dp;
+        const Color soft = tv_on_surface().with_alpha(0.85f);
+        for (const std::string &part : h.facts)
+        {
+            fx += tv_text(list, tv_regular(), part, fx, y, fact, 22.0f * dp, soft);
+            fx += tv_text(list, tv_regular(), "  •  ", fx, y, fact, 22.0f * dp, soft.with_alpha(0.6f));
+        }
+        const float badge_w = tv_medium().measure(h.quality, 11.0f * dp, 0.5f * dp) + 12.0f * dp;
+        const Rect badge{fx, y + 3.0f * dp, badge_w, 16.0f * dp};
+        list.bordered_rect(badge, 3.0f * dp, kClear, 1.0f * dp, tv_on_surface().with_alpha(0.75f));
+        tv_text(list, tv_medium(), h.quality, badge.cx(), badge.y, 11.0f * dp, 16.0f * dp, tv_on_surface(),
+                gfx::Align::center, 0.5f * dp);
+        y += 22.0f * dp + 12.0f * dp;
+        for (const std::string &part : h.blurb)
+        {
+            tv_text(list, tv_regular(), part, x, y, kTvHeroBlurb, 21.0f * dp, tv_on_surface().with_alpha(0.75f));
+            y += 21.0f * dp;
+        }
+        list.pop_opacity();
+    }
+    // The text block's height, for centring it with the buttons in the banner.
+    static float tv_hero_block_h(const TvHero &h)
+    {
+        const float dp = kTvDp;
+        const float title = h.title[1].empty() ? 40.0f * dp : 60.0f * dp;
+        return 28.0f * dp + title + 10.0f * dp + 34.0f * dp + static_cast<float>(h.blurb.size()) * 21.0f * dp;
+    }
+
+    void tv_draw_hero_button(gfx::DrawList &list, const Rect &r, int which, bool light, int icon,
+                             const char *label) const
+    {
+        const float dp = kTvDp;
+        const float lift = tv_hero_lift_[which];
+        const Rect grown = scaled(r, 1.0f + 0.06f * lift);
+        const float radius = grown.h * 0.5f;
+        Color ink = tv_on_surface();
+        if (light)
+        {
+            list.rounded_rect(grown, radius, mix(tv_on_surface(), kWhite, lift));
+            ink = tv_inverse_on_surface();
+        }
+        else
+        {
+            list.bordered_rect(grown, radius, mix(kBlack.with_alpha(0.35f), kWhite, lift), 1.5f * dp,
+                               tv_on_surface().with_alpha(0.7f));
+            ink = mix(tv_on_surface(), tv_inverse_on_surface(), lift);
+        }
+        if (lift > 0.01f)
+            list.bordered_rect(grown.inset(-4.0f * dp), radius + 4.0f * dp, kClear, 2.0f * dp,
+                               tv_on_surface().with_alpha(lift));
+        tv_icon(list, icon, grown.x + 20.0f * dp, grown.cy() - 12.0f * dp, 24.0f * dp, ink);
+        tv_text(list, tv_medium(), label, grown.x + 52.0f * dp, grown.cy() - 12.0f * dp, 16.0f * dp, 24.0f * dp, ink,
+                gfx::Align::left, 0.2f * dp);
+    }
+
+    void tv_draw_hero(gfx::DrawList &list) const
+    {
+        if (!tv_hero_shown())
+            return;
+        const float dp = kTvDp;
+        const float view = kHeight - kTvGridTop;
+        Rect b = tv_hero_rect();
+        b.y += kTvGridTop - tv_scroll_.value;
+        if (b.y + b.h < kTvGridTop || b.y > kHeight)
+            return;
+        list.push_clip({-kTvSlide, kTvGridTop, kWidth + kTvSlide, view});
+        if (tv_hero_.empty())
+        {
+            // Loading: the frame of the picture, pulsing as the grid's placeholders do
+            const float pulse = 0.25f + 0.1f * std::sin(clock_ * 3.0f);
+            const Rect frame{b.x + b.w * 0.38f, b.y, b.w * 0.62f, b.h};
+            list.rounded_rect(frame, 16.0f * dp, tv_surface_variant().with_alpha(pulse));
+            list.gradient_rect_h({frame.x - 1.0f, frame.y, frame.w * 0.6f, frame.h}, 0.0f, tv_surface(),
+                                 tv_surface().with_alpha(0.0f));
+            list.pop_clip();
+            return;
+        }
+        const TvHero &now = tv_hero_[static_cast<std::size_t>(tv_hero_index_)];
+        const bool fading = tv_hero_prev_ >= 0 && tv_hero_prev_ < static_cast<int>(tv_hero_.size());
+        const float t = fading ? tv_smooth(tv_hero_fade_) : 1.0f;
+
+        // The pictures: the old one whole, the new one coming in over it.
+        if (fading)
+            tv_draw_hero_picture(list, b, tv_hero_[static_cast<std::size_t>(tv_hero_prev_)], 1.0f);
+        tv_draw_hero_picture(list, b, now, t);
+
+        // The page's colour over the picture's edges: wide on the left and
+        // below, where the text is, a little at the top and on the right.
+        // They follow the picture's own frame (the wider of the two while fading).
+        const Color page = tv_surface();
+        const Color none = page.with_alpha(0.0f);
+        float left = b.x + b.w * 0.38f;
+        for (int i : {tv_hero_index_, fading ? tv_hero_prev_ : -1})
+        {
+            if (i < 0 || tv_hero_[static_cast<std::size_t>(i)].aspect <= 0.0f)
+                continue;
+            Rect frame, uv;
+            tv_hero_frame(b, tv_hero_[static_cast<std::size_t>(i)].aspect, frame, uv);
+            left = i == tv_hero_index_ ? frame.x : std::min(left, frame.x);
+        }
+        const Rect area{left, b.y, b.x + b.w - left + 1.0f, b.h};
+        list.gradient_rect_h({area.x - 2.0f, area.y, area.w * 0.55f, area.h}, 0.0f, page, none);
+        list.gradient_rect_h({area.x, area.y, area.w * 0.8f, area.h}, 0.0f, page.with_alpha(0.55f), none);
+        list.gradient_rect({area.x, area.y + area.h * 0.5f, area.w, area.h * 0.5f + 2.0f}, 0.0f, none, page);
+        list.gradient_rect({area.x, area.y + area.h * 0.78f, area.w, area.h * 0.22f + 2.0f}, 0.0f, none, page);
+        list.gradient_rect({area.x, area.y - 1.0f, area.w, area.h * 0.14f}, 0.0f, page, none);
+        list.gradient_rect_h({area.x + area.w * 0.9f, area.y, area.w * 0.1f + 1.0f, area.h}, 0.0f, none, page);
+
+        // The text, the old slide's leaving in the first half of the fade, the new one's coming in the second.
+        const float x = b.x + 32.0f * dp;
+        const float buttons_h = 44.0f * dp;
+        const auto top_of = [&](const TvHero &h) {
+            return b.y + (b.h - (tv_hero_block_h(h) + 20.0f * dp + buttons_h)) * 0.5f;
+        };
+        if (fading)
+        {
+            const TvHero &old = tv_hero_[static_cast<std::size_t>(tv_hero_prev_)];
+            tv_draw_hero_text(list, x, top_of(old), old, 1.0f - std::min(1.0f, t * 2.0f));
+        }
+        tv_draw_hero_text(list, x, top_of(now), now, fading ? std::max(0.0f, t * 2.0f - 1.0f) : 1.0f);
+
+        // The buttons stay put under the text block's bottom, as the slide changes.
+        const float by = b.y + b.h - (b.h - (tv_hero_block_h(now) + 20.0f * dp + buttons_h)) * 0.5f - buttons_h;
+        const float play_w = tv_medium().measure("Смотреть", 16.0f * dp, 0.2f * dp) + 52.0f * dp + 24.0f * dp;
+        // Signed in, the site's folders are chosen on the title's page
+        auto &app = rezka::App::instance();
+        const bool saved = !app.signed_in() && app.is_favorite(now.item.url);
+        const char *list_label = saved ? "В моём списке" : "Мой список";
+        const float list_w = tv_medium().measure(list_label, 16.0f * dp, 0.2f * dp) + 52.0f * dp + 24.0f * dp;
+        tv_draw_hero_button(list, {x, by, play_w, buttons_h}, 0, true, kTvIconPlayArrow, "Смотреть");
+        tv_draw_hero_button(list, {x + play_w + 16.0f * dp, by, list_w, buttons_h}, 1, false,
+                            saved ? kTvIconCheck : kTvIconAdd, list_label);
+
+        // The dots, the slide shown drawn long.
+        const int count = static_cast<int>(tv_hero_.size());
+        float dx = b.x + b.w - 28.0f * dp;
+        const float dy = b.y + b.h - 24.0f * dp;
+        for (int i = count - 1; i >= 0; --i)
+        {
+            const bool on = i == tv_hero_index_;
+            const float w = on ? 22.0f * dp : 8.0f * dp;
+            dx -= w;
+            list.rounded_rect({dx, dy - 4.0f * dp, w, 8.0f * dp}, 4.0f * dp,
+                              on ? tv_on_surface() : tv_on_surface().with_alpha(0.35f));
+            dx -= 8.0f * dp;
+        }
+        list.pop_clip();
+    }
+
     void tv_draw_home(gfx::DrawList &list) const
     {
         const bool shrink = rezka::App::instance().settings().anim_nav_drawer == 1;
@@ -5055,6 +6189,7 @@ class Store final : public app::Concept
             list.push_transform(1.0f, 0.0f, 0.0f, tv_page_x(), 0.0f);
         tv_draw_tabs(list);
         tv_draw_chips(list);
+        tv_draw_hero(list);
         tv_draw_grid(list);
         list.pop_transform();
         tv_draw_clock(list);
@@ -5277,6 +6412,7 @@ class Store final : public app::Concept
         schedule, // Расписание выхода серий
         links,    // all of a row's links
         image,    // the poster, full screen
+        bookmarks, // the account's folders, the title's checked (signed in)
     };
 
     static constexpr float kDpEdge = 24.0f * kTvDp;  // the column's own padding
@@ -5673,6 +6809,7 @@ class Store final : public app::Concept
 
     void dp_open_dialog(DpDialog dialog, app::Feedback &feedback)
     {
+        dp_bookmarks_asked_ = false;
         dp_dialog_ = dialog;
         dp_dialog_focus_ = 0;
         dp_dialog_scroll_.snap(0.0f);
@@ -5687,6 +6824,7 @@ class Store final : public app::Concept
             return;
         }
         tv_list_title_ = title;
+        tv_results_back_ = SearchBack::home;
         page_open_ = false;
         dp_stack_.clear();
         dp_dialog_ = DpDialog::none;
@@ -5696,7 +6834,11 @@ class Store final : public app::Concept
         tv_scroll_.snap(0.0f);
         tv_cards_.clear();
         home_layout_ = false;
-        rezka::App::instance().list_async([url](rezka::Client &client) { return client.get_list_at(url); }, title);
+        // A list of the site, a page at a time (m8.V.e: the address, /page/N)
+        const bool pages = url.find('?') == std::string::npos;
+        rezka::App::instance().paged_list_async(title, [url, pages](rezka::Client &, int page) {
+            return pages ? rezka::Client::extended_search_path(url, page) : url;
+        });
         feedback.play(audio::Cue::select);
     }
     // Another title's page over this one; Circle comes back.
@@ -5717,7 +6859,8 @@ class Store final : public app::Concept
     void dp_update_dialog(const InputFrame &input, app::Feedback &feedback)
     {
         const PageModel &m = page_model_;
-        if (input.is_pressed(Action::back) || (dp_dialog_ != DpDialog::links && (input.is_pressed(Action::confirm) || input.nav == Direction::left)))
+        const bool listing = dp_dialog_ == DpDialog::links || dp_dialog_ == DpDialog::bookmarks;
+        if (input.is_pressed(Action::back) || (!listing && (input.is_pressed(Action::confirm) || input.nav == Direction::left)))
         {
             dp_dialog_ = DpDialog::none;
             feedback.play(audio::Cue::modal_close);
@@ -5740,6 +6883,41 @@ class Store final : public app::Concept
             if (input.is_pressed(Action::confirm) && dp_dialog_focus_ < count)
                 dp_open_list(dp_link_names(dp_dialog_list_)[static_cast<std::size_t>(dp_dialog_focus_)],
                              dp_link_url(dp_dialog_list_, dp_dialog_focus_), feedback);
+            return;
+        }
+        if (dp_dialog_ == DpDialog::bookmarks)
+        {
+            // A folder pressed is toggled on the site and stays in the list,
+            // its check following the answer, as the app's dialog does.
+            const int count = static_cast<int>(m.bookmarks.size());
+            // A page that gave no folders (still loading, or none on it): the account's own
+            if (count == 0 && m.loaded && !dp_bookmarks_asked_)
+            {
+                dp_bookmarks_asked_ = true;
+                rezka::App::instance().load_bookmark_choices_async(page_item_);
+            }
+            if (input.nav == Direction::up || input.nav == Direction::down)
+            {
+                const int next = dp_dialog_focus_ + (input.nav == Direction::down ? 1 : -1);
+                if (next < 0 || next >= count)
+                    tv_refuse(feedback, input.nav_repeat);
+                else
+                {
+                    dp_dialog_focus_ = next;
+                    tv_tick(feedback, kWidth * 0.5f);
+                }
+            }
+            if (input.is_pressed(Action::confirm))
+            {
+                if (dp_dialog_focus_ < count && !m.bookmarks[static_cast<std::size_t>(dp_dialog_focus_)].pending)
+                {
+                    rezka::App::instance().toggle_bookmark_folder_async(
+                        page_item_, m.bookmarks[static_cast<std::size_t>(dp_dialog_focus_)].id);
+                    feedback.play(audio::Cue::toggle);
+                }
+                else
+                    tv_refuse(feedback, false);
+            }
             return;
         }
         // The other dialogs scroll, 150 px a press as the app's description does
@@ -6041,8 +7219,16 @@ class Store final : public app::Concept
         {
             const Color content = dp_surface(list, r, r.h * 0.5f, lift, 1.1f, kClear, tv_on_surface(), 2.0f * dp,
                                              mix(tv_on_surface_variant().with_alpha(0.4f), tv_on_surface(), lift), 2.0f * dp);
+            bool saved = false;
+            if (m.signed_in)
+            {
+                for (const rezka::BookmarkFolder &f : m.bookmarks)
+                    saved = saved || f.checked;
+            }
+            else
+                saved = rezka::App::instance().is_favorite(m.url);
             const int icon = item.what == DpWhat::qr ? kTvIconQrCode2 : item.what == DpWhat::stats ? kTvIconStackedBarChart
-                             : rezka::App::instance().is_favorite(m.url) ? kTvIconBookmark : kTvIconBookmarkBorder;
+                             : saved ? kTvIconBookmark : kTvIconBookmarkBorder;
             tv_icon(list, icon, r.cx() - 10.0f * dp, r.cy() - 10.0f * dp, 20.0f * dp, content);
             break;
         }
@@ -6456,6 +7642,40 @@ class Store final : public app::Concept
                 tv_text(list, tv_medium(), tv_medium().font->fit(names[static_cast<std::size_t>(i)], 14.0f * dp, r.w - 32.0f * dp),
                         r.x + 16.0f * dp, r.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp, focused ? tv_inverse_on_surface() : tv_on_surface(),
                         gfx::Align::left, 0.1f * dp);
+            }
+            list.pop_clip();
+        }
+        else if (dp_dialog_ == DpDialog::bookmarks)
+        {
+            const std::vector<rezka::BookmarkFolder> &folders = m.bookmarks;
+            const float w = 480.0f * dp;
+            const float item_h = 48.0f * dp;
+            const float rows = std::max(1.0f, static_cast<float>(folders.size()));
+            const float h = std::min(kHeight - 48.0f * dp, (84.0f * dp) + rows * (item_h + 4.0f * dp));
+            const Rect card = dp_card(list, w, h, "Закладки");
+            const Rect view{card.x, card.y + 64.0f * dp, w, h - 80.0f * dp};
+            if (folders.empty())
+                tv_text(list, tv_regular(), "Загрузка…", card.cx(), view.y + 14.0f * dp, 14.0f * dp, 20.0f * dp,
+                        tv_on_surface_variant(), gfx::Align::center);
+            const float focus_y = static_cast<float>(dp_dialog_focus_) * (item_h + 4.0f * dp);
+            const float scroll = std::clamp(focus_y - view.h * 0.4f, 0.0f,
+                                            std::max(0.0f, static_cast<float>(folders.size()) * (item_h + 4.0f * dp) - view.h));
+            list.push_clip(view);
+            for (int i = 0; i < static_cast<int>(folders.size()); ++i)
+            {
+                const rezka::BookmarkFolder &f = folders[static_cast<std::size_t>(i)];
+                const Rect r{card.x + 20.0f * dp, view.y + static_cast<float>(i) * (item_h + 4.0f * dp) - scroll, w - 40.0f * dp, item_h};
+                const bool focused = i == dp_dialog_focus_;
+                if (focused)
+                    list.rounded_rect(r, 8.0f * dp, tv_on_surface());
+                const Color ink = focused ? tv_inverse_on_surface() : tv_on_surface();
+                if (f.pending)
+                    list.arc(r.x + 28.0f * dp, r.cy(), 10.0f * dp, 2.5f * dp, clock_ * 5.0f, 4.4f, ink);
+                else
+                    tv_icon(list, f.checked ? kTvIconCheckBox : kTvIconCheckBoxBlank, r.x + 16.0f * dp, r.cy() - 12.0f * dp,
+                            24.0f * dp, f.checked && !focused ? tv_primary() : ink);
+                tv_text(list, tv_medium(), tv_medium().font->fit(f.name, 14.0f * dp, r.w - 72.0f * dp), r.x + 56.0f * dp,
+                        r.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp, ink, gfx::Align::left, 0.1f * dp);
             }
             list.pop_clip();
         }
@@ -7525,7 +8745,9 @@ class Store final : public app::Concept
                 m.voice_stats = d.voice_stats;
             m.cast = d.people;
                 voices = d.translators;
+                m.bookmarks = d.bookmarks;
             }
+            m.signed_in = app.account.logged_in;
         }
         rezka::ContinueEntry entry;
         if (!m.url.empty() && app.get_continue(m.url, entry))
@@ -7701,7 +8923,11 @@ class Store final : public app::Concept
         toast_age_ = 0.0f;
     }
 
-    // The bookmark: adds the open title to the bookmarks, or takes it out.
+    // The bookmark. Signed in, the app's title screen opens the account's
+    // folders, the title's checked, and a folder chosen puts it in or takes
+    // it out on the site (/ajax/favorites/, add_post): the profile's
+    // "Закладки" are those folders. Without an account the title is kept
+    // in this console's own bookmarks.
     void toggle_bookmark(app::Feedback &feedback)
     {
         if (page_model_.url.empty())
@@ -7709,7 +8935,19 @@ class Store final : public app::Concept
             feedback.play(audio::Cue::error, 1.0f, 0.0f, 0.6f);
             return;
         }
-        const bool on = rezka::App::instance().toggle_favorite(page_model_.url, page_model_.title);
+        auto &app = rezka::App::instance();
+        if (page_model_.signed_in)
+        {
+            if (!page_model_.loaded || page_model_.post_id.empty())
+            {
+                tv_refuse(feedback, false);
+                return;
+            }
+            app.load_bookmark_choices_async(page_item_);
+            dp_open_dialog(DpDialog::bookmarks, feedback);
+            return;
+        }
+        const bool on = app.toggle_favorite(page_model_.url, page_model_.title);
         show_message(on ? "Добавлено в закладки" : "Убрано из закладок");
         feedback.play(audio::Cue::select);
     }
@@ -10138,6 +11376,18 @@ class Store final : public app::Concept
     bool tv_icons_tried_ = false;
 
     std::string tv_list_title_;   // heads a list opened from a title's page
+    // The home banner (App::hero_slides, measured once per change).
+    std::vector<TvHero> tv_hero_;
+    int tv_hero_state_ = 0;         // App::hero_state when last looked at
+    std::uint32_t tv_hero_version_ = 0;
+    std::uint32_t bookmark_error_version_ = 0;
+    bool dp_bookmarks_asked_ = false; // the folders dialog asked for the account's folders
+    int tv_hero_index_ = 0;         // the slide shown
+    int tv_hero_prev_ = -1;         // ... and the one fading out under it
+    float tv_hero_fade_ = 1.0f;     // 0 to 1 over the crossfade
+    float tv_hero_timer_ = 0.0f;    // seconds the slide has been left alone
+    int tv_hero_focus_ = 0;         // 0 Смотреть, 1 Мой список
+    float tv_hero_lift_[2] = {0.0f, 0.0f};
     std::uint32_t tv_youtube_ = 0;
     // The profile
     std::uint32_t tv_ill_[5] = {0, 0, 0, 0, 0}; // tv/ill-*.png, by ProfileIll
@@ -10271,6 +11521,14 @@ class Store final : public app::Concept
 
     // The checkout.
     bool search_open_ = false;
+    bool search_row_del_ = false;          // a history row's delete button has the focus
+    SxScreen sx_screen_ = SxScreen::none;  // Расширенный поиск or the countries, over the search
+    int sx_focus_ = 0;
+    int sx_cat_ = 0, sx_genre_ = 0, sx_year_ = 0; // Расширенный поиск's choices
+    std::string sx_country_query_;
+    tween::Spring sx_scroll_;
+    tween::Spring sx_year_scroll_;
+    SearchBack tv_results_back_ = SearchBack::home; // where Circle takes the list of results
     bool profile_open_ = false;
     // The settings screen
     bool settings_open_ = false;

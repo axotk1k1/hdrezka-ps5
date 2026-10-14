@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <iostream>
 #include <sstream>
 #include <algorithm>
@@ -1315,6 +1316,146 @@ std::vector<CatalogItem> Client::get_catalog(const std::string &category, const 
     return parse_catalog_html(html, category, mirror_);
 }
 
+// The app's rule for a list page: a next page exists when the navigation block
+// is there and its "next" arrow is not the disabled (no-page) one.
+static bool page_has_next(const std::string &html)
+{
+    const bool nav = html.find("b-navigation") != std::string::npos;
+    const size_t next = html.find("b-navigation__next");
+    bool disabled = false;
+    if (next != std::string::npos) {
+        const size_t from = next > 160 ? next - 160 : 0;
+        const size_t no_page = html.rfind("no-page", next);
+        disabled = no_page != std::string::npos && no_page >= from;
+    }
+    return nav && next != std::string::npos && !disabled;
+}
+
+std::vector<CatalogItem> Client::get_list_page(const std::string &path, bool *has_next)
+{
+    const std::string html = http_get(path);
+    if (has_next)
+        *has_next = page_has_next(html);
+    return parse_catalog_html(html, "list", mirror_);
+}
+
+// Percent-encoded, as OkHttp sends the app's addresses.
+static std::string url_escape(const std::string &text)
+{
+    std::string out;
+    if (CURL *curl = curl_easy_init()) {
+        if (char *esc = curl_easy_escape(curl, text.c_str(), static_cast<int>(text.size()))) {
+            out = esc;
+            curl_free(esc);
+        }
+        curl_easy_cleanup(curl);
+    }
+    return out;
+}
+
+std::string Client::search_path(const std::string &query, int page) const
+{
+    std::string path = "/search/?do=search&subaction=search&q=" + url_escape(query);
+    if (page > 1)
+        path += "&page=" + std::to_string(page);
+    return path;
+}
+
+std::string Client::extended_search_path(const std::string &link_part, int page)
+{
+    // The genre's path and the year as they are (m8.e0.a: url + linkPart + /page/N)
+    std::string path = link_part.empty() ? std::string("/") : link_part;
+    if (page > 1) {
+        if (path.back() == '/')
+            path.pop_back();
+        path += "/page/" + std::to_string(page) + "/";
+    }
+    return path;
+}
+
+std::string Client::country_path(const std::string &country, int page) const
+{
+    // N8.g: <mirror>/country/<name with spaces as +>
+    std::string name = url_escape(country);
+    for (size_t at = name.find("%20"); at != std::string::npos; at = name.find("%20", at + 1))
+        name.replace(at, 3, "+");
+    std::string path = "/country/" + name;
+    if (page > 1)
+        path += "/page/" + std::to_string(page) + "/";
+    return path;
+}
+
+// The text of each <option> of the first <select> whose class holds `cls`
+// inside [from, to), with its value.
+static std::vector<std::pair<std::string, std::string>> select_options(const std::string &html, const char *cls,
+                                                                       size_t from, size_t to)
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    const size_t at = find_class(html, cls, from);
+    if (at == std::string::npos || at >= to)
+        return out;
+    const size_t end = std::min(to, html.find("</select>", at));
+    for (size_t opt = html.find("<option", at); opt != std::string::npos && opt < end;
+         opt = html.find("<option", opt + 7)) {
+        const size_t close = html.find('>', opt);
+        if (close == std::string::npos)
+            break;
+        const std::string tag = html.substr(opt, close - opt);
+        std::string text = decode_entities(strip_tags(inner_after(html, opt, "</option>")));
+        while (!text.empty() && (text.back() == ' ' || text.back() == '\n'))
+            text.pop_back();
+        while (!text.empty() && (text.front() == ' ' || text.front() == '\n'))
+            text.erase(0, 1);
+        out.emplace_back(text, attr_of(tag, "value"));
+    }
+    return out;
+}
+
+bool Client::get_search_filters(SearchFilters &out)
+{
+    out = {};
+    const std::string html = http_get("/");
+    if (html.empty())
+        return false;
+    // Each li.b-topnav__item but the "single" ones (the menu's plain links)
+    const std::string mark = "b-topnav__item";
+    for (size_t at = find_class(html, "b-topnav__item"); at != std::string::npos;) {
+        const size_t next = find_class(html, "b-topnav__item", at + mark.size());
+        const size_t end = next == std::string::npos ? std::min(html.size(), at + 60000) : next;
+        const size_t class_open = html.rfind("class=\"", at);
+        const size_t class_close = html.find('"', at);
+        const std::string classes = class_open == std::string::npos || class_close == std::string::npos
+                                        ? std::string()
+                                        : html.substr(class_open, class_close - class_open);
+        if (classes.find("single") == std::string::npos) {
+            SearchCategory category;
+            const size_t link = find_class(html, "b-topnav__item-link", at);
+            if (link != std::string::npos && link < end) {
+                const size_t a = html.rfind("<a", link);
+                if (a != std::string::npos) {
+                    category.url = attr_of(html.substr(a, html.find('>', a) - a), "href");
+                    category.name = decode_entities(strip_tags(inner_after(html, a, "</a>")));
+                }
+            }
+            for (const auto &option : select_options(html, "select-category", at, end)) {
+                SearchGenre genre;
+                genre.name = option.first == "любого жанра" ? "Любой" : option.first;
+                genre.value = option.second;
+                if (!genre.name.empty())
+                    category.genres.push_back(genre);
+            }
+            if (!category.name.empty())
+                out.categories.push_back(category);
+        }
+        at = next;
+    }
+    // The years: the first select.select-year of the page
+    for (const auto &option : select_options(html, "select-year", 0, html.size()))
+        out.years.push_back(option.first == "за все время" ? "Все" : option.first);
+    write_log("[DEBUG] get_search_filters categories=%zu years=%zu\n", out.categories.size(), out.years.size());
+    return !out.categories.empty();
+}
+
 std::vector<CatalogItem> Client::get_movie_list(const std::string &filter, int genre, int page,
                                                 bool *has_next, const std::string &prefix)
 {
@@ -1326,19 +1467,8 @@ std::vector<CatalogItem> Client::get_movie_list(const std::string &filter, int g
         path += "&genre=" + std::to_string(genre);
 
     const std::string html = http_get(path);
-    if (has_next) {
-        // The app's rule: a next page exists when the navigation block is
-        // there and its "next" arrow is not the disabled (no-page) one.
-        const bool nav = html.find("b-navigation") != std::string::npos;
-        const size_t next = html.find("b-navigation__next");
-        bool disabled = false;
-        if (next != std::string::npos) {
-            const size_t from = next > 160 ? next - 160 : 0;
-            const size_t no_page = html.rfind("no-page", next);
-            disabled = no_page != std::string::npos && no_page >= from;
-        }
-        *has_next = nav && next != std::string::npos && !disabled;
-    }
+    if (has_next)
+        *has_next = page_has_next(html);
     return parse_catalog_html(html, "home", mirror_);
 }
 
@@ -1563,6 +1693,90 @@ std::vector<BookmarkFolder> Client::get_bookmark_folders()
         at = next;
     }
     write_log("[DEBUG] get_bookmark_folders -> %zu\n", out.size());
+    return out;
+}
+
+static std::string json_string(const std::string &json, const char *key);
+
+// The site's {"success":false,"message":"..."} answers; an empty answer fails too.
+static bool site_said_yes(const std::string &body, std::string *error)
+{
+    const bool no = body.empty() || body.find("\"success\":false") != std::string::npos;
+    if (no && error) {
+        *error = json_string(body, "message");
+        if (error->empty())
+            *error = body.empty() ? "Нет ответа сервера" : "Сервер отказал";
+    }
+    return !no;
+}
+
+bool Client::add_to_bookmarks(const std::string &post_id, const std::string &cat_id, std::string &error)
+{
+    std::map<std::string, std::string> fields;
+    fields["post_id"] = post_id;
+    fields["cat_id"] = cat_id;
+    fields["action"] = "add_post";
+    const bool ok = site_said_yes(http_post("/ajax/favorites/", fields), &error);
+    write_log("[DEBUG] add_to_bookmarks post=%s cat=%s -> %d %s\n", post_id.c_str(), cat_id.c_str(), (int)ok,
+              error.c_str());
+    return ok;
+}
+
+bool Client::send_save(const std::string &post_id, const std::string &translator_id, const std::string &season,
+                       const std::string &episode)
+{
+    std::map<std::string, std::string> fields;
+    fields["post_id"] = post_id;
+    fields["translator_id"] = translator_id;
+    fields["season"] = season.empty() ? "0" : season;
+    fields["episode"] = episode.empty() ? "0" : episode;
+    fields["current_time"] = "1";
+    const std::string url = "/ajax/send_save/?t=" + std::to_string(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    const bool ok = site_said_yes(http_post(url, fields), nullptr);
+    write_log("[DEBUG] send_save post=%s tr=%s s=%s e=%s -> %d\n", post_id.c_str(), translator_id.c_str(),
+              fields["season"].c_str(), fields["episode"].c_str(), (int)ok);
+    return ok;
+}
+
+// The folders on a title's page, checked where the title is. The page's
+// bookmark menu (signed in only): #user-favorites-list, a row per folder with
+// a checkbox whose value is the folder's cat_id and a label with its name.
+static std::vector<BookmarkFolder> parse_page_bookmarks(const std::string &html)
+{
+    std::vector<BookmarkFolder> out;
+    size_t start = html.find("user-favorites-list");
+    if (start == std::string::npos)
+        start = html.find("b-userset__fav");
+    if (start == std::string::npos)
+        return out;
+    // The menu ends with its "new folder" field, or within a few kilobytes.
+    size_t end = html.find("b-userset__fav_add", start);
+    if (end == std::string::npos || end - start > 40000)
+        end = std::min(html.size(), start + 40000);
+    for (size_t at = html.find("<input", start); at != std::string::npos && at < end;
+         at = html.find("<input", at + 6)) {
+        const size_t close = html.find('>', at);
+        if (close == std::string::npos || close > end)
+            break;
+        const std::string tag = html.substr(at, close - at);
+        if (tag.find("checkbox") == std::string::npos)
+            continue;
+        BookmarkFolder folder;
+        folder.id = attr_of(tag, "data-cat_id");
+        if (folder.id.empty())
+            folder.id = attr_of(tag, "value");
+        if (folder.id.empty() || folder.id.find_first_not_of("0123456789") != std::string::npos)
+            continue;
+        folder.checked = tag.find("checked") != std::string::npos;
+        const size_t label = html.find("<label", close);
+        if (label != std::string::npos && label < end)
+            folder.name = strip_tags(inner_after(html, label, "</label>"));
+        while (!folder.name.empty() && (folder.name.back() == ' ' || folder.name.back() == '\n'))
+            folder.name.pop_back();
+        if (!folder.name.empty())
+            out.push_back(folder);
+    }
     return out;
 }
 
@@ -1990,20 +2204,11 @@ std::vector<CatalogItem> Client::get_person_films(const std::string &person_url)
     return details.movies;
 }
 
-std::vector<CatalogItem> Client::search(const std::string &query)
+std::vector<CatalogItem> Client::search(const std::string &query, int page, bool *has_next)
 {
-    std::string path = "/search/?do=search&subaction=search&q=";
-    CURL *curl = curl_easy_init();
-    if (curl) {
-        char *esc = curl_easy_escape(curl, query.c_str(), (int)query.length());
-        if (esc) {
-            path += esc;
-            curl_free(esc);
-        }
-        curl_easy_cleanup(curl);
-    }
-
-    std::string html = http_get(path);
+    const std::string html = http_get(search_path(query, page));
+    if (has_next)
+        *has_next = page_has_next(html);
     return parse_catalog_html(html, "search", mirror_);
 }
 
@@ -2028,9 +2233,12 @@ std::vector<CatalogItem> Client::search_suggest(const std::string &query)
         if (item.url.find(".html") == std::string::npos)
             continue;
         std::string inner = inner_after(chunk, a, "</a>");
+        // m8.e0.d: span.enty is the title; the <a>'s own text after it is
+        // "(Original, year)", the line under it
+        std::string name;
         const size_t enty = find_class(inner, "enty");
         if (enty != std::string::npos) {
-            item.entity = strip_tags(inner_after(inner, enty, "</span>"));
+            name = decode_entities(strip_tags(inner_after(inner, enty, "</span>")));
             const size_t open = inner.rfind("<span", enty);
             const size_t close = inner.find("</span>", enty);
             if (open != std::string::npos && close != std::string::npos)
@@ -2045,19 +2253,23 @@ std::vector<CatalogItem> Client::search_suggest(const std::string &query)
             if (open != std::string::npos && close != std::string::npos)
                 inner.erase(open, close + 7 - open);
         }
-        item.title = strip_tags(inner);
+        std::string rest = decode_entities(strip_tags(inner));
+        while (!rest.empty() && rest.front() == ' ')
+            rest.erase(0, 1);
+        while (!rest.empty() && rest.back() == ' ')
+            rest.pop_back();
+        item.title = name.empty() ? rest : name;
+        item.info = name.empty() ? std::string() : rest;
         if (item.title.empty())
             continue;
         if (item.url.rfind("http", 0) != 0)
             item.url = mirror_ + (item.url[0] == '/' ? "" : "/") + item.url;
-        // "Name (2021)" or "Name (Original, 2021)": the year is the last number in brackets
-        const size_t open = item.title.rfind('(');
-        if (open != std::string::npos && item.title.back() == ')') {
-            const std::string tail = item.title.substr(open + 1, item.title.size() - open - 2);
+        // "(Original, 2021)" or "(2021)": the year is the last number in brackets
+        const size_t open = rest.rfind('(');
+        if (open != std::string::npos && !rest.empty() && rest.back() == ')') {
+            const std::string tail = rest.substr(open + 1, rest.size() - open - 2);
             const size_t comma = tail.rfind(',');
-            const std::string year = comma == std::string::npos ? tail : tail.substr(comma + 1);
-            item.year = atoi(year.c_str());
-            item.info = strip_tags(year);
+            item.year = atoi((comma == std::string::npos ? tail : tail.substr(comma + 1)).c_str());
         }
         out.push_back(std::move(item));
     }
@@ -2223,6 +2435,7 @@ bool Client::get_details(const std::string &item_url, VideoDetails &out_details)
             }
         }
     }
+    out_details.bookmarks = parse_page_bookmarks(html);
 
     // Check embedded streams in HTML e.g. "streams":"..."
     size_t st_pos = html.find("\"streams\":");

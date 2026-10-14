@@ -172,7 +172,8 @@ public:
     void load_movie_list_more_async();
     int list_tab = 0;
     int list_type = 0;
-    int list_kind = 0;
+    int list_kind = 0;                     // 3: a paged list of paged_list_async
+    std::function<std::string(Client &, int)> list_path; // its pages; guarded by catalog_mutex
     int list_page = 0;                     // pages in movies[]; guarded by catalog_mutex
     bool list_has_next = false;            // guarded by catalog_mutex
     std::atomic<bool> list_more_loading{false};
@@ -180,7 +181,22 @@ public:
     // this is above zero: the poster worker lets them have the connection.
     std::atomic<int> urgent_requests{0};
     std::atomic<int> poster_hint{0};       // the list's posters are fetched from this index on
+    // The full search's results, a page at a time (the app's SearchResult screen).
     void search_async(const std::string &query);
+    // Any of the app's paged lists that are not the home tabs (list_kind 3):
+    // the catalogue is replaced with page 1 of path_of(page), and
+    // load_movie_list_more_async appends the next pages while the site has them.
+    void paged_list_async(const std::string &title, std::function<std::string(Client &, int)> path_of);
+    // "Расширенный поиск": the site's categories, genres and years (search_filters,
+    // guarded by catalog_mutex; filters_state 0 none, 1 loading, 2 loaded, 3 failed),
+    // and the list a choice makes: link_part is the genre's path and the year.
+    SearchFilters search_filters;
+    std::atomic<int> filters_state{0};
+    void load_search_filters_async();
+    void extended_search_async(const std::string &title, const std::string &link_part);
+    // "Поиск фильмов и сериалов по стране": /country/<name>.
+    void country_search_async(const std::string &country);
+    void remove_search_history(const std::string &query);
     // The search box: live suggestions for what is typed (suggest_version
     // counts their changes), and the history of the queries sent.
     std::vector<CatalogItem> search_suggestions; // guarded by catalog_mutex
@@ -219,6 +235,25 @@ public:
     void person_select_career(int career_idx);
     // The next /person/.../page/N/ when the site still has films to give.
     void person_load_more_async();
+    // The home banner: the first ten of "Фильмы — Смотрят сейчас", each filled
+    // in from its page (description, genre, country, the large poster). Its
+    // own thread and texture queue, so the catalogue's list changes do not
+    // drop its pictures. Guarded by catalog_mutex; hero_version counts changes.
+    struct HeroSlide {
+        CatalogItem item; // opens the title's page
+        std::string title;
+        std::string year;
+        std::string genre;
+        std::string country;
+        std::string quality;
+        std::string description;
+        uint32_t texture = 0; // the full cover, once uploaded
+        int tex_w = 0;
+        int tex_h = 0;
+    };
+    std::vector<HeroSlide> hero_slides;
+    std::atomic<uint32_t> hero_version{0};
+    std::atomic<int> hero_state{0}; // 0 not asked yet, 1 loading, 2 loaded, 3 failed
     // Inserts (or finds) a title met on another title's page (its franchise,
     // "Смотрите также") in movies[] so its own page can open; -1 without a url.
     int adopt_catalog_item(const CatalogItem &item);
@@ -254,9 +289,25 @@ public:
     std::vector<WatchLaterItem> watch_later;
     std::vector<BookmarkFolder> bookmark_folders;
     std::atomic<bool> account_lists_loading{false};
+    std::atomic<bool> account_lists_again{false};
     std::atomic<uint32_t> account_version{0};
     void load_account_lists_async();
     void remove_watch_later_async(const std::string &id);
+    // A title's bookmark folders, as the app's title screen has them: the
+    // page's own list (movies[i].details.bookmarks, checked where the title
+    // is), or the account's folders when the page gave none. Signed in only.
+    void load_bookmark_choices_async(int movie_idx);
+    // Puts the title in the folder or takes it out (the site toggles it); the
+    // folder shows pending until the site answers, then flips, and the
+    // profile's lists are asked for again. bookmark_error is the site's
+    // refusal, for the screen to show once (bookmark_error_version counts them).
+    void toggle_bookmark_folder_async(int movie_idx, const std::string &cat_id);
+    std::atomic<bool> bookmark_choices_loading_{false};
+    std::string bookmark_error; // guarded by catalog_mutex
+    std::atomic<uint32_t> bookmark_error_version{0};
+    // Whether the site's account is signed in (the app's own bookmarks and
+    // "Досмотреть" are the site's then).
+    bool signed_in();
     void stop_playback();
     void save_continue_progress();
     bool get_continue(const std::string &url, ContinueEntry &out);
@@ -337,6 +388,19 @@ private:
 
     BigThread worker_thread_;
     std::atomic<bool> stop_worker_{false};
+    // The banner's loader (see hero_slides) and its decoded pictures.
+    struct HeroPending {
+        int index = 0;
+        std::string url; // the slide's page, still the same one when it lands
+        int width = 0;
+        int height = 0;
+        std::vector<uint8_t> rgba;
+    };
+    std::vector<HeroPending> hero_pending_; // guarded by pending_mutex
+    BigThread hero_thread_;
+    std::atomic<bool> stop_hero_{false};
+    float hero_retry_ = 0.0f; // seconds until a failed banner is asked for again
+    void load_hero_async();
     bool network_started_ = false;
     void init_defaults();
 };
