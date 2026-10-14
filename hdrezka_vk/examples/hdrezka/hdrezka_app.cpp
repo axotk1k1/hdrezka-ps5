@@ -95,6 +95,13 @@ void App::init(vks::VulkanDevice *dev, VkQueue q, hui::gfx::VkRenderer *rend, hu
     }
 
     player.set_audio_ring(&audio_ring);
+    {
+        const std::string path = data_file_path(client.get_cookie_file(), "settings.cfg");
+        std::lock_guard<std::mutex> lock(settings_mutex_);
+        const bool loaded = settings_.load(path);
+        write_log("[DEBUG] settings %s %s\n", loaded ? "loaded from" : "default, no", path.c_str());
+    }
+    apply_settings();
     load_continue_map();
     load_favorites();
     load_search_history();
@@ -581,7 +588,8 @@ void App::load_movie_list_async(int tab, int type, int kind)
         std::vector<MovieData> new_movies;
         new_movies.reserve(items.size());
         for (const auto &it : items)
-            new_movies.push_back(movie_from_catalog(it, ""));
+            if (!hidden_by_filter(it.info))
+                new_movies.push_back(movie_from_catalog(it, ""));
         {
             std::lock_guard<std::mutex> lock(catalog_mutex);
             movies = std::move(new_movies);
@@ -626,7 +634,7 @@ void App::load_movie_list_more_async()
             for (const auto &m : movies)
                 known.insert(m.url);
             for (const auto &it : items) {
-                if (known.insert(it.url).second)
+                if (known.insert(it.url).second && !hidden_by_filter(it.info))
                     movies.push_back(movie_from_catalog(it, ""));
             }
             list_page = page;
@@ -1863,7 +1871,8 @@ void App::play_title_async(int movie_idx, int translator_idx, int quality_idx, i
         write_log("[DEBUG] play_title_async before get_streams id=%s tr=%s s=%s e=%s is_series=%d wanted=%s\n",
                   det.id.c_str(), tr_id.c_str(), s_id.c_str(), e_id.c_str(), (int)det.is_series,
                   wanted_quality.c_str());
-        auto streams = client.get_streams(det, tr_id, s_id, e_id);
+        std::vector<SubtitleTrack> subtitles;
+        auto streams = client.get_streams(det, tr_id, s_id, e_id, &subtitles);
         write_log("[DEBUG] play_title_async after get_streams count=%zu\n", streams.size());
         if (play_serial_.load() != serial)
             return;
@@ -1894,6 +1903,13 @@ void App::play_title_async(int movie_idx, int translator_idx, int quality_idx, i
             playing_quality_idx = best;
             playing_season_idx = season_idx;
             playing_episode_idx = episode_idx;
+            {
+                std::lock_guard<std::mutex> lock(catalog_mutex);
+                playing_subtitles = subtitles;
+                subtitle_idx = -1;
+                subtitle_cues.clear();
+                subtitle_version++;
+            }
             write_log("[DEBUG] play_title_async chosen best=%d quality=%s wanted=%s url=%s\n",
                       best, pending_play_quality_.c_str(), wanted_quality.c_str(), pending_play_url_.c_str());
         }
@@ -1950,6 +1966,13 @@ void App::play_stream(const std::string &title, const std::string &voice, const 
     playing_quality = quality;
     playing_url = item_url;
 
+    {
+        const AppSettings &s = settings_;
+        const int mb = kStreamBufferSizeMb[std::clamp(s.stream_buffer_size, 0, 6)];
+        player.set_buffer_limits(kBufferDurationSeconds[std::clamp(s.buffer_duration, 0, 5)],
+                                 mb > 0 ? static_cast<std::size_t>(mb) << 20 : 0);
+        player.set_speed(kPlaySpeeds[std::clamp(s.play_speed, 0, 7)]);
+    }
     write_log("[DEBUG] play_stream calling player.open(%s) seek=%.1f\n", url.c_str(), seek_to);
     is_buffering = true;
     if (player.open(url, seek_to)) {
@@ -2144,4 +2167,206 @@ void App::update(float dt)
         }
     }
 }
+// ---- the settings screen's preferences ------------------------------------
+
+AppSettings App::settings_snapshot()
+{
+    std::lock_guard<std::mutex> lock(settings_mutex_);
+    return settings_;
+}
+
+void App::update_settings(const AppSettings &next)
+{
+    {
+        std::lock_guard<std::mutex> lock(settings_mutex_);
+        settings_ = next;
+        const std::string path = data_file_path(client.get_cookie_file(), "settings.cfg");
+        if (!settings_.save(path))
+            write_log("[DEBUG] settings: cannot write %s\n", path.c_str());
+    }
+    apply_settings();
+}
+
+void App::apply_settings()
+{
+    const AppSettings s = settings_snapshot();
+    client.set_preferred_mirror(s.mirror());
+    Client::set_ssl_bypass(s.bypass_ssl);
+    if (player.is_open())
+        player.set_speed(kPlaySpeeds[std::clamp(s.play_speed, 0, 7)]);
+}
+
+bool App::hidden_by_filter(const std::string &info)
+{
+    std::lock_guard<std::mutex> lock(settings_mutex_);
+    if (settings_.country_filter.empty())
+        return false;
+    // "2024, США, Великобритания, Боевики": every part is looked up
+    std::size_t at = 0;
+    while (at < info.size()) {
+        std::size_t comma = info.find(',', at);
+        if (comma == std::string::npos)
+            comma = info.size();
+        std::size_t b = at, e = comma;
+        while (b < e && info[b] == ' ')
+            ++b;
+        while (e > b && info[e - 1] == ' ')
+            --e;
+        if (e > b && settings_.country_filter.count(info.substr(b, e - b)))
+            return true;
+        at = comma + 1;
+    }
+    return false;
+}
+
+void App::check_mirror_async(const std::string &mirror)
+{
+    if (mirror_check.exchange(1) == 1)
+        return;
+    BigThread([this, mirror]() {
+        UrgentRequest urgent(urgent_requests);
+        const bool ok = mirror.empty() ? client.pick_mirror() : client.check_mirror(mirror);
+        mirror_check = ok ? 2 : 3;
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        catalog_version++;
+    }).detach();
+}
+
+namespace
+{
+// "00:01:02.500" or "01:02.500" in seconds; -1 when it is not a time.
+double vtt_time(const std::string &s)
+{
+    double parts[3] = {0, 0, 0};
+    int n = 0;
+    std::size_t at = 0;
+    while (at < s.size() && n < 3) {
+        char *end = nullptr;
+        const double v = std::strtod(s.c_str() + at, &end);
+        if (end == s.c_str() + at)
+            return -1.0;
+        parts[n++] = v;
+        at = static_cast<std::size_t>(end - s.c_str());
+        if (at < s.size() && s[at] == ':')
+            ++at;
+        else
+            break;
+    }
+    if (n == 3)
+        return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (n == 2)
+        return parts[0] * 60 + parts[1];
+    return -1.0;
+}
+
+std::vector<SubtitleCue> parse_vtt(const std::string &text)
+{
+    std::vector<SubtitleCue> cues;
+    std::size_t at = 0;
+    SubtitleCue *open = nullptr;
+    while (at <= text.size()) {
+        std::size_t nl = text.find('\n', at);
+        if (nl == std::string::npos)
+            nl = text.size();
+        std::string line = text.substr(at, nl - at);
+        at = nl + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        const std::size_t arrow = line.find("-->");
+        if (arrow != std::string::npos) {
+            SubtitleCue cue;
+            cue.start = vtt_time(line.substr(0, arrow));
+            std::string rest = line.substr(arrow + 3);
+            while (!rest.empty() && rest.front() == ' ')
+                rest.erase(0, 1);
+            cue.end = vtt_time(rest.substr(0, rest.find(' ')));
+            if (cue.start >= 0.0 && cue.end > cue.start) {
+                cues.push_back(cue);
+                open = &cues.back();
+            } else
+                open = nullptr;
+            continue;
+        }
+        if (line.empty()) {
+            open = nullptr;
+            continue;
+        }
+        if (!open)
+            continue;
+        // Tags (<i>, <b>, <c.color>) and entities out
+        std::string clean;
+        for (std::size_t i = 0; i < line.size(); ++i) {
+            if (line[i] == '<') {
+                const std::size_t close = line.find('>', i);
+                if (close != std::string::npos) {
+                    i = close;
+                    continue;
+                }
+            }
+            clean += line[i];
+        }
+        for (const auto &[from, to] : {std::pair<const char *, const char *>{"&amp;", "&"}, {"&lt;", "<"},
+                                       {"&gt;", ">"}, {"&nbsp;", " "}, {"&quot;", "\""}}) {
+            std::size_t p = 0;
+            while ((p = clean.find(from, p)) != std::string::npos) {
+                clean.replace(p, std::strlen(from), to);
+                p += std::strlen(to);
+            }
+        }
+        if (!open->text.empty())
+            open->text += '\n';
+        open->text += clean;
+    }
+    std::stable_sort(cues.begin(), cues.end(),
+                     [](const SubtitleCue &a, const SubtitleCue &b) { return a.start < b.start; });
+    return cues;
+}
+} // namespace
+
+void App::select_subtitle_async(int idx)
+{
+    std::string url;
+    {
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        subtitle_idx = (idx >= 0 && idx < static_cast<int>(playing_subtitles.size())) ? idx : -1;
+        subtitle_cues.clear();
+        subtitle_version++;
+        if (subtitle_idx < 0)
+            return;
+        url = playing_subtitles[static_cast<std::size_t>(subtitle_idx)].url;
+    }
+    const int wanted = subtitle_idx;
+    BigThread([this, url, wanted]() {
+        std::vector<uint8_t> bytes;
+        const bool ok = client.http_get_binary(url, bytes);
+        std::vector<SubtitleCue> cues = ok ? parse_vtt(std::string(bytes.begin(), bytes.end()))
+                                           : std::vector<SubtitleCue>{};
+        write_log("[DEBUG] subtitles %s: %s, %zu cues\n", url.c_str(), ok ? "loaded" : "failed", cues.size());
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        if (subtitle_idx != wanted)
+            return;
+        subtitle_cues = std::move(cues);
+        subtitle_version++;
+    }).detach();
+}
+
+std::string App::subtitle_at(double t)
+{
+    std::lock_guard<std::mutex> lock(catalog_mutex);
+    if (subtitle_idx < 0 || subtitle_cues.empty())
+        return {};
+    // The last cue that has started
+    auto it = std::upper_bound(subtitle_cues.begin(), subtitle_cues.end(), t,
+                               [](double v, const SubtitleCue &c) { return v < c.start; });
+    std::string text;
+    for (auto back = it; back != subtitle_cues.begin();) {
+        --back;
+        if (back->end > t)
+            text = back->text + (text.empty() ? "" : "\n" + text);
+        if (t - back->start > 30.0)
+            break;
+    }
+    return text;
+}
+
 } // namespace rezka

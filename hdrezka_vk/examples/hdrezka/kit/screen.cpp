@@ -604,6 +604,7 @@ class Store final : public app::Concept
         kPlPrevious,
         kPlPlay,
         kPlNext,
+        kPlSubtitles,
         kPlQuality,
     };
     static std::string pl_time(double seconds)
@@ -670,6 +671,19 @@ class Store final : public app::Concept
                 names.push_back(q.quality);
         return names;
     }
+    // The stream's subtitle tracks: "Выкл." then each language.
+    std::vector<std::string> pl_subtitles() const
+    {
+        std::vector<std::string> names;
+        auto &app = rezka::App::instance();
+        std::lock_guard<std::mutex> lock(app.catalog_mutex);
+        if (app.playing_subtitles.empty())
+            return names;
+        names.push_back("Выкл.");
+        for (const rezka::SubtitleTrack &t : app.playing_subtitles)
+            names.push_back(t.label);
+        return names;
+    }
     // The buttons the row has now, left to right.
     std::vector<int> pl_buttons() const
     {
@@ -680,6 +694,8 @@ class Store final : public app::Concept
         row.push_back(kPlPlay);
         if (pl_episode(1, s, e))
             row.push_back(kPlNext);
+        if (!pl_subtitles().empty())
+            row.push_back(kPlSubtitles);
         if (pl_qualities().size() > 1)
             row.push_back(kPlQuality);
         return row;
@@ -739,10 +755,54 @@ class Store final : public app::Concept
             pl_controls_ = true;
             pl_timer_ = 4.0f;
             pl_quality_open_ = false;
+            pl_sub_open_ = false;
             return;
         }
         const double position = app.player.get_position();
         const double duration = app.player.get_duration();
+
+        // The end of the file: "Автоматически включать следующую серию", else back to the page
+        if (app.player.is_finished())
+        {
+            int season = 0, episode = 0;
+            if (app.settings().auto_next_episode && pl_episode(1, season, episode))
+                pl_step_episode(1, feedback);
+            else
+            {
+                app.stop_playback();
+                feedback.play(audio::Cue::back);
+            }
+            return;
+        }
+
+        if (pl_sub_open_)
+        {
+            const std::vector<std::string> names = pl_subtitles();
+            const int count = static_cast<int>(names.size());
+            if (input.is_pressed(Action::back) || input.nav == Direction::left)
+            {
+                pl_sub_open_ = false;
+                feedback.play(audio::Cue::modal_close);
+            }
+            else if (input.nav == Direction::up || input.nav == Direction::down)
+            {
+                const int next = pl_sub_focus_ + (input.nav == Direction::down ? 1 : -1);
+                if (next < 0 || next >= count)
+                    tv_refuse(feedback, input.nav_repeat);
+                else
+                {
+                    pl_sub_focus_ = next;
+                    tv_tick(feedback, kWidth * 0.8f);
+                }
+            }
+            else if (input.is_pressed(Action::confirm) && pl_sub_focus_ < count)
+            {
+                pl_sub_open_ = false;
+                feedback.play(audio::Cue::select);
+                app.select_subtitle_async(pl_sub_focus_ - 1);
+            }
+            return;
+        }
 
         if (pl_quality_open_)
         {
@@ -809,11 +869,13 @@ class Store final : public app::Concept
             }
             else if (input.nav == Direction::left || input.nav == Direction::right)
             {
-                // The app's default step, ten seconds either way
+                // "Шаг быстрой перемотки" вперед и назад, ten seconds by default
                 const int dir = input.nav == Direction::left ? -1 : 1;
-                seek_player_to(app, position + 10.0 * dir);
+                const int step = dir < 0 ? app.settings().step_replay : app.settings().step_forward;
+                seek_player_to(app, position + static_cast<double>(step * dir));
                 pl_flash(dir < 0 ? kTvIconFastRewind : kTvIconFastForward,
-                         std::string(dir < 0 ? "-" : "+") + "10 сек. (" + pl_time(seek_cursor_) + ")", dir);
+                         std::string(dir < 0 ? "-" : "+") + std::to_string(step) + " сек. (" + pl_time(seek_cursor_) + ")",
+                         dir);
             }
             else if (input.nav == Direction::up || input.nav == Direction::down)
                 pl_show(true);
@@ -889,6 +951,15 @@ class Store final : public app::Concept
             case kPlNext:
                 pl_step_episode(1, feedback);
                 break;
+            case kPlSubtitles:
+            {
+                pl_controls_ = false;
+                pl_sub_open_ = true;
+                std::lock_guard<std::mutex> lock(app.catalog_mutex);
+                pl_sub_focus_ = app.subtitle_idx + 1;
+                feedback.play(audio::Cue::modal_open);
+                break;
+            }
             case kPlQuality:
                 pl_controls_ = false;
                 pl_quality_open_ = true;
@@ -900,6 +971,49 @@ class Store final : public app::Concept
                 feedback.play(audio::Cue::toggle);
                 break;
             }
+        }
+    }
+
+    // The cue playing, as the settings' "Субтитры" place and size it: white
+    // lines on a half black plate, inside the picture, 24 dp from its edges.
+    void pl_draw_subtitle(gfx::DrawList &list, const Rect &picture) const
+    {
+        auto &app = rezka::App::instance();
+        const std::string text = app.subtitle_at(app.player.get_position());
+        if (text.empty())
+            return;
+        const float dp = kTvDp;
+        const rezka::AppSettings &s = app.settings();
+        const float size = static_cast<float>(rezka::kSubtitleFontSp[std::clamp(s.subtitle_font_size, 0, 3)]) * dp;
+        const float line_h = size * 1.3f;
+        const int arrangement = std::clamp(s.subtitle_arrangement, 0, 5);
+        const bool top = arrangement < 3;
+        const int side = arrangement % 3; // 0 centre, 1 start, 2 end
+        const float margin = 24.0f * dp;
+        const float max_w = picture.w * 0.8f;
+        std::vector<std::string> lines;
+        std::size_t at = 0;
+        while (at <= text.size())
+        {
+            std::size_t nl = text.find('\n', at);
+            if (nl == std::string::npos)
+                nl = text.size();
+            for (std::string &part : tv_medium().font->wrap(text.substr(at, nl - at), size, max_w))
+                lines.push_back(std::move(part));
+            at = nl + 1;
+        }
+        const float block_h = static_cast<float>(lines.size()) * line_h;
+        float y = top ? picture.y + margin : picture.y + picture.h - margin - block_h;
+        // Clear of the controls while they are up
+        if (!top && pl_in_.value > 0.01f)
+            y -= pl_in_.value * 150.0f * dp;
+        for (const std::string &line : lines)
+        {
+            const float w = tv_medium().measure(line, size, 0.0f);
+            const float x = side == 0 ? picture.cx() - w * 0.5f : side == 1 ? picture.x + margin : picture.x + picture.w - margin - w;
+            list.rounded_rect({x - 8.0f * dp, y, w + 16.0f * dp, line_h}, 4.0f * dp, kBlack.with_alpha(0.55f));
+            tv_text(list, tv_medium(), line, x, y, size, line_h, kWhite);
+            y += line_h;
         }
     }
 
@@ -942,6 +1056,7 @@ class Store final : public app::Concept
             picture = {(kWidth - dw) * 0.5f, (kHeight - dh) * 0.5f, dw, dh};
         }
         frame.scene.image(app.video_texture.hui_handle, picture, gfx::kFullUv, kWhite, 0.0f);
+        pl_draw_subtitle(frame.scene, picture);
 
         const float shown = pl_in_.value;
         if (shown > 0.01f)
@@ -977,7 +1092,21 @@ class Store final : public app::Concept
             const float h = (4.0f + 6.0f * pl_bar_.value) * dp;
             const Rect bar{left + now_w + 4.0f * dp, seek_y + 12.0f * dp - h * 0.5f, right - total_w - left - now_w - 8.0f * dp, h};
             list.rounded_rect(bar, h * 0.5f, tv_on_surface().with_alpha(0.2f));
-            if (fraction > 0.001f)
+            if (fraction > 0.001f && app.settings().rainbow_progress)
+            {
+                // "Радужная полоса прогресса": the spectrum along the whole line, shown as far as played
+                static const Color kRainbow[] = {Color::rgb(0xff5252), Color::rgb(0xffab40), Color::rgb(0xffff00),
+                                                 Color::rgb(0x69f0ae), Color::rgb(0x40c4ff), Color::rgb(0x7c4dff),
+                                                 Color::rgb(0xe040fb)};
+                const float played_w = bar.w * fraction;
+                list.push_clip({bar.x, bar.y - 1.0f, played_w, bar.h + 2.0f});
+                const float seg = bar.w / 6.0f;
+                for (int i = 0; i < 6; ++i)
+                    list.gradient_rect_h({bar.x + seg * static_cast<float>(i) - (i ? 1.0f : 0.0f), bar.y, seg + (i ? 1.0f : 0.0f), bar.h},
+                                         (i == 0 || i == 5) ? h * 0.5f : 0.0f, kRainbow[i], kRainbow[i + 1]);
+                list.pop_clip();
+            }
+            else if (fraction > 0.001f)
                 list.gradient_rect_h({bar.x, bar.y, bar.w * fraction, bar.h}, h * 0.5f, tv_primary(), tv_inverse_primary());
             if (pl_bar_.value > 0.05f)
                 list.circle(bar.x + bar.w * fraction, bar.cy(), 1.05f * h * pl_bar_.value, tv_primary());
@@ -986,14 +1115,19 @@ class Store final : public app::Concept
             float x = left;
             for (const int button : row)
             {
-                const bool trailing = button == kPlQuality;
-                const float bx = trailing ? right - 40.0f * dp : x;
+                // The quality keeps the right edge, the subtitles stand left of it
+                const bool trailing = button == kPlQuality || button == kPlSubtitles;
+                const bool has_quality = std::find(row.begin(), row.end(), kPlQuality) != row.end();
+                const float bx = button == kPlQuality ? right - 40.0f * dp
+                                 : button == kPlSubtitles ? right - (has_quality ? 92.0f : 40.0f) * dp
+                                                          : x;
                 if (!trailing)
                     x += 52.0f * dp;
                 const bool focused = !pl_scrub_ && pl_controls_ && button == pl_focus_;
                 const Rect r = scaled({bx, buttons_y, 40.0f * dp, 40.0f * dp}, focused ? 1.2f : 1.0f);
                 list.circle(r.cx(), r.cy(), r.w * 0.5f, focused ? tv_on_surface() : tv_on_surface().with_alpha(0.2f));
                 const int icon = button == kPlPrevious ? kTvIconSkipPrevious : button == kPlNext ? kTvIconSkipNext
+                                 : button == kPlSubtitles ? kTvIconSubtitles
                                  : button == kPlQuality ? kTvIconHighQuality : app.player.is_playing() ? kTvIconPause : kTvIconPlayArrow;
                 const float size = 24.0f * dp * (focused ? 1.2f : 1.0f);
                 tv_icon(list, icon, r.cx() - size * 0.5f, r.cy() - size * 0.5f, size, focused ? tv_inverse_on_surface() : tv_on_surface());
@@ -1023,6 +1157,33 @@ class Store final : public app::Concept
                         gfx::Align::left, 0.5f * dp);
             }
             list.pop_opacity();
+        }
+
+        if (pl_sub_open_)
+        {
+            const std::vector<std::string> names = pl_subtitles();
+            int chosen = -1;
+            {
+                std::lock_guard<std::mutex> lock(app.catalog_mutex);
+                chosen = app.subtitle_idx + 1;
+            }
+            const float w = 320.0f * dp;
+            const float h = std::min(kHeight - 48.0f * dp, (20.0f + 28.0f + 16.0f + 20.0f) * dp + static_cast<float>(names.size()) * 52.0f * dp);
+            const Rect card{kWidth - 24.0f * dp - w, (kHeight - h) * 0.5f, w, h};
+            list.bordered_rect(card, 28.0f * dp, tv_surface().with_alpha(0.5f), 1.0f * dp, tv_border_variant().with_alpha(0.5f));
+            tv_text(list, tv_regular(), "Субтитры", card.cx(), card.y + 20.0f * dp, 22.0f * dp, 28.0f * dp, tv_on_surface(), gfx::Align::center);
+            for (int i = 0; i < static_cast<int>(names.size()); ++i)
+            {
+                const Rect r{card.x + 20.0f * dp, card.y + 64.0f * dp + static_cast<float>(i) * 52.0f * dp, w - 40.0f * dp, 48.0f * dp};
+                const bool focused = i == pl_sub_focus_;
+                if (focused)
+                    list.rounded_rect(r, 8.0f * dp, tv_on_surface());
+                const Color content = focused ? tv_inverse_on_surface() : tv_on_surface();
+                tv_text(list, tv_medium(), names[static_cast<std::size_t>(i)], r.x + 16.0f * dp, r.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp, content,
+                        gfx::Align::left, 0.1f * dp);
+                if (i == chosen)
+                    tv_icon(list, kTvIconCheck, r.x + r.w - 32.0f * dp, r.cy() - 8.0f * dp, 16.0f * dp, content);
+            }
         }
 
         if (pl_quality_open_)
@@ -1128,6 +1289,8 @@ class Store final : public app::Concept
         // The topmost layer takes the input; the layers under it only animate.
         else if (search_open_)
             update_search(input, dt, feedback);
+        else if (settings_open_)
+            update_settings(input, dt, feedback);
         else if (profile_open_)
             update_profile(input, feedback);
         else if (person_open_)
@@ -1188,6 +1351,7 @@ class Store final : public app::Concept
         draw_qr(overlay);
         draw_search(overlay);
         draw_profile(overlay);
+        draw_settings(overlay);
         wd_draw(overlay);
         draw_toast(overlay, frame.glass_texture);
     }
@@ -3148,15 +3312,22 @@ class Store final : public app::Concept
     static constexpr float kTvGridTop = 136.0f * kTvDp;    // the grid's viewport starts here
     static constexpr float kTvGridPad = 24.0f * kTvDp;     // its content padding, top and bottom
     static constexpr float kTvGap = 12.0f * kTvDp;
-    static constexpr int kTvColumns = 7;                   // the app's default "Столбцы в списках"
-    static constexpr float kTvCardW =
-        (kWidth - kTvRail - 2.0f * kTvPad - (kTvColumns - 1) * kTvGap) / kTvColumns;
-    static constexpr float kTvCoverH = kTvCardW * 1.5f;
     static constexpr float kTvTitleSize = 14.0f * kTvDp;
     static constexpr float kTvSubSize = 12.0f * kTvDp;
-    static constexpr float kTvCardH =
-        kTvCoverH + 12.0f * kTvDp + 2.0f * kTvTitleSize + 4.0f * kTvDp + 2.0f * kTvSubSize;
-    static constexpr float kTvRowPitch = kTvCardH + kTvGap;
+    // "Столбцы в списках" (5 to 9, the app's default 7) sets the grid.
+    static int tv_columns() { return std::clamp(rezka::App::instance().settings().columns, 5, 9); }
+    static float tv_card_w()
+    {
+        const int columns = tv_columns();
+        return (kWidth - kTvRail - 2.0f * kTvPad - static_cast<float>(columns - 1) * kTvGap) /
+               static_cast<float>(columns);
+    }
+    static float tv_cover_h() { return tv_card_w() * 1.5f; }
+    static float tv_card_h()
+    {
+        return tv_cover_h() + 12.0f * kTvDp + 2.0f * kTvTitleSize + 4.0f * kTvDp + 2.0f * kTvSubSize;
+    }
+    static float tv_row_pitch() { return tv_card_h() + kTvGap; }
     static constexpr int kTvDrawerItems = 7;
     static constexpr int kTvHomeItem = 2;
     static constexpr int kTvTabs = 3;
@@ -3170,7 +3341,11 @@ class Store final : public app::Concept
                                                             "Мультфильмы", "Аниме"};
 
     // The app's dark colour scheme (q9.a in the APK), by Material role.
-    static Color tv_surface() { return Color::rgb(0x191c1e); }
+    // "Черная тема" turns the surface black, as the app does for OLED screens.
+    static Color tv_surface()
+    {
+        return rezka::App::instance().settings().black_mode ? Color::rgb(0x000000) : Color::rgb(0x191c1e);
+    }
     static Color tv_on_surface() { return Color::rgb(0xe1e2e5); }
     static Color tv_surface_variant() { return Color::rgb(0x40484c); }
     static Color tv_on_surface_variant() { return Color::rgb(0xc0c7cd); }
@@ -3278,8 +3453,8 @@ class Store final : public app::Concept
             else
             {
                 card.url = m.url;
-                tv_two_lines(*tv_medium().font, m.title, kTvTitleSize, kTvCardW, card.title);
-                tv_two_lines(*tv_regular().font, m.info, kTvSubSize, kTvCardW, card.sub);
+                tv_two_lines(*tv_medium().font, m.title, kTvTitleSize, tv_card_w(), card.title);
+                tv_two_lines(*tv_regular().font, m.info, kTvSubSize, tv_card_w(), card.sub);
             }
             card.texture = m.texture_ready ? m.texture_id : 0;
         }
@@ -3364,6 +3539,33 @@ class Store final : public app::Concept
         kTvIconFullscreen,
         kTvIconFastRewind,
         kTvIconFastForward,
+        // The settings screen's (Outlined, as the app's preferences)
+        kTvIconPalette,
+        kTvIconNightlight,
+        kTvIconViewColumn,
+        kTvIconThumbUp,
+        kTvIconColorLens,
+        kTvIconAnimation,
+        kTvIconLanguage,
+        kTvIconLockOpen,
+        kTvIconDoNotDisturbOn,
+        kTvIconPlayCircle,
+        kTvIconForward10,
+        kTvIconReplay10,
+        kTvIconCached,
+        kTvIconDownloading,
+        kTvIconReplay,
+        kTvIconTextFields,
+        kTvIconTranslate,
+        kTvIconBrowserUpdated,
+        kTvIconCoffee,
+        kTvIconRadioChecked,
+        kTvIconRadioUnchecked,
+        kTvIconCheckBox,
+        kTvIconCheckBoxBlank,
+        kTvIconRemove,
+        kTvIconAdd,
+        kTvIconSend,
         kTvIconCount,
     };
     void tv_icon(gfx::DrawList &list, int icon, float x, float y, float size, Color color) const
@@ -3375,11 +3577,823 @@ class Store final : public app::Concept
                    color);
     }
 
+    // ---- the settings: HDrezkaTV's Settings screen ---------------------------
+    //
+    // "Настройки" over two equal columns (P8 and R8 in the APK): on the left
+    // the groups, Внешний вид, Подключение и предпочтения, Плеер, Субтитры and
+    // О приложении; the one with the focus shows its preferences on the right.
+    // A switch flips with Cross, a list opens its side sheet of choices on the
+    // right edge, a number (columns, the seek steps) is changed with left and
+    // right once Cross has taken it. Everything is kept at once
+    // (App::update_settings, data/settings.cfg).
+
+    enum StKind : int
+    {
+        kStSwitch,
+        kStList,
+        kStRange,
+        kStMulti,
+    };
+    enum StPref : int
+    {
+        kStBlack,
+        kStColumns,
+        kStVoices,
+        kStRecommendations,
+        kStClock,
+        kStRainbow,
+        kStAnimDrawer,
+        kStSource,
+        kStSsl,
+        kStCountries,
+        kStQuality,
+        kStAutoNext,
+        kStStepForward,
+        kStStepReplay,
+        kStSpeed,
+        kStBufferSize,
+        kStBufferDuration,
+        kStBackBuffer,
+        kStSubtitlePlace,
+        kStSubtitleSize,
+    };
+    struct StDef
+    {
+        StPref key;
+        StKind kind;
+        const char *title;
+        const char *summary; // a switch's line, or the line under a list's sheet title
+        int icon;
+    };
+    struct StGroup
+    {
+        const char *title;
+        int icon;
+        const StDef *items;
+        int count;
+    };
+    static constexpr StDef kStStyle[] = {
+        {kStBlack, kStSwitch, "Черная тема", "Лучше подходит для OLED-дисплеев", kTvIconNightlight},
+        {kStColumns, kStRange, "Столбцы в списках", nullptr, kTvIconViewColumn},
+        {kStVoices, kStSwitch, "Показывать количество голосов", "Рядом с рейтингом будет показано количество голосов",
+         kTvIconStarRate},
+        {kStRecommendations, kStSwitch, "Рекомендации", "Показывать похожие фильмы внизу страницы", kTvIconThumbUp},
+        {kStClock, kStSwitch, "Часы", "Показывать часы и дату на некоторых экранах", kTvIconAccessTime},
+        {kStRainbow, kStSwitch, "Радужная полоса прогресса", "Радужная полоса прогресса в плеере", kTvIconColorLens},
+        {kStAnimDrawer, kStList, "Анимация при открытии панели навигации", nullptr, kTvIconAnimation},
+    };
+    static constexpr StDef kStConnection[] = {
+        {kStSource, kStList, "Источник", nullptr, kTvIconLanguage},
+        {kStSsl, kStSwitch, "Включить обход SSL", "Внимание! Проверка сертификата безопасности будет отключена",
+         kTvIconLockOpen},
+        {kStCountries, kStMulti, "Фильтры контента", "Выберите страны, контент из которых Вы бы не хотели видеть",
+         kTvIconDoNotDisturbOn},
+    };
+    static constexpr StDef kStPlayer[] = {
+        {kStQuality, kStList, "Качество по умолчанию", nullptr, kTvIconHighQuality},
+        {kStAutoNext, kStSwitch, "Автоматически включать следующую серию", "Плеер начнет воспроизведение следующей серии",
+         kTvIconSkipNext},
+        {kStStepForward, kStRange, "Шаг быстрой перемотки вперед", nullptr, kTvIconForward10},
+        {kStStepReplay, kStRange, "Шаг быстрой перемотки назад", nullptr, kTvIconReplay10},
+        {kStSpeed, kStList, "Скорость воспроизведения по умолчанию", nullptr, kTvIconSpeed},
+        {kStBufferSize, kStList, "Размер буфера потока",
+         "Выбирайте не больше, чем размер свободной оперативной памяти вашего устройства. Если не знаете, оставьте автовыбор",
+         kTvIconCached},
+        {kStBufferDuration, kStList, "Длительность буфера",
+         "Столько времени воспроизведения будет предзагружаться в буфер. Если выбран небольшой размер буфера потока, то "
+         "возможно длительность будет меньше.",
+         kTvIconDownloading},
+        {kStBackBuffer, kStList, "Длительность буфера перемотки",
+         "Столько времени будет оставаться в буфере для перемотки назад", kTvIconReplay},
+    };
+    static constexpr StDef kStSubtitle[] = {
+        {kStSubtitlePlace, kStList, "Расположение субтитров", nullptr, kTvIconSubtitles},
+        {kStSubtitleSize, kStList, "Размер шрифта субтитров", nullptr, kTvIconTextFields},
+    };
+    static constexpr int kStGroups = 5;
+    static constexpr int kStAbout = 4;
+    static StGroup st_group(int g)
+    {
+        switch (g)
+        {
+        case 0:
+            return {"Внешний вид", kTvIconPalette, kStStyle, static_cast<int>(std::size(kStStyle))};
+        case 1:
+            return {"Подключение и предпочтения", kTvIconLanguage, kStConnection, static_cast<int>(std::size(kStConnection))};
+        case 2:
+            return {"Плеер", kTvIconPlayCircle, kStPlayer, static_cast<int>(std::size(kStPlayer))};
+        case 3:
+            return {"Субтитры", kTvIconSubtitles, kStSubtitle, static_cast<int>(std::size(kStSubtitle))};
+        default:
+            return {"О приложении", kTvIconInfoOutlined, nullptr, 0};
+        }
+    }
+
+    // ---- what each preference holds --------------------------------------------
+
+    static bool *st_flag(rezka::AppSettings &s, StPref key)
+    {
+        switch (key)
+        {
+        case kStBlack: return &s.black_mode;
+        case kStVoices: return &s.show_rating_voices;
+        case kStRecommendations: return &s.show_recommendations;
+        case kStClock: return &s.show_clock;
+        case kStRainbow: return &s.rainbow_progress;
+        case kStSsl: return &s.bypass_ssl;
+        case kStAutoNext: return &s.auto_next_episode;
+        default: return nullptr;
+        }
+    }
+    // A list preference's choices and the index it holds.
+    static int *st_choice(rezka::AppSettings &s, StPref key, const rezka::SettingChoice *&choices, int &count)
+    {
+        using namespace rezka;
+        switch (key)
+        {
+        case kStAnimDrawer: choices = kAnimNavDrawerChoices; count = setting_count(kAnimNavDrawerChoices); return &s.anim_nav_drawer;
+        case kStSource: choices = kSourceChoices; count = setting_count(kSourceChoices); return &s.source;
+        case kStQuality: choices = kVideoQualityChoices; count = setting_count(kVideoQualityChoices); return &s.video_quality;
+        case kStSpeed: choices = kPlaySpeedChoices; count = setting_count(kPlaySpeedChoices); return &s.play_speed;
+        case kStBufferSize: choices = kStreamBufferSizeChoices; count = setting_count(kStreamBufferSizeChoices); return &s.stream_buffer_size;
+        case kStBufferDuration: choices = kBufferDurationChoices; count = setting_count(kBufferDurationChoices); return &s.buffer_duration;
+        case kStBackBuffer: choices = kBackBufferDurationChoices; count = setting_count(kBackBufferDurationChoices); return &s.back_buffer_duration;
+        case kStSubtitlePlace: choices = kSubtitleArrangementChoices; count = setting_count(kSubtitleArrangementChoices); return &s.subtitle_arrangement;
+        case kStSubtitleSize: choices = kSubtitleFontSizeChoices; count = setting_count(kSubtitleFontSizeChoices); return &s.subtitle_font_size;
+        default: choices = nullptr; count = 0; return nullptr;
+        }
+    }
+    // A number preference, its range and step (IntRangePreference).
+    static int *st_number(rezka::AppSettings &s, StPref key, int &lo, int &hi, int &step)
+    {
+        if (key == kStColumns)
+        {
+            lo = 5, hi = 9, step = 1;
+            return &s.columns;
+        }
+        lo = 5, hi = 60, step = 5;
+        if (key == kStStepForward)
+            return &s.step_forward;
+        if (key == kStStepReplay)
+            return &s.step_replay;
+        return nullptr;
+    }
+    // The line under a preference's title.
+    std::string st_supporting(const StDef &def) const
+    {
+        rezka::AppSettings s = rezka::App::instance().settings();
+        if (def.kind == kStSwitch || def.kind == kStMulti)
+        {
+            return def.summary ? def.summary : "";
+        }
+        if (def.kind != kStList)
+            return {};
+        const rezka::SettingChoice *choices = nullptr;
+        int count = 0;
+        const int *at = st_choice(s, def.key, choices, count);
+        std::string text = choices[std::clamp(*at, 0, count - 1)].label;
+        if (def.key == kStSource)
+        {
+            if (s.source == 2)
+                text = s.custom_mirror.empty() ? std::string("Свой домен не задан") : s.custom_mirror;
+            const int check = rezka::App::instance().mirror_check.load();
+            if (check == 1)
+                text += " • проверка…";
+            else if (check == 2)
+                text += " • доступно";
+            else if (check == 3)
+                text += " • недоступно";
+        }
+        return text;
+    }
+    static float st_item_h(const StDef &def)
+    {
+        return (def.kind == kStRange ? 48.0f : 64.0f) * kTvDp;
+    }
+
+    // ---- input --------------------------------------------------------------
+
+    void open_settings(app::Feedback &feedback)
+    {
+        settings_open_ = true;
+        st_zone_ = 0;
+        st_group_ = 0;
+        st_item_ = 0;
+        st_editing_ = false;
+        st_sheet_ = false;
+        st_scroll_.snap(0.0f);
+        st_filter_dirty_ = false;
+        rezka::App::instance().mirror_check = 0;
+        feedback.play(audio::Cue::open);
+    }
+
+    void st_close(app::Feedback &feedback)
+    {
+        settings_open_ = false;
+        feedback.play(audio::Cue::back);
+        // A new country filter shows on the list at once
+        if (st_filter_dirty_)
+        {
+            st_filter_dirty_ = false;
+            tv_load(tv_kind_);
+        }
+    }
+
+    // Keeps a changed copy and redoes what depends on it on this screen.
+    void st_commit(const rezka::AppSettings &next)
+    {
+        auto &app = rezka::App::instance();
+        const rezka::AppSettings before = app.settings();
+        app.update_settings(next);
+        if (before.columns != next.columns)
+        {
+            // The cards are measured for their width: measure them again
+            tv_cards_.clear();
+            last_catalog_version_ = 0;
+        }
+        if (before.country_filter != next.country_filter)
+            st_filter_dirty_ = true;
+        if (before.source != next.source || before.custom_mirror != next.custom_mirror)
+        {
+            // "Переподключиться": the new mirror is checked, the list reloads once it answers
+            app.check_mirror_async(next.mirror());
+            st_reconnect_ = true;
+        }
+    }
+
+    void update_settings(const InputFrame &input, float dt, app::Feedback &feedback)
+    {
+        auto &app = rezka::App::instance();
+        // The keyboard just closed over "Свой домен" or the countries' search
+        if (st_kb_ != 0)
+        {
+            const int which = st_kb_;
+            st_kb_ = 0;
+            if (which == 1)
+            {
+                std::string domain = st_text_;
+                while (!domain.empty() && (domain.back() == '/' || domain.back() == ' '))
+                    domain.pop_back();
+                if (!domain.empty())
+                {
+                    if (domain.find("://") == std::string::npos)
+                        domain = "https://" + domain;
+                    rezka::AppSettings next = app.settings();
+                    next.source = 2;
+                    next.custom_mirror = domain;
+                    st_commit(next);
+                }
+            }
+            else
+            {
+                st_sheet_focus_ = 0;
+                st_sheet_scroll_.snap(0.0f);
+            }
+        }
+        if (st_reconnect_ && app.mirror_check.load() >= 2)
+        {
+            st_reconnect_ = false;
+            if (app.mirror_check.load() == 2)
+            {
+                show_message("Зеркало доступно");
+                tv_load(tv_kind_);
+            }
+            else
+                show_message("Зеркало недоступно");
+        }
+        st_scroll_.update(dt, omega(16.0f));
+        st_sheet_scroll_.update(dt, omega(16.0f));
+        if (st_sheet_)
+        {
+            update_settings_sheet(input, feedback);
+            return;
+        }
+
+        const StGroup group = st_group(st_group_);
+        if (st_zone_ == 0)
+        {
+            if (input.is_pressed(Action::back))
+            {
+                st_close(feedback);
+                return;
+            }
+            if (input.nav == Direction::up || input.nav == Direction::down)
+            {
+                const int next = st_group_ + (input.nav == Direction::down ? 1 : -1);
+                if (next < 0 || next >= kStGroups)
+                    tv_refuse(feedback, input.nav_repeat);
+                else
+                {
+                    // The focus on a group shows it, as the app's onFocusChanged does
+                    st_group_ = next;
+                    st_item_ = 0;
+                    st_scroll_.snap(0.0f);
+                    tv_tick(feedback, kWidth * 0.25f);
+                }
+            }
+            else if (input.nav == Direction::right || input.is_pressed(Action::confirm))
+            {
+                if (group.count == 0)
+                    tv_refuse(feedback, false);
+                else
+                {
+                    st_zone_ = 1;
+                    tv_tick(feedback, kWidth * 0.75f);
+                }
+            }
+            else if (input.nav == Direction::left)
+                tv_refuse(feedback, input.nav_repeat);
+            return;
+        }
+
+        const StDef &def = group.items[std::clamp(st_item_, 0, group.count - 1)];
+        rezka::AppSettings s = app.settings();
+        if (st_editing_)
+        {
+            int lo = 0, hi = 0, step = 1;
+            int *value = st_number(s, def.key, lo, hi, step);
+            if (input.is_pressed(Action::back) || input.is_pressed(Action::confirm))
+            {
+                st_editing_ = false;
+                feedback.play(audio::Cue::select);
+            }
+            else if (value && (input.nav == Direction::left || input.nav == Direction::right))
+            {
+                const int next = *value + (input.nav == Direction::right ? step : -step);
+                if (next < lo || next > hi)
+                    tv_refuse(feedback, input.nav_repeat);
+                else
+                {
+                    *value = next;
+                    st_commit(s);
+                    tv_tick(feedback, kWidth * 0.75f);
+                }
+            }
+            else if (input.nav == Direction::up || input.nav == Direction::down)
+                tv_refuse(feedback, input.nav_repeat);
+            return;
+        }
+        if (input.is_pressed(Action::back) || input.nav == Direction::left)
+        {
+            st_zone_ = 0;
+            feedback.play(input.nav == Direction::left ? audio::Cue::focus : audio::Cue::back);
+            return;
+        }
+        if (input.nav == Direction::up || input.nav == Direction::down)
+        {
+            const int next = st_item_ + (input.nav == Direction::down ? 1 : -1);
+            if (next < 0 || next >= group.count)
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                st_item_ = next;
+                tv_tick(feedback, kWidth * 0.75f);
+            }
+            return;
+        }
+        if (input.nav == Direction::right)
+        {
+            tv_refuse(feedback, input.nav_repeat);
+            return;
+        }
+        if (!input.is_pressed(Action::confirm))
+            return;
+        switch (def.kind)
+        {
+        case kStSwitch:
+            if (bool *flag = st_flag(s, def.key))
+            {
+                *flag = !*flag;
+                st_commit(s);
+                feedback.play(audio::Cue::toggle);
+            }
+            break;
+        case kStRange:
+            st_editing_ = true;
+            feedback.play(audio::Cue::select);
+            break;
+        case kStList:
+        case kStMulti:
+        {
+            st_sheet_ = true;
+            st_sheet_key_ = def.key;
+            st_text_.clear();
+            st_sheet_scroll_.snap(0.0f);
+            st_sheet_focus_ = 0;
+            if (def.kind == kStList)
+            {
+                const rezka::SettingChoice *choices = nullptr;
+                int count = 0;
+                st_sheet_focus_ = std::clamp(*st_choice(s, def.key, choices, count), 0, count - 1);
+            }
+            feedback.play(audio::Cue::modal_open);
+            break;
+        }
+        }
+    }
+
+    // The countries the search leaves, by their index in the app's list.
+    std::vector<int> st_countries() const
+    {
+        std::vector<int> out;
+        for (int i = 0; i < static_cast<int>(std::size(rezka::kCountryFilterChoices)); ++i)
+        {
+            const std::string name = rezka::kCountryFilterChoices[i];
+            if (st_text_.empty() || utf8_lower(name).find(utf8_lower(st_text_)) != std::string::npos)
+                out.push_back(i);
+        }
+        return out;
+    }
+    // Lower case for Latin and Cyrillic, enough to search a country's name.
+    static std::string utf8_lower(const std::string &in)
+    {
+        std::string out;
+        for (std::size_t i = 0; i < in.size(); ++i)
+        {
+            const unsigned char c = static_cast<unsigned char>(in[i]);
+            if (c < 0x80)
+                out += static_cast<char>(std::tolower(c));
+            else if (c == 0xd0 && i + 1 < in.size())
+            {
+                unsigned char d = static_cast<unsigned char>(in[++i]);
+                if (d >= 0x90 && d <= 0x9f) // А..П
+                    out += static_cast<char>(0xd0), out += static_cast<char>(d + 0x20);
+                else if (d >= 0xa0 && d <= 0xaf) // Р..Я
+                    out += static_cast<char>(0xd1), out += static_cast<char>(d - 0x20);
+                else if (d == 0x81) // Ё
+                    out += static_cast<char>(0xd1), out += static_cast<char>(0x91);
+                else
+                    out += static_cast<char>(0xd0), out += static_cast<char>(d);
+            }
+            else
+                out += static_cast<char>(c);
+        }
+        return out;
+    }
+
+    // The side sheet of a list (radio buttons) or of the countries (check boxes
+    // under a search row: row 0 is the search, the countries follow).
+    void update_settings_sheet(const InputFrame &input, app::Feedback &feedback)
+    {
+        auto &app = rezka::App::instance();
+        rezka::AppSettings s = app.settings();
+        const bool multi = st_sheet_key_ == kStCountries;
+        const std::vector<int> countries = multi ? st_countries() : std::vector<int>{};
+        const rezka::SettingChoice *choices = nullptr;
+        int count = 0;
+        int *chosen = multi ? nullptr : st_choice(s, static_cast<StPref>(st_sheet_key_), choices, count);
+        if (multi)
+            count = 1 + static_cast<int>(countries.size());
+        if (input.is_pressed(Action::back) || input.nav == Direction::left)
+        {
+            st_sheet_ = false;
+            feedback.play(audio::Cue::modal_close);
+            return;
+        }
+        if (input.nav == Direction::up || input.nav == Direction::down)
+        {
+            const int next = st_sheet_focus_ + (input.nav == Direction::down ? 1 : -1);
+            if (next < 0 || next >= count)
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                st_sheet_focus_ = next;
+                tv_tick(feedback, kWidth * 0.8f);
+            }
+            return;
+        }
+        if (!input.is_pressed(Action::confirm))
+            return;
+        if (multi)
+        {
+            if (st_sheet_focus_ == 0)
+            {
+                st_kb_ = 2;
+                kb_begin(&st_text_, "Поиск", false, feedback);
+                return;
+            }
+            const std::string name = rezka::kCountryFilterChoices[countries[static_cast<std::size_t>(st_sheet_focus_ - 1)]];
+            if (!s.country_filter.erase(name))
+                s.country_filter.insert(name);
+            st_commit(s);
+            feedback.play(audio::Cue::toggle);
+            return;
+        }
+        if (st_sheet_key_ == kStSource && st_sheet_focus_ == 2)
+        {
+            // "Свой домен…": typed with the console's keyboard (the sheet of keys on a PC)
+            st_sheet_ = false;
+            st_kb_ = 1;
+            st_text_ = s.custom_mirror;
+            kb_begin(&st_text_, "Адрес зеркала HDRezka", false, feedback);
+            return;
+        }
+        *chosen = st_sheet_focus_;
+        st_commit(s);
+        st_sheet_ = false;
+        feedback.play(audio::Cue::select);
+    }
+
+    // ---- drawing ------------------------------------------------------------
+
+    // A tv-material3 ListItem: 8 dp corners, the inverse surface under the
+    // focus, the secondary container (40%) when selected.
+    void st_list_item(gfx::DrawList &list, const Rect &r0, bool focused, bool selected, int icon, const std::string &title,
+                      const std::string &supporting, float trailing_w = 0.0f) const
+    {
+        const float dp = kTvDp;
+        const Rect r = scaled(r0, focused ? 1.03f : 1.0f);
+        Color ink = tv_on_surface(), sub = tv_on_surface_variant();
+        if (focused)
+        {
+            list.rounded_rect(r, 8.0f * dp, tv_on_surface());
+            ink = tv_inverse_on_surface();
+            sub = tv_inverse_on_surface().with_alpha(0.8f);
+        }
+        else if (selected)
+        {
+            list.rounded_rect(r, 8.0f * dp, tv_secondary_container().with_alpha(0.4f));
+            ink = tv_on_secondary_container();
+            sub = tv_on_secondary_container().with_alpha(0.8f);
+        }
+        float x = r.x + 16.0f * dp;
+        if (icon >= 0)
+        {
+            tv_icon(list, icon, x, r.cy() - 12.0f * dp, 24.0f * dp, ink);
+            x += 24.0f * dp + 16.0f * dp;
+        }
+        const float text_w = r.x + r.w - 16.0f * dp - trailing_w - x;
+        if (supporting.empty())
+            tv_text(list, tv_medium(), tv_medium().font->fit(title, 16.0f * dp, text_w), x, r.cy() - 12.0f * dp, 16.0f * dp,
+                    24.0f * dp, ink, gfx::Align::left, 0.15f * dp);
+        else
+        {
+            tv_text(list, tv_medium(), tv_medium().font->fit(title, 16.0f * dp, text_w), x, r.cy() - 21.0f * dp, 16.0f * dp,
+                    24.0f * dp, ink, gfx::Align::left, 0.15f * dp);
+            tv_text(list, tv_regular(), tv_regular().font->fit(supporting, 12.0f * dp, text_w), x, r.cy() + 3.0f * dp,
+                    12.0f * dp, 16.0f * dp, sub, gfx::Align::left, 0.4f * dp);
+        }
+    }
+
+    // A Material switch: a 52x32 dp track, the thumb 24 dp on and 16 off.
+    void st_switch(gfx::DrawList &list, float right, float cy, bool on, bool focused) const
+    {
+        const float dp = kTvDp;
+        const Rect track{right - 52.0f * dp, cy - 16.0f * dp, 52.0f * dp, 32.0f * dp};
+        if (on)
+        {
+            list.rounded_rect(track, 16.0f * dp, tv_primary());
+            list.circle(track.x + track.w - 16.0f * dp, cy, 12.0f * dp, tv_on_primary());
+            tv_icon(list, kTvIconCheck, track.x + track.w - 24.0f * dp, cy - 8.0f * dp, 16.0f * dp, tv_primary());
+        }
+        else
+        {
+            const Color outline = focused ? tv_inverse_on_surface().with_alpha(0.7f) : tv_border();
+            list.bordered_rect(track, 16.0f * dp, tv_surface_variant().with_alpha(focused ? 0.15f : 1.0f), 2.0f * dp, outline);
+            list.circle(track.x + 16.0f * dp, cy, 8.0f * dp, outline);
+        }
+    }
+
+    void draw_settings(gfx::DrawList &list) const
+    {
+        if (!settings_open_)
+            return;
+        const float dp = kTvDp;
+        auto &app = rezka::App::instance();
+        rezka::AppSettings s = app.settings();
+        list.rounded_rect({0, 0, kWidth, kHeight}, 0.0f, tv_surface());
+        // Text("Настройки"): headlineSmall, 24 dp from the top, 48 from the side
+        tv_text(list, tv_regular(), "Настройки", 48.0f * dp, 24.0f * dp, 24.0f * dp, 32.0f * dp, tv_on_surface());
+
+        // Row: 8 dp below, 24 from the sides, two columns 8 dp apart, each a list padded 16
+        const float top = 64.0f * dp;
+        const float col_w = (kWidth - 48.0f * dp - 8.0f * dp) * 0.5f;
+        const float left_x = 24.0f * dp + 16.0f * dp;
+        const float right_x = 24.0f * dp + col_w + 8.0f * dp + 16.0f * dp;
+        const float item_w = col_w - 32.0f * dp;
+
+        for (int g = 0; g < kStGroups; ++g)
+        {
+            const StGroup group = st_group(g);
+            const Rect r{left_x, top + 16.0f * dp + static_cast<float>(g) * 52.0f * dp, item_w, 48.0f * dp};
+            st_list_item(list, r, st_zone_ == 0 && g == st_group_, g == st_group_, group.icon, group.title, "");
+        }
+
+        const StGroup group = st_group(st_group_);
+        if (st_group_ == kStAbout)
+        {
+            // О приложении: a plate for now, the section is filled later
+            const Rect card{right_x, top + 16.0f * dp, item_w, 200.0f * dp};
+            list.rounded_rect(card, 16.0f * dp, tv_surface_variant().with_alpha(0.35f));
+            list.bordered_rect(card, 16.0f * dp, kClear, 1.0f * dp, tv_border_variant());
+            tv_icon(list, kTvIconInfoOutlined, card.x + 24.0f * dp, card.y + 24.0f * dp, 40.0f * dp, tv_primary());
+            tv_text(list, tv_medium(), "HDRezka для PlayStation 5", card.x + 80.0f * dp, card.y + 24.0f * dp, 18.0f * dp,
+                    24.0f * dp, tv_on_surface(), gfx::Align::left, 0.1f * dp);
+            tv_text(list, tv_regular(), "Версия: 1.4.0", card.x + 80.0f * dp, card.y + 50.0f * dp, 14.0f * dp, 20.0f * dp,
+                    tv_on_surface_variant());
+            std::string lines[2];
+            tv_two_lines(*tv_regular().font,
+                         "Здесь появятся сведения о приложении, язык, обновления и ссылки. Раздел в разработке.",
+                         14.0f * dp, card.w - 48.0f * dp, lines);
+            tv_text(list, tv_regular(), lines[0], card.x + 24.0f * dp, card.y + 96.0f * dp, 14.0f * dp, 20.0f * dp,
+                    tv_on_surface());
+            tv_text(list, tv_regular(), lines[1], card.x + 24.0f * dp, card.y + 118.0f * dp, 14.0f * dp, 20.0f * dp,
+                    tv_on_surface());
+            const Rect chip{card.x + 24.0f * dp, card.y + card.h - 52.0f * dp, 140.0f * dp, 32.0f * dp};
+            list.rounded_rect(chip, 16.0f * dp, tv_secondary_container());
+            tv_text(list, tv_medium(), "В разработке", chip.cx(), chip.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp,
+                    tv_on_secondary_container(), gfx::Align::center, 0.1f * dp);
+        }
+        else
+        {
+            // The focused row kept in view: the list scrolls by whole rows
+            float y = 16.0f * dp, focus_top = 0.0f, focus_bottom = 0.0f;
+            for (int i = 0; i < group.count; ++i)
+            {
+                if (i == st_item_)
+                    focus_top = y, focus_bottom = y + st_item_h(group.items[i]);
+                y += st_item_h(group.items[i]) + 4.0f * dp;
+            }
+            const float view = kHeight - top;
+            const float content = y + 12.0f * dp;
+            float want = st_scroll_.target;
+            if (focus_bottom + 16.0f * dp - want > view)
+                want = focus_bottom + 16.0f * dp - view;
+            if (focus_top - 16.0f * dp < want)
+                want = focus_top - 16.0f * dp;
+            want = std::clamp(want, 0.0f, std::max(0.0f, content - view));
+            st_scroll_.target = want;
+
+            list.push_clip({right_x - 16.0f * dp, top, col_w, view});
+            y = top + 16.0f * dp - st_scroll_.value;
+            for (int i = 0; i < group.count; ++i)
+            {
+                const StDef &def = group.items[i];
+                const float h = st_item_h(def);
+                const Rect r{right_x, y, item_w, h};
+                const bool focused = st_zone_ == 1 && i == st_item_;
+                float trailing = 0.0f;
+                if (def.kind == kStSwitch)
+                    trailing = 60.0f * dp;
+                else if (def.kind == kStRange)
+                    trailing = 96.0f * dp;
+                st_list_item(list, r, focused, false, def.icon, def.title, st_supporting(def), trailing);
+                const Rect rs = scaled(r, focused ? 1.03f : 1.0f);
+                const Color ink = focused ? tv_inverse_on_surface() : tv_on_surface();
+                if (def.kind == kStSwitch)
+                {
+                    bool *flag = st_flag(s, def.key);
+                    st_switch(list, rs.x + rs.w - 16.0f * dp, rs.cy(), flag && *flag, focused);
+                }
+                else if (def.kind == kStRange)
+                {
+                    int lo = 0, hi = 0, step = 1;
+                    const int *value = st_number(s, def.key, lo, hi, step);
+                    const float cx = rs.x + rs.w - 16.0f * dp - 40.0f * dp;
+                    const bool editing = focused && st_editing_;
+                    if (editing)
+                        list.rounded_rect({cx - 44.0f * dp, rs.cy() - 16.0f * dp, 88.0f * dp, 32.0f * dp}, 16.0f * dp,
+                                          tv_primary());
+                    const Color num = editing ? tv_on_primary() : ink;
+                    tv_icon(list, kTvIconRemove, cx - 40.0f * dp, rs.cy() - 10.0f * dp, 20.0f * dp,
+                            num.with_alpha(value && *value > lo ? 1.0f : 0.35f));
+                    tv_icon(list, kTvIconAdd, cx + 20.0f * dp, rs.cy() - 10.0f * dp, 20.0f * dp,
+                            num.with_alpha(value && *value < hi ? 1.0f : 0.35f));
+                    tv_text(list, tv_medium(), value ? std::to_string(*value) : "", cx, rs.cy() - 12.0f * dp, 16.0f * dp,
+                            24.0f * dp, num, gfx::Align::center, 0.1f * dp);
+                }
+                y += h + 4.0f * dp;
+            }
+            list.pop_clip();
+        }
+
+        if (st_sheet_)
+            draw_settings_sheet(list, s);
+        kb_draw(list);
+    }
+
+    void draw_settings_sheet(gfx::DrawList &list, rezka::AppSettings &s) const
+    {
+        const float dp = kTvDp;
+        list.rounded_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, kBlack.with_alpha(0.6f));
+        // The dialog's window at the end: 24 dp from the top, bottom and right, corners 28
+        const float w = 400.0f * dp;
+        const Rect card{kWidth - 24.0f * dp - w, 24.0f * dp, w, kHeight - 48.0f * dp};
+        list.bordered_rect(card, 28.0f * dp, tv_surface(), 1.0f * dp, tv_border_variant());
+        const StPref key = static_cast<StPref>(st_sheet_key_);
+        const StDef *def = nullptr;
+        for (int g = 0; g < kStAbout && !def; ++g)
+        {
+            const StGroup group = st_group(g);
+            for (int i = 0; i < group.count; ++i)
+                if (group.items[i].key == key)
+                    def = &group.items[i];
+        }
+        if (!def)
+            return;
+        // Title: titleLarge, 20 dp in, 20 from the top, 8 below
+        float y = card.y + 20.0f * dp;
+        tv_text(list, tv_regular(), tv_regular().font->fit(def->title, 22.0f * dp, w - 40.0f * dp), card.x + 20.0f * dp, y,
+                22.0f * dp, 28.0f * dp, tv_on_surface());
+        y += 28.0f * dp + 8.0f * dp;
+        if (def->summary && def->kind == kStList)
+        {
+            for (const std::string &line : tv_regular().font->wrap(def->summary, 14.0f * dp, w - 40.0f * dp))
+            {
+                tv_text(list, tv_regular(), line, card.x + 20.0f * dp, y, 14.0f * dp, 20.0f * dp, tv_on_surface_variant());
+                y += 20.0f * dp;
+            }
+            y += 8.0f * dp;
+        }
+
+        const bool multi = key == kStCountries;
+        std::vector<std::string> labels;
+        std::vector<bool> checked;
+        std::vector<std::string> extra;
+        if (multi)
+        {
+            labels.push_back(st_text_.empty() ? std::string("Поиск") : st_text_);
+            checked.push_back(false);
+            for (const int i : st_countries())
+            {
+                labels.push_back(rezka::kCountryFilterChoices[i]);
+                checked.push_back(s.country_filter.count(rezka::kCountryFilterChoices[i]) != 0);
+            }
+        }
+        else
+        {
+            const rezka::SettingChoice *choices = nullptr;
+            int count = 0;
+            const int *at = st_choice(s, key, choices, count);
+            for (int i = 0; i < count; ++i)
+            {
+                labels.push_back(choices[i].label);
+                checked.push_back(i == *at);
+            }
+            if (key == kStSource && !s.custom_mirror.empty())
+                extra = {"", "", s.custom_mirror};
+        }
+
+        // The list: 20 dp in, 8 from the top, 4 between rows, a 48 dp row
+        const float list_top = y;
+        const float view = card.y + card.h - 20.0f * dp - list_top;
+        const float pitch = 52.0f * dp;
+        const float focus_y = static_cast<float>(st_sheet_focus_) * pitch;
+        float want = st_sheet_scroll_.target;
+        if (focus_y + pitch - want > view)
+            want = focus_y + pitch - view;
+        if (focus_y < want)
+            want = focus_y;
+        st_sheet_scroll_.target = std::max(0.0f, want);
+        list.push_clip({card.x, list_top - 4.0f * dp, card.w, view + 8.0f * dp});
+        for (int i = 0; i < static_cast<int>(labels.size()); ++i)
+        {
+            const float ry = list_top + static_cast<float>(i) * pitch - st_sheet_scroll_.value;
+            if (ry + pitch < list_top - 8.0f * dp || ry > list_top + view + 8.0f * dp)
+                continue;
+            const Rect r{card.x + 20.0f * dp, ry, w - 40.0f * dp, 48.0f * dp};
+            const bool focused = i == st_sheet_focus_;
+            const bool search = multi && i == 0;
+            if (search)
+            {
+                // OutlinedTextField: the search through the countries
+                list.bordered_rect(r, 8.0f * dp, kClear, (focused ? 2.0f : 1.0f) * dp, focused ? tv_primary() : tv_border());
+                tv_icon(list, kTvIconSearch, r.x + 12.0f * dp, r.cy() - 12.0f * dp, 24.0f * dp, tv_on_surface_variant());
+                tv_text(list, tv_regular(), labels[0], r.x + 48.0f * dp, r.cy() - 12.0f * dp, 16.0f * dp, 24.0f * dp,
+                        st_text_.empty() ? tv_on_surface_variant() : tv_on_surface());
+                continue;
+            }
+            const Color ink = focused ? tv_inverse_on_surface() : tv_on_surface();
+            if (focused)
+                list.rounded_rect(scaled(r, 1.03f), 8.0f * dp, tv_on_surface());
+            const int icon = multi ? (checked[i] ? kTvIconCheckBox : kTvIconCheckBoxBlank)
+                                   : (checked[i] ? kTvIconRadioChecked : kTvIconRadioUnchecked);
+            const Color mark = checked[i] ? (focused ? tv_inverse_primary() : tv_primary()) : ink;
+            tv_icon(list, icon, r.x + 12.0f * dp, r.cy() - 12.0f * dp, 24.0f * dp, mark);
+            const std::string sub = i < static_cast<int>(extra.size()) ? extra[static_cast<std::size_t>(i)] : std::string();
+            if (sub.empty())
+                tv_text(list, tv_medium(), tv_medium().font->fit(labels[i], 16.0f * dp, r.w - 64.0f * dp), r.x + 48.0f * dp,
+                        r.cy() - 12.0f * dp, 16.0f * dp, 24.0f * dp, ink, gfx::Align::left, 0.15f * dp);
+            else
+            {
+                tv_text(list, tv_medium(), labels[i], r.x + 48.0f * dp, r.cy() - 20.0f * dp, 16.0f * dp, 22.0f * dp, ink,
+                        gfx::Align::left, 0.15f * dp);
+                tv_text(list, tv_regular(), tv_regular().font->fit(sub, 12.0f * dp, r.w - 64.0f * dp), r.x + 48.0f * dp,
+                        r.cy() + 2.0f * dp, 12.0f * dp, 16.0f * dp, focused ? ink.with_alpha(0.8f) : tv_on_surface_variant());
+            }
+        }
+        list.pop_clip();
+    }
+
     // ---- layout ------------------------------------------------------------
 
     // The page's left edge: it slides aside as the drawer opens.
     float tv_page_x() const
     {
+        // "Анимация при открытии панели навигации": the page slides aside, or
+        // (Сжатие экрана) stays and shrinks towards its right edge.
+        if (rezka::App::instance().settings().anim_nav_drawer == 1)
+            return kTvRail;
         return kTvRail + kTvSlide * tv_open_.value;
     }
     static float tv_drawer_item_y(int item)
@@ -3423,10 +4437,10 @@ class Store final : public app::Concept
     // A card's place in the grid's content (before scrolling), from the page's left edge.
     static Rect tv_card_rect(int index)
     {
-        const int col = index % kTvColumns;
-        const int row = index / kTvColumns;
-        return {kTvPad + static_cast<float>(col) * (kTvCardW + kTvGap),
-                kTvGridPad + static_cast<float>(row) * kTvRowPitch, kTvCardW, kTvCardH};
+        const int col = index % tv_columns();
+        const int row = index / tv_columns();
+        return {kTvPad + static_cast<float>(col) * (tv_card_w() + kTvGap),
+                kTvGridPad + static_cast<float>(row) * tv_row_pitch(), tv_card_w(), tv_card_h()};
     }
     // Compose's bring-into-view on a TV: the focused row's top rests 30% down
     // the viewport, as far as the content allows.
@@ -3436,8 +4450,8 @@ class Store final : public app::Concept
         if (tv_zone_ != TvZone::grid || count == 0)
             return tv_scroll_.target;
         const float view = kHeight - kTvGridTop;
-        const int rows = (count + kTvColumns - 1) / kTvColumns;
-        const float content = 2.0f * kTvGridPad + static_cast<float>(rows) * kTvRowPitch - kTvGap;
+        const int rows = (count + tv_columns() - 1) / tv_columns();
+        const float content = 2.0f * kTvGridPad + static_cast<float>(rows) * tv_row_pitch() - kTvGap;
         const float top = tv_card_rect(tv_focus_).y;
         return std::clamp(top - 0.3f * view, 0.0f, std::max(0.0f, content - view));
     }
@@ -3578,8 +4592,12 @@ class Store final : public app::Concept
             feedback.play(audio::Cue::select);
             break;
         }
+        case 6:
+            tv_close_drawer();
+            open_settings(feedback);
+            break;
         default:
-            // Подборки and Настройки have no screen here yet; the app's own word for that.
+            // Подборки has no screen here yet; the app's own word for that.
             show_message("В разработке");
             feedback.play(audio::Cue::select);
             break;
@@ -3615,9 +4633,9 @@ class Store final : public app::Concept
                 tv_load(0);
                 feedback.play(audio::Cue::back);
             }
-            else if (tv_zone_ == TvZone::grid && tv_focus_ >= kTvColumns)
+            else if (tv_zone_ == TvZone::grid && tv_focus_ >= tv_columns())
             {
-                tv_focus_ %= kTvColumns;
+                tv_focus_ %= tv_columns();
                 feedback.play(audio::Cue::back);
             }
             else if (tv_zone_ == TvZone::grid)
@@ -3702,19 +4720,19 @@ class Store final : public app::Concept
         }
         else if (tv_zone_ == TvZone::grid && nav != Direction::none && count > 0)
         {
-            const int col = tv_focus_ % kTvColumns;
+            const int col = tv_focus_ % tv_columns();
             int next = tv_focus_;
             if (nav == Direction::left)
                 next = col == 0 ? -1 : tv_focus_ - 1;
             else if (nav == Direction::right)
-                next = (col == kTvColumns - 1 || tv_focus_ + 1 >= count) ? tv_focus_ : tv_focus_ + 1;
+                next = (col == tv_columns() - 1 || tv_focus_ + 1 >= count) ? tv_focus_ : tv_focus_ + 1;
             else if (nav == Direction::up)
-                next = tv_focus_ - kTvColumns;
+                next = tv_focus_ - tv_columns();
             else
             {
                 // Down into a short last row lands on its last card.
-                next = tv_focus_ + kTvColumns;
-                if (next >= count && next / kTvColumns == (count - 1) / kTvColumns)
+                next = tv_focus_ + tv_columns();
+                if (next >= count && next / tv_columns() == (count - 1) / tv_columns())
                     next = count - 1;
                 else if (next >= count)
                     next = tv_focus_;
@@ -3740,7 +4758,7 @@ class Store final : public app::Concept
                 tv_tick(feedback, tv_page_x() + tv_card_rect(next).cx());
             }
             // The app asks for the next page a page ahead of the focus.
-            if (listing && tv_focus_ + 2 * kTvColumns >= count)
+            if (listing && tv_focus_ + 2 * tv_columns() >= count)
                 rezka::App::instance().load_movie_list_more_async();
         }
 
@@ -3775,13 +4793,16 @@ class Store final : public app::Concept
         }
         // Posters come for the rows in view first
         rezka::App::instance().poster_hint =
-            std::max(0, (tv_focus_ / kTvColumns - 1) * kTvColumns);
+            std::max(0, (tv_focus_ / tv_columns() - 1) * tv_columns());
         tv_open_.target = tv_zone_ == TvZone::drawer ? 1.0f : 0.0f;
         tv_open_.update(dt, omega(14.0f));
         tv_scroll_.target = tv_scroll_target();
         tv_scroll_.update(dt, omega(12.0f));
         const bool covered = page_open_ || search_open_ || profile_open_ || person_open_;
-        tv_clock_.target = (tv_zone_ != TvZone::drawer && home_layout_ && !covered) ? 1.0f : 0.0f;
+        tv_clock_.target = (rezka::App::instance().settings().show_clock && tv_zone_ != TvZone::drawer &&
+                            home_layout_ && !covered)
+                               ? 1.0f
+                               : 0.0f;
         tv_clock_.update(dt, omega(12.0f));
         const float rate = std::min(1.0f, dt * 14.0f);
         for (int i = 0; i < static_cast<int>(tv_cards_.size()); ++i)
@@ -3895,10 +4916,10 @@ class Store final : public app::Concept
             {
                 // The app's placeholder grid while the first page loads
                 const float pulse = 0.35f + 0.15f * std::sin(clock_ * 3.0f);
-                for (int i = 0; i < 2 * kTvColumns; ++i)
+                for (int i = 0; i < 2 * tv_columns(); ++i)
                 {
                     const Rect r = tv_card_rect(i);
-                    list.rounded_rect({r.x, kTvGridTop + r.y, r.w, kTvCoverH}, radius,
+                    list.rounded_rect({r.x, kTvGridTop + r.y, r.w, tv_cover_h()}, radius,
                                       tv_surface_variant().with_alpha(pulse));
                 }
             }
@@ -3910,10 +4931,10 @@ class Store final : public app::Concept
         }
 
         // Only the rows in the viewport; the focused card goes last, over its neighbours.
-        const int first_row = std::max(0, static_cast<int>((scroll - kTvGridPad) / kTvRowPitch) - 1);
-        const int last_row = static_cast<int>((scroll + view) / kTvRowPitch) + 1;
-        const int first = first_row * kTvColumns;
-        const int last = std::min(count, (last_row + 1) * kTvColumns);
+        const int first_row = std::max(0, static_cast<int>((scroll - kTvGridPad) / tv_row_pitch()) - 1);
+        const int last_row = static_cast<int>((scroll + view) / tv_row_pitch()) + 1;
+        const int first = first_row * tv_columns();
+        const int last = std::min(count, (last_row + 1) * tv_columns());
         const int focused = tv_zone_ == TvZone::grid ? tv_focus_ : -1;
         list.push_clip({-kTvSlide, kTvGridTop, kWidth + kTvSlide, view});
         for (int pass = 0; pass < 2; ++pass)
@@ -3928,7 +4949,7 @@ class Store final : public app::Concept
                 // The cover alone grows under the focus, by a tenth, with the
                 // border colour's 3 dp frame; the texts under it stay put.
                 const float scale = 1.0f + 0.1f * card.lift;
-                const Rect cover{r.x, r.y, r.w, kTvCoverH};
+                const Rect cover{r.x, r.y, r.w, tv_cover_h()};
                 const Rect grown = scaled(cover, scale);
                 const float grown_radius = radius * scale;
                 if (card.texture != 0)
@@ -3938,7 +4959,7 @@ class Store final : public app::Concept
                 if (card.lift > 0.01f)
                     list.bordered_rect(grown, grown_radius, kClear, 3.0f * kTvDp * scale,
                                        tv_border().with_alpha(card.lift));
-                float y = cover.y + kTvCoverH + 12.0f * kTvDp;
+                float y = cover.y + tv_cover_h() + 12.0f * kTvDp;
                 for (const std::string &line : card.title)
                 {
                     if (!line.empty())
@@ -4027,7 +5048,11 @@ class Store final : public app::Concept
 
     void tv_draw_home(gfx::DrawList &list) const
     {
-        list.push_transform(1.0f, 0.0f, 0.0f, tv_page_x(), 0.0f);
+        const bool shrink = rezka::App::instance().settings().anim_nav_drawer == 1;
+        if (shrink)
+            list.push_transform(1.0f - 0.12f * tv_open_.value, kWidth, kHeight * 0.5f, tv_page_x(), 0.0f);
+        else
+            list.push_transform(1.0f, 0.0f, 0.0f, tv_page_x(), 0.0f);
         tv_draw_tabs(list);
         tv_draw_chips(list);
         tv_draw_grid(list);
@@ -4324,7 +5349,7 @@ class Store final : public app::Concept
             value = text;
             if (value.size() > 3 && value.back() == '0')
                 value.pop_back();
-            if (!rating->votes.empty())
+            if (!rating->votes.empty() && rezka::App::instance().settings().show_rating_voices)
                 votes = "(" + rating->votes + ")";
             label = chip == 0 ? "КиноПоиск" : chip == 1 ? "IMDb" : "HDrezka";
             color = tv_rating_color(rating->value);
@@ -4601,7 +5626,7 @@ class Store final : public app::Concept
                 y += 64.0f * dp + kDpGap;
             }
         }
-        if (!m.related.empty())
+        if (!m.related.empty() && rezka::App::instance().settings().show_recommendations)
         {
             L.related_y = y;
             DpRow row;
@@ -5659,6 +6684,18 @@ class Store final : public app::Concept
             return;
         if (here.section == 3)
         {
+            // "Качество по умолчанию": anything but "Всегда спрашивать" plays at once
+            if (const char *label = rezka::App::instance().settings().quality_label())
+            {
+                dialog_open_ = false;
+                press_.trigger();
+                feedback.play(audio::Cue::select);
+                write_log("[DEBUG] start_watch movie=%d tr=%d default quality='%s' s=%d e=%d\n", page_item_,
+                          translator_idx_, label, season_idx_, episode_idx_);
+                rezka::App::instance().play_title_async(page_item_, translator_idx_, -1, season_idx_, episode_idx_,
+                                                        -1.0, label);
+                return;
+            }
             // The qualities next, as the app asks by default
             wd_quality_ = true;
             {
@@ -9164,6 +10201,8 @@ class Store final : public app::Concept
     int pl_flash_side_ = 0;
     float pl_flash_left_ = 0.0f;
     bool pl_quality_open_ = false;
+    bool pl_sub_open_ = false;
+    int pl_sub_focus_ = 0;
     int pl_quality_focus_ = 0;
     // The watch dialogs.
     bool wd_quality_ = false;
@@ -9233,6 +10272,21 @@ class Store final : public app::Concept
     // The checkout.
     bool search_open_ = false;
     bool profile_open_ = false;
+    // The settings screen
+    bool settings_open_ = false;
+    int st_zone_ = 0;  // 0 the groups, 1 the preferences
+    int st_group_ = 0;
+    int st_item_ = 0;
+    bool st_editing_ = false; // a number takes left and right
+    bool st_sheet_ = false;   // a list's side sheet is up
+    int st_sheet_key_ = 0;
+    int st_sheet_focus_ = 0;
+    int st_kb_ = 0;           // the keyboard is up for: 1 the mirror, 2 the countries' search
+    std::string st_text_;
+    bool st_filter_dirty_ = false;
+    bool st_reconnect_ = false;
+    mutable tween::Spring st_scroll_;
+    mutable tween::Spring st_sheet_scroll_;
     bool person_open_ = false;
     int person_zone_ = 0; // 0 grid, 1 career chips, 2 close
     int person_focus_ = 0;

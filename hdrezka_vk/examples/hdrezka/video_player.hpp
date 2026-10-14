@@ -58,6 +58,16 @@ public:
 
     void set_audio_ring(hui::audio::StreamRing *ring) { audio_ring_ = ring; }
 
+    // "Скорость воспроизведения": the clock runs this much faster; the sound is
+    // resampled to keep up (its pitch moves with it).
+    void set_speed(double speed);
+    double get_speed() const { return speed_.load(); }
+    // "Длительность буфера" and "Размер буфера потока" (0 bytes: the automatic
+    // choice), for the next open: the demuxer reads that far ahead at most.
+    void set_buffer_limits(double seconds, std::size_t bytes);
+    // True once the file has been read to its end and the last picture shown.
+    bool is_finished() const { return finished_.load(); }
+
     // Returns true if a new decoded frame is available for uploading to GPU.
     // out_w/out_h match the pixel buffer; do not use get_width/get_height with it.
     bool get_frame(std::vector<uint8_t> &out_rgba, uint32_t &out_w, uint32_t &out_h);
@@ -69,7 +79,9 @@ private:
         std::condition_variable cv;
         std::deque<AVPacket *> q;
         bool aborted = false;
-        const std::size_t max;
+        std::size_t max;
+        std::size_t bytes = 0;
+        std::size_t max_bytes = 0; // 0: no limit
     };
 
     void decode_loop();
@@ -125,6 +137,11 @@ private:
     PacketQueue video_packets_{160};
     PacketQueue audio_packets_{640};
     std::atomic<bool> video_need_flush_{false};
+    std::atomic<double> speed_{1.0};
+    double buffer_seconds_ = 60.0;
+    std::size_t buffer_bytes_ = 0;
+    std::atomic<bool> eof_{false};
+    std::atomic<bool> finished_{false};
     std::atomic<bool> audio_need_flush_{false};
 
     std::mutex frame_mutex_;

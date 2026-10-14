@@ -1,6 +1,7 @@
 #include <set>
 #include "rezka_api.hpp"
 
+#include <atomic>
 #include <cctype>
 #include <iostream>
 #include <sstream>
@@ -381,6 +382,14 @@ static const char *const kBrowserAgent =
     "Mozilla/5.0 (Linux; Android 12; BRAVIA 4K) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36";
 
+// isEnableBypassSsl, for every request of every Client.
+static std::atomic<bool> g_ssl_bypass{true};
+
+void Client::set_ssl_bypass(bool on)
+{
+    g_ssl_bypass.store(on);
+}
+
 static void setup_curl_headers(CURL *curl, struct curl_slist **headers, const std::string &mirror, const std::string &cookie_file, bool is_post = false)
 {
     console_curl_setup(curl);
@@ -405,8 +414,9 @@ static void setup_curl_headers(CURL *curl, struct curl_slist **headers, const st
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    const long verify = g_ssl_bypass.load() ? 0L : 1L;
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, verify);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, verify ? 2L : 0L);
 
     if (!cookie_file.empty()) {
         curl_easy_setopt(curl, CURLOPT_COOKIEFILE, cookie_file.c_str());
@@ -503,8 +513,44 @@ bool Client::solve_anubis_challenge(const std::string &html, const std::string &
     return (res == CURLE_OK);
 }
 
+void Client::set_preferred_mirror(const std::string &mirror)
+{
+    std::string m = mirror;
+    while (!m.empty() && (m.back() == '/' || m.back() == ' '))
+        m.pop_back();
+    if (!m.empty() && m.find("://") == std::string::npos)
+        m = "https://" + m;
+    std::lock_guard<std::mutex> lock(preferred_mu_);
+    preferred_mirror_ = m;
+}
+
+std::string Client::preferred_mirror() const
+{
+    std::lock_guard<std::mutex> lock(preferred_mu_);
+    return preferred_mirror_;
+}
+
+bool Client::check_mirror(const std::string &mirror)
+{
+    std::lock_guard<std::recursive_mutex> lock(net_mu_);
+    const std::string before = mirror_;
+    std::string m = mirror;
+    if (!m.empty() && m.find("://") == std::string::npos)
+        m = "https://" + m;
+    set_mirror(m);
+    const std::string html = http_get("/films/?filter=popular");
+    const bool ok = html.find("class=\"b-content__inline_item\"") != std::string::npos;
+    write_log("[DEBUG] check_mirror %s -> %zu bytes, catalog %s\n", m.c_str(), html.size(), ok ? "found" : "missing");
+    if (!ok)
+        set_mirror(before);
+    return ok;
+}
+
 bool Client::pick_mirror()
 {
+    const std::string preferred = preferred_mirror();
+    if (!preferred.empty())
+        return check_mirror(preferred);
     static const char *candidates[] = {
         "https://hdrezka.ag",
         "https://rezka.ag",
@@ -2835,8 +2881,11 @@ bool Client::get_episodes(const VideoDetails &video,
 std::vector<StreamQuality> Client::get_streams(const VideoDetails &video,
                                                const std::string &translator_id,
                                                const std::string &season_id,
-                                               const std::string &episode_id)
+                                               const std::string &episode_id,
+                                               std::vector<SubtitleTrack> *subtitles)
 {
+    if (subtitles)
+        subtitles->clear();
     std::map<std::string, std::string> fields;
     fields["id"] = video.id;
     fields["translator_id"] = translator_id.empty() ? "238" : translator_id;
@@ -2908,6 +2957,34 @@ std::vector<StreamQuality> Client::get_streams(const VideoDetails &video,
     const std::string obfuscated = json_unescape_string(response, val_start + 1, &val_end);
     if (obfuscated.empty())
         return from_embedded();
+
+    // "subtitle": "[Русский]https://…/ru.vtt,[English]https://…/en.vtt", or false
+    if (subtitles) {
+        const size_t sub_key = response.find("\"subtitle\":\"");
+        if (sub_key != std::string::npos) {
+            const std::string raw = json_unescape_string(response, sub_key + 12, nullptr);
+            size_t at = 0;
+            while ((at = raw.find('[', at)) != std::string::npos) {
+                const size_t close = raw.find(']', at);
+                if (close == std::string::npos)
+                    break;
+                size_t end = raw.find(",[", close);
+                SubtitleTrack track;
+                track.label = raw.substr(at + 1, close - at - 1);
+                track.url = raw.substr(close + 1, end == std::string::npos ? std::string::npos : end - close - 1);
+                while (!track.url.empty() && (track.url.back() == ',' || track.url.back() == ' '))
+                    track.url.pop_back();
+                if (track.url.rfind("//", 0) == 0)
+                    track.url = "https:" + track.url;
+                if (!track.label.empty() && track.url.rfind("http", 0) == 0)
+                    subtitles->push_back(std::move(track));
+                if (end == std::string::npos)
+                    break;
+                at = end + 1;
+            }
+            write_log("[DEBUG] get_streams subtitles=%zu\n", subtitles->size());
+        }
+    }
 
     std::string decoded = clear_trash(obfuscated);
     return finish(parse_stream_string(decoded), obfuscated.size(), decoded.size());

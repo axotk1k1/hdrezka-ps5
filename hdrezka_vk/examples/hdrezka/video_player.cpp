@@ -60,7 +60,25 @@ double VideoPlayer::master_clock() const
     const auto now = std::chrono::steady_clock::now();
     const double elapsed =
         std::chrono::duration<double>(now - clock_wall_).count();
-    return clock_pts_ + elapsed;
+    return clock_pts_ + elapsed * speed_.load();
+}
+
+void VideoPlayer::set_speed(double speed)
+{
+    speed = std::clamp(speed, 0.25, 2.0);
+    std::lock_guard<std::mutex> lock(clock_mutex_);
+    if (clock_started_ && playing_.load()) {
+        const auto now = std::chrono::steady_clock::now();
+        clock_pts_ += std::chrono::duration<double>(now - clock_wall_).count() * speed_.load();
+        clock_wall_ = now;
+    }
+    speed_ = speed;
+}
+
+void VideoPlayer::set_buffer_limits(double seconds, std::size_t bytes)
+{
+    buffer_seconds_ = std::max(10.0, seconds);
+    buffer_bytes_ = bytes;
 }
 
 bool VideoPlayer::clock_running() const
@@ -243,6 +261,8 @@ bool VideoPlayer::open(const std::string &url, double seek_seconds)
     video_need_flush_ = false;
     audio_need_flush_ = false;
     open_deadline_ns_ = 0;
+    eof_ = false;
+    finished_ = false;
     duration_ = 0.0;
     {
         std::lock_guard<std::mutex> lock(clock_mutex_);
@@ -457,6 +477,14 @@ bool VideoPlayer::prepare_decoder()
     if (audio_ring_)
         audio_ring_->drain();
 
+    // How far ahead the demuxer reads: the buffer's duration in packets of
+    // each stream (AAC: ~47 a second), never less than before, and its size.
+    video_packets_.max = std::max<std::size_t>(160, static_cast<std::size_t>(buffer_seconds_ / frame_duration_));
+    video_packets_.max_bytes = buffer_bytes_;
+    audio_packets_.max = std::max<std::size_t>(640, static_cast<std::size_t>(buffer_seconds_ * 50.0));
+    write_log("[DEBUG] VideoPlayer buffer %.0f s: video %zu packets, %zu bytes max\n", buffer_seconds_,
+              video_packets_.max, video_packets_.max_bytes);
+
     if (open_seek_ > 0.5)
         seek_target_.store(open_seek_, std::memory_order_release);
     is_open_.store(true, std::memory_order_release);
@@ -486,6 +514,8 @@ void VideoPlayer::close()
         audio_ring_->drain();
 
     is_open_ = false;
+    eof_ = false;
+    finished_ = false;
     seeking_ = false;
     seek_target_ = -1.0;
     seek_discard_until_ = -1.0;
@@ -524,7 +554,7 @@ void VideoPlayer::pause()
             const auto now = std::chrono::steady_clock::now();
             const double elapsed =
                 std::chrono::duration<double>(now - clock_wall_).count();
-            clock_pts_ += elapsed;
+            clock_pts_ += elapsed * speed_.load();
             clock_wall_ = now;
         }
     }
@@ -578,6 +608,7 @@ void VideoPlayer::queue_clear(PacketQueue &queue)
     for (AVPacket *packet : queue.q)
         av_packet_free(&packet);
     queue.q.clear();
+    queue.bytes = 0;
     queue.cv.notify_all();
 }
 
@@ -593,13 +624,15 @@ bool VideoPlayer::queue_push(PacketQueue &queue, AVPacket *packet)
     std::unique_lock<std::mutex> lock(queue.mu);
     queue.cv.wait(lock, [&] {
         return queue.aborted || stop_thread_.load(std::memory_order_acquire) ||
-               seek_target_.load(std::memory_order_acquire) >= 0.0 || queue.q.size() < queue.max;
+               seek_target_.load(std::memory_order_acquire) >= 0.0 ||
+               (queue.q.size() < queue.max && (queue.max_bytes == 0 || queue.bytes < queue.max_bytes));
     });
     if (queue.aborted || stop_thread_.load(std::memory_order_acquire) ||
         seek_target_.load(std::memory_order_acquire) >= 0.0) {
         av_packet_free(&packet);
         return false;
     }
+    queue.bytes += static_cast<std::size_t>(std::max(0, packet->size));
     queue.q.push_back(packet);
     queue.cv.notify_one();
     return true;
@@ -612,6 +645,7 @@ AVPacket *VideoPlayer::queue_try_pop(PacketQueue &queue)
         return nullptr;
     AVPacket *packet = queue.q.front();
     queue.q.pop_front();
+    queue.bytes -= std::min(queue.bytes, static_cast<std::size_t>(std::max(0, packet->size)));
     queue.cv.notify_one();
     return packet;
 }
@@ -626,6 +660,7 @@ AVPacket *VideoPlayer::queue_pop_wait(PacketQueue &queue, int timeout_ms)
         return nullptr;
     AVPacket *packet = queue.q.front();
     queue.q.pop_front();
+    queue.bytes -= std::min(queue.bytes, static_cast<std::size_t>(std::max(0, packet->size)));
     queue.cv.notify_one();
     return packet;
 }
@@ -633,8 +668,11 @@ AVPacket *VideoPlayer::queue_pop_wait(PacketQueue &queue, int timeout_ms)
 void VideoPlayer::demux_loop()
 {
     while (!stop_thread_.load(std::memory_order_acquire)) {
-        if (demux_apply_seek())
+        if (demux_apply_seek()) {
+            eof_ = false;
+            finished_ = false;
             continue;
+        }
         if (!playing_.load()) {
             wait_interruptible(0.02);
             continue;
@@ -647,6 +685,8 @@ void VideoPlayer::demux_loop()
             av_packet_free(&packet);
             if (stop_thread_.load(std::memory_order_acquire))
                 break;
+            if (ret == AVERROR_EOF || avio_feof(format_ctx_->pb))
+                eof_ = true;
             wait_interruptible(0.02);
             continue;
         }
@@ -745,8 +785,16 @@ void VideoPlayer::decode_loop()
         }
 
         AVPacket *packet = queue_pop_wait(video_packets_, 20);
-        if (!packet)
+        if (!packet) {
+            if (eof_.load() && !finished_.load()) {
+                std::lock_guard<std::mutex> lock(video_packets_.mu);
+                if (video_packets_.q.empty()) {
+                    finished_ = true;
+                    write_log("[DEBUG] VideoPlayer finished at %.1f\n", current_position_.load());
+                }
+            }
             continue;
+        }
         if (avcodec_send_packet(video_codec_ctx_, packet) == 0) {
             while (avcodec_receive_frame(video_codec_ctx_, frame) == 0) {
                 if (video_need_flush_.load(std::memory_order_acquire) ||
@@ -831,6 +879,10 @@ void VideoPlayer::audio_loop()
         return;
     std::vector<float> resampled;
     const double ring_rate = static_cast<double>(audio_out_rate_);
+    // The rate swr is told the source has: the real one times the speed, so
+    // a faster film gives fewer samples a second of it.
+    double built_speed = 1.0;
+    int in_rate = audio_codec_ctx_->sample_rate;
 
     while (!stop_thread_.load(std::memory_order_acquire)) {
         if (audio_need_flush_.exchange(false, std::memory_order_acq_rel))
@@ -843,6 +895,22 @@ void VideoPlayer::audio_loop()
             continue;
         }
 
+        const double speed = speed_.load();
+        if (speed != built_speed) {
+            in_rate = static_cast<int>(std::lround(audio_codec_ctx_->sample_rate * speed));
+            AVChannelLayout out_layout;
+            av_channel_layout_default(&out_layout, 2);
+            swr_free(&swr_ctx_);
+            swr_alloc_set_opts2(&swr_ctx_, &out_layout, AV_SAMPLE_FMT_FLT, audio_out_rate_,
+                                &audio_codec_ctx_->ch_layout, audio_codec_ctx_->sample_fmt, in_rate, 0,
+                                nullptr);
+            if (!swr_ctx_ || swr_init(swr_ctx_) < 0) {
+                write_log("[DEBUG] audio speed %.2f: swr failed\n", speed);
+                break;
+            }
+            built_speed = speed;
+        }
+
         AVPacket *packet = queue_pop_wait(audio_packets_, 20);
         if (!packet)
             continue;
@@ -853,8 +921,8 @@ void VideoPlayer::audio_loop()
                     stop_thread_.load(std::memory_order_acquire))
                     break;
                 const int max_dst_nb_samples = static_cast<int>(av_rescale_rnd(
-                    swr_get_delay(swr_ctx_, audio_codec_ctx_->sample_rate) + audio_frame->nb_samples,
-                    audio_out_rate_, audio_codec_ctx_->sample_rate, AV_ROUND_UP));
+                    swr_get_delay(swr_ctx_, in_rate) + audio_frame->nb_samples,
+                    audio_out_rate_, in_rate, AV_ROUND_UP));
                 if (max_dst_nb_samples <= 0)
                     continue;
                 if (resampled.size() < static_cast<size_t>(max_dst_nb_samples) * 2)
@@ -871,8 +939,9 @@ void VideoPlayer::audio_loop()
                 // hold audio that is early (after a pause or a stall).
                 const double a_pts = packet_pts_seconds(audio_frame, audio_stream_idx_);
                 if (a_pts != AV_NOPTS_VALUE) {
-                    const double dur = converted / ring_rate;
-                    double heard_at = master_clock() + audio_ring_->available() / ring_rate;
+                    // A second of the ring is `speed` seconds of the film
+                    const double dur = converted / ring_rate * built_speed;
+                    double heard_at = master_clock() + audio_ring_->available() / ring_rate * built_speed;
                     if (a_pts + dur < heard_at - 0.03)
                         continue;
                     bool ok = true;
@@ -881,7 +950,7 @@ void VideoPlayer::audio_loop()
                             ok = false;
                             break;
                         }
-                        heard_at = master_clock() + audio_ring_->available() / ring_rate;
+                        heard_at = master_clock() + audio_ring_->available() / ring_rate * built_speed;
                     }
                     if (!ok)
                         break;

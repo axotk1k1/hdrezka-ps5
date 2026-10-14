@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rezka_api.hpp"
+#include "app_settings.hpp"
 #include "video_player.hpp"
 #include "texture_loader.hpp"
 #include "gfx/vk/vk_renderer.hpp"
@@ -52,6 +53,14 @@ struct HomeSection
     std::string title;
     int begin = 0; // index into movies[]
     int count = 0;
+};
+
+// One line of a WebVTT file: shown from start to end (seconds of the film).
+struct SubtitleCue
+{
+    double start = 0.0;
+    double end = 0.0;
+    std::string text; // lines joined by '\n', tags removed
 };
 
 struct ContinueEntry
@@ -254,6 +263,29 @@ public:
     void load_continue_map();
     void persist_continue_map();
 
+    // The settings screen's preferences (data/settings.cfg). Read and changed
+    // on the main thread; settings_snapshot() is for the workers.
+    const AppSettings &settings() const { return settings_; }
+    AppSettings settings_snapshot();
+    // Keeps the new preferences, saves them and applies what they change at once.
+    void update_settings(const AppSettings &next);
+    // A title the country filter hides ("2024, США, Боевики").
+    bool hidden_by_filter(const std::string &info);
+    // "Источник": whether a mirror answers. mirror_check: 0 idle, 1 checking,
+    // 2 it answers (and is now the mirror), 3 it does not.
+    void check_mirror_async(const std::string &mirror);
+    std::atomic<int> mirror_check{0};
+
+    // The playing stream's subtitles: its tracks (from get_streams), the one
+    // chosen (-1: off) and its cues once loaded. Guarded by catalog_mutex.
+    std::vector<SubtitleTrack> playing_subtitles;
+    int subtitle_idx = -1;
+    std::vector<SubtitleCue> subtitle_cues;
+    std::atomic<uint32_t> subtitle_version{0};
+    void select_subtitle_async(int idx);
+    // The cue on screen at `t`, empty when none.
+    std::string subtitle_at(double t);
+
     // Bookmarks, by page url. toggle_favorite returns the new state.
     bool is_favorite(const std::string &url);
     bool toggle_favorite(const std::string &url, const std::string &title);
@@ -298,6 +330,10 @@ private:
     void load_search_history();
     void persist_search_history();
     std::map<std::string, std::string> favorites_; // url -> title
+
+    AppSettings settings_;
+    std::mutex settings_mutex_;
+    void apply_settings();
 
     BigThread worker_thread_;
     std::atomic<bool> stop_worker_{false};

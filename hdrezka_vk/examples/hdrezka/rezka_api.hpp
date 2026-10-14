@@ -82,6 +82,13 @@ struct Season
     std::vector<Episode> episodes;
 };
 
+// A subtitle track of a stream ("subtitle" in get_cdn_series' answer).
+struct SubtitleTrack
+{
+    std::string label; // "Русский", "English", ...
+    std::string url;   // a WebVTT file
+};
+
 struct StreamQuality
 {
     std::string quality; // e.g. "1080p Ultra", "1080p", "720p", "480p", "360p"
@@ -326,15 +333,24 @@ public:
                       std::vector<Season> &out_seasons);
 
     // Get stream links
+    // subtitles, when given, gets the stream's subtitle tracks (none: empty).
     std::vector<StreamQuality> get_streams(const VideoDetails &video,
                                            const std::string &translator_id,
                                            const std::string &season_id = "",
-                                           const std::string &episode_id = "");
+                                           const std::string &episode_id = "",
+                                           std::vector<SubtitleTrack> *subtitles = nullptr);
 
     bool http_get_binary(const std::string &url, std::vector<uint8_t> &out_bytes);
 
     // Probe known mirrors and keep the first one that returns a catalog page.
+    // With a preferred mirror (the settings' "Источник") only that one is tried.
     bool pick_mirror();
+    void set_preferred_mirror(const std::string &mirror);
+    std::string preferred_mirror() const;
+    // Whether `mirror` answers with a catalog page; it becomes the mirror when it does.
+    bool check_mirror(const std::string &mirror);
+    // "Включить обход SSL": no certificate check when on (every Client).
+    static void set_ssl_bypass(bool on);
 
     // Utility: stream deobfuscator
     static std::string clear_trash(const std::string &data);
@@ -342,6 +358,8 @@ public:
 
 private:
     std::string mirror_{"https://hdrezka.ag"};
+    mutable std::mutex preferred_mu_;
+    std::string preferred_mirror_;
     std::string cookie_file_;
     std::recursive_mutex net_mu_;
     std::string http_get(const std::string &url);
