@@ -1,0 +1,6 @@
+# Public repository: the release's description only. Everything else
+# (the source, the build, the assets, the tools) stays out.
+/*
+!/README.md
+!/LICENSE.md
+!/.gitignore
