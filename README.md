@@ -1,4 +1,4 @@
-<img width="1254" height="1254" alt="cinematográfico" src="https://github.com/user-attachments/assets/82619674-496b-4785-a8c0-c79627b8b124" />
+<img width="128" height="128" alt="cinematográfico" src="https://github.com/user-attachments/assets/82619674-496b-4785-a8c0-c79627b8b124" />
 
 
 # HDRezka for PlayStation 5
