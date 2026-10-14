@@ -230,7 +230,11 @@ public:
 
     void play_stream(const std::string &title, const std::string &voice, const std::string &url);
     void play_title_async(int movie_idx, int translator_idx, int quality_idx, int season_idx,
-                          int episode_idx, double start_time = -1.0);
+                          int episode_idx, double start_time = -1.0, std::string quality_label = {});
+    // Applied on the next App::update, on the main thread. Does not stop the
+    // decoder or touch the Vulkan texture.
+    void queue_playback(int movie_idx, int translator_idx, int quality_idx, int season_idx,
+                        int episode_idx, double start_time, std::string quality_label);
     void login_async(const std::string& email, const std::string& password);
     void refresh_account_async();
     // Signs out on the site and forgets the session here.
@@ -261,7 +265,28 @@ private:
     App(const App &) = delete;
     App &operator=(const App &) = delete;
 
-    void halt_decoder();
+    struct QueuedPlay {
+        bool pending = false;
+        int movie_idx = -1;
+        int translator_idx = 0;
+        int quality_idx = 0;
+        int season_idx = 0;
+        int episode_idx = 0;
+        double start_time = -1.0;
+        std::string quality_label;
+    };
+
+    void stop_decoder();
+    void release_video_texture();
+    QueuedPlay queued_play_;
+    bool release_video_texture_ = false;
+    bool video_sync_texture_ = false;
+    // The film's audio ring is in the mixer only while the film plays: a
+    // paused film keeps what it decoded instead of the mixer draining it.
+    bool video_audio_live_ = false;
+    // Swapped with the decoder's buffer every frame, so a 1080p RGBA frame
+    // (8 MB) is not allocated and zeroed again for each picture.
+    std::vector<uint8_t> video_frame_rgba_;
     void queue_person_posters(uint32_t epoch, int from);
     void load_favorites();
     void persist_favorites();

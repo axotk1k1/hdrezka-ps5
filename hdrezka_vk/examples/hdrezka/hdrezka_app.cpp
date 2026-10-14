@@ -1726,8 +1726,31 @@ static int pick_stream_index(const std::vector<StreamQuality> &streams, const st
     return best;
 }
 
+void App::queue_playback(int movie_idx, int translator_idx, int quality_idx, int season_idx,
+                         int episode_idx, double start_time, std::string quality_label)
+{
+    const uint32_t serial = ++play_serial_;
+    std::lock_guard<std::mutex> pl(play_mu_);
+    pending_play_url_.clear();
+    pending_play_title_.clear();
+    pending_play_voice_.clear();
+    pending_play_quality_.clear();
+    pending_play_item_url_.clear();
+    pending_seek_ = -1.0;
+    queued_play_.pending = true;
+    queued_play_.movie_idx = movie_idx;
+    queued_play_.translator_idx = translator_idx;
+    queued_play_.quality_idx = quality_idx;
+    queued_play_.season_idx = season_idx;
+    queued_play_.episode_idx = episode_idx;
+    queued_play_.start_time = start_time;
+    queued_play_.quality_label = std::move(quality_label);
+    write_log("[DEBUG] queue_playback serial=%u movie=%d q=%d label=%s seek=%.1f\n", serial, movie_idx,
+              quality_idx, queued_play_.quality_label.c_str(), start_time);
+}
+
 void App::play_title_async(int movie_idx, int translator_idx, int quality_idx, int season_idx,
-                           int episode_idx, double start_time)
+                           int episode_idx, double start_time, std::string quality_label)
 {
     const uint32_t serial = ++play_serial_;
     {
@@ -1741,7 +1764,8 @@ void App::play_title_async(int movie_idx, int translator_idx, int quality_idx, i
     }
     is_buffering = true;
 
-    BigThread([this, movie_idx, translator_idx, quality_idx, season_idx, episode_idx, start_time, serial]() {
+    BigThread([this, movie_idx, translator_idx, quality_idx, season_idx, episode_idx, start_time, serial,
+               quality_label = std::move(quality_label)]() {
         write_log("[DEBUG] play_title_async thread started movie_idx=%d tr=%d q=%d s=%d e=%d seek=%.1f serial=%u\n",
                   movie_idx, translator_idx, quality_idx, season_idx, episode_idx, start_time, serial);
         std::string url, title, voice = "HDRezka", item_url;
@@ -1773,7 +1797,9 @@ void App::play_title_async(int movie_idx, int translator_idx, int quality_idx, i
             title = m.title;
             item_url = m.url;
             static const char *kDefaultQualities[] = {"1080p Ultra", "1080p", "720p", "480p", "360p"};
-            if (quality_idx >= 0 && quality_idx < static_cast<int>(m.streams.size()))
+            if (!quality_label.empty())
+                wanted_quality = quality_label;
+            else if (quality_idx >= 0 && quality_idx < static_cast<int>(m.streams.size()))
                 wanted_quality = m.streams[static_cast<std::size_t>(quality_idx)].quality;
             else if (quality_idx >= 0 && quality_idx < 5)
                 wanted_quality = kDefaultQualities[quality_idx];
@@ -1879,13 +1905,23 @@ void App::play_title_async(int movie_idx, int translator_idx, int quality_idx, i
     }).detach();
 }
 
-void App::halt_decoder()
+void App::stop_decoder()
 {
-    player.close();
     if (mixer) {
         mixer->swap_stream(1, nullptr);
         mixer->set_stream_gain(0, 0.0f, 0.1f);
     }
+    video_audio_live_ = false;
+    player.close();
+}
+
+void App::release_video_texture()
+{
+    if (!release_video_texture_)
+        return;
+    release_video_texture_ = false;
+    video_sync_texture_ = false;
+    write_log("[DEBUG] release_video_texture handle=%u\n", video_texture.hui_handle);
     if (device && device->logicalDevice)
         vkDeviceWaitIdle(device->logicalDevice);
     if (video_texture.hui_handle != 0 && renderer) {
@@ -1893,6 +1929,7 @@ void App::halt_decoder()
         video_texture.hui_handle = 0;
     }
     video_texture.release();
+    video_frame_rgba_ = {};
 }
 
 void App::play_stream(const std::string &title, const std::string &voice, const std::string &url)
@@ -1904,7 +1941,8 @@ void App::play_stream(const std::string &title, const std::string &voice, const 
 
     if (is_playing)
         save_continue_progress();
-    halt_decoder();
+    stop_decoder();
+    video_sync_texture_ = true;
     is_playing = false;
 
     playing_title = title;
@@ -1914,15 +1952,13 @@ void App::play_stream(const std::string &title, const std::string &voice, const 
 
     write_log("[DEBUG] play_stream calling player.open(%s) seek=%.1f\n", url.c_str(), seek_to);
     is_buffering = true;
-    if (player.open(url)) {
-        write_log("[DEBUG] player.open succeeded\n");
+    if (player.open(url, seek_to)) {
+        write_log("[DEBUG] player.open queued\n");
         if (mixer) {
             mixer->set_stream_gain(0, 0.0f, 0.1f);
-            mixer->swap_stream(1, &audio_ring);
+            video_audio_live_ = mixer->swap_stream(1, &audio_ring);
             mixer->set_stream_gain(1, 1.0f, 0.1f);
         }
-        if (seek_to > 5.0)
-            player.seek(seek_to);
         is_playing = true;
         osd_timer = 4.0f;
         osd_visible = true;
@@ -1948,10 +1984,12 @@ void App::stop_playback()
         pending_play_quality_.clear();
         pending_play_item_url_.clear();
         pending_seek_ = -1.0;
+        queued_play_ = {};
     }
     if (is_playing)
         save_continue_progress();
-    halt_decoder();
+    stop_decoder();
+    release_video_texture_ = true;
     is_playing = false;
     is_buffering = false;
 }
@@ -1963,6 +2001,29 @@ void App::update(float dt)
         network_started_ = true;
         load_movie_list_async(list_tab, list_type);
         refresh_account_async();
+    }
+
+    // Previous frame has been submitted. Drop a video image only here, before
+    // this frame records a command buffer that could sample it.
+    release_video_texture();
+
+    QueuedPlay queued;
+    {
+        std::lock_guard<std::mutex> pl(play_mu_);
+        if (queued_play_.pending) {
+            queued = std::move(queued_play_);
+            queued_play_ = {};
+            queued.pending = true;
+        }
+    }
+    if (queued.pending) {
+        write_log("[DEBUG] apply queued playback movie=%d q=%d label=%s seek=%.1f\n", queued.movie_idx,
+                  queued.quality_idx, queued.quality_label.c_str(), queued.start_time);
+        stop_decoder();
+        video_sync_texture_ = true;
+        is_playing = false;
+        play_title_async(queued.movie_idx, queued.translator_idx, queued.quality_idx, queued.season_idx,
+                         queued.episode_idx, queued.start_time, queued.quality_label);
     }
 
     std::string url, title, voice, quality, item_url;
@@ -2036,6 +2097,16 @@ void App::update(float dt)
         }
     }
 
+    if ((is_playing || is_buffering) && player.consume_open_error()) {
+        write_log("[DEBUG] player.open failed on the decode thread\n");
+        stop_decoder();
+        is_playing = false;
+        is_buffering = false;
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        catalog_status = "Ошибка воспроизведения видео";
+        catalog_version++;
+    }
+
     // Update video playback frame
     if (is_playing && player.is_open()) {
         if (osd_timer > 0.0f) {
@@ -2043,10 +2114,18 @@ void App::update(float dt)
             if (osd_timer <= 0.0f) osd_visible = false;
         }
 
-        std::vector<uint8_t> frame_rgba;
+        const bool audio_live = player.is_playing();
+        if (mixer && audio_live != video_audio_live_ &&
+            mixer->swap_stream(1, audio_live ? &audio_ring : nullptr))
+            video_audio_live_ = audio_live;
+
+        std::vector<uint8_t> &frame_rgba = video_frame_rgba_;
         uint32_t vw = 0, vh = 0;
         if (player.get_frame(frame_rgba, vw, vh) && vw > 0 && vh > 0 &&
             frame_rgba.size() == static_cast<size_t>(vw) * static_cast<size_t>(vh) * 4) {
+            if (video_sync_texture_ && device && device->logicalDevice)
+                vkDeviceWaitIdle(device->logicalDevice);
+            video_sync_texture_ = false;
             if (video_texture.image == VK_NULL_HANDLE || video_texture.width != vw || video_texture.height != vh) {
                 if (device && device->logicalDevice)
                     vkDeviceWaitIdle(device->logicalDevice);
@@ -2054,6 +2133,7 @@ void App::update(float dt)
                     renderer->destroy_texture(video_texture.hui_handle);
                     video_texture.hui_handle = 0;
                 }
+                video_texture.release();
                 video_texture.init(device, queue, vw, vh);
                 if (renderer && video_texture.view != VK_NULL_HANDLE) {
                     video_texture.hui_handle = renderer->import_texture(video_texture.view);

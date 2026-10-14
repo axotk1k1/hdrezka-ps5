@@ -375,11 +375,8 @@ void Client::set_mirror(const std::string &mirror)
     }
 }
 
-// Some mirrors answer the app's own headers with a bare 403 on a title's page
-// (to those not signed in, from some countries) while a browser gets the
-// page behind the Anubis proof of work, which solve_anubis_challenge passes.
-// The first such 403 switches every later request to a browser's identity.
-static std::atomic<bool> g_browser_identity{false};
+// One browser identity for the whole process. Switching to another User-Agent
+// after a 403 makes DLE drop the Premium session (Set-Cookie dle_user_id=deleted).
 static const char *const kBrowserAgent =
     "Mozilla/5.0 (Linux; Android 12; BRAVIA 4K) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36";
@@ -388,14 +385,7 @@ static void setup_curl_headers(CURL *curl, struct curl_slist **headers, const st
 {
     console_curl_setup(curl);
 
-    const bool browser = g_browser_identity.load();
-    if (browser) {
-        *headers = curl_slist_append(*headers, (std::string("User-Agent: ") + kBrowserAgent).c_str());
-    } else {
-        *headers = curl_slist_append(*headers, "User-Agent: okhttp/4.12.0");
-        *headers = curl_slist_append(*headers, "X-Hdrezka-Android-App-V2: 1");
-        *headers = curl_slist_append(*headers, "X-Hdrezka-Android-App-Version-V2: 0.9.15 \xce\xb2");
-    }
+    *headers = curl_slist_append(*headers, (std::string("User-Agent: ") + kBrowserAgent).c_str());
     *headers = curl_slist_append(*headers, "Accept-Language: ru-RU,ru;q=0.9,uk-UA,uk;q=0.8,en;q=0.7");
     *headers = curl_slist_append(*headers, "Accept: */*");
 
@@ -410,7 +400,7 @@ static void setup_curl_headers(CURL *curl, struct curl_slist **headers, const st
     }
 
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, *headers);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, browser ? kBrowserAgent : "okhttp/4.12.0");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, kBrowserAgent);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
@@ -614,11 +604,6 @@ std::string Client::http_get(const std::string &url)
 
     if (res != CURLE_OK) return "";
 
-    if (http_code == 403 && !g_browser_identity.exchange(true)) {
-        write_log("[DEBUG] http_get 403 for the app's headers: asking as a browser from now on\n");
-        return http_get(url);
-    }
-
     // Check for Anubis challenge
     if (response.find("anubis_challenge") != std::string::npos) {
         if (solve_anubis_challenge(response, full_url)) {
@@ -689,11 +674,6 @@ std::string Client::http_post(const std::string &url, const std::map<std::string
               (int)res, curl_easy_strerror(res), post_code, errbuf);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
-
-    if (res == CURLE_OK && post_code == 403 && !g_browser_identity.exchange(true)) {
-        write_log("[DEBUG] http_post 403 for the app's headers: asking as a browser from now on\n");
-        return http_post(url, fields);
-    }
 
     write_log("[DEBUG] http_post done rc=%d bytes=%zu resp: %.200s\n", (int)res, response.size(), response.c_str());
 
@@ -817,13 +797,65 @@ static bool stream_is_mp4(const std::string &u)
 
 static std::string strip_hls_wrapper(std::string u)
 {
+    u = trim_stream_token(std::move(u));
+    // voidboost appends this to a direct mp4 when there is no separate " or " link.
     const char *kMarks[] = {":hls:manifest.m3u8", ":hls:manifest", ":hls"};
     for (const char *mark : kMarks) {
-        const size_t at = u.find(mark);
-        if (at != std::string::npos)
-            u.erase(at);
+        const size_t n = std::strlen(mark);
+        if (u.size() >= n && u.compare(u.size() - n, n, mark) == 0) {
+            u.erase(u.size() - n);
+            break;
+        }
     }
     return trim_stream_token(std::move(u));
+}
+
+static bool is_quality_label(const std::string &label)
+{
+    if (label.empty() || label.size() > 24)
+        return false;
+    if (label.find("://") != std::string::npos || label.find('/') != std::string::npos ||
+        label.find('.') != std::string::npos)
+        return false;
+    bool mark = false;
+    for (unsigned char c : label) {
+        if (std::isdigit(c)) {
+            mark = true;
+            continue;
+        }
+        const char lower = static_cast<char>(std::tolower(c));
+        if (lower == 'p' || lower == 'k' || lower == 'u' || lower == 'l' || lower == 't' ||
+            lower == 'r' || lower == 'a' || lower == 'h' || lower == 'd' || lower == 's' ||
+            lower == 'i' || lower == ' ' || lower == '+' || lower == '-')
+            continue;
+        return false;
+    }
+    const std::string low = [&] {
+        std::string s = label;
+        for (char &c : s)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    }();
+    return mark || low.find("hd") != std::string::npos || low.find("ultra") != std::string::npos ||
+           low.find('k') != std::string::npos;
+}
+
+// Next "[360p]" / "[1080p Ultra]" / "[4K]". A '[' inside a URL is not a label.
+static size_t find_quality_marker(const std::string &raw, size_t from, size_t *bracket_end)
+{
+    for (size_t i = from; i < raw.size(); ++i) {
+        if (raw[i] != '[')
+            continue;
+        const size_t end = raw.find(']', i + 1);
+        if (end == std::string::npos || end - i > 25)
+            continue;
+        if (!is_quality_label(raw.substr(i + 1, end - (i + 1))))
+            continue;
+        if (bracket_end)
+            *bracket_end = end;
+        return i;
+    }
+    return std::string::npos;
 }
 
 static int stream_url_score(const std::string &u)
@@ -870,11 +902,12 @@ static std::string pick_direct_stream_url(const std::string &blob)
     }
 
     auto consider_into = [](std::string u, std::string &best, int &best_score) {
-        u = trim_stream_token(std::move(u));
+        u = strip_hls_wrapper(trim_stream_token(std::move(u)));
         if (u.rfind("//", 0) == 0)
             u = "https:" + u;
         if (u.rfind("http", 0) != 0)
             return;
+        u = strip_hls_wrapper(u);
         const int score = stream_url_score(u);
         if (score > best_score) {
             best_score = score;
@@ -892,25 +925,7 @@ static std::string pick_direct_stream_url(const std::string &blob)
     };
     for (const std::string &part : parts)
         consider(part);
-
-    // Also pick bare http(s) tokens in case the CDN list used an odd separator.
-    size_t http_at = 0;
-    while ((http_at = blob.find("http", http_at)) != std::string::npos) {
-        if (blob.compare(http_at, 7, "http://") != 0 && blob.compare(http_at, 8, "https://") != 0) {
-            ++http_at;
-            continue;
-        }
-        size_t end = http_at;
-        while (end < blob.size()) {
-            const unsigned char c = static_cast<unsigned char>(blob[end]);
-            if (std::isspace(c) || c == ',' || c == '[' || c == '"' || c == '\'')
-                break;
-            ++end;
-        }
-        consider(blob.substr(http_at, end - http_at));
-        http_at = end;
-    }
-    return best;
+    return strip_hls_wrapper(best);
 }
 
 static std::string json_unescape_string(const std::string &json, size_t start, size_t *end_out)
@@ -1017,17 +1032,19 @@ std::vector<StreamQuality> Client::parse_stream_string(const std::string &raw)
         return qualities;
 
     size_t pos = 0;
-    while ((pos = raw.find('[', pos)) != std::string::npos) {
-        const size_t label_end = raw.find(']', pos + 1);
-        if (label_end == std::string::npos)
+    while (pos < raw.size()) {
+        size_t label_end = 0;
+        const size_t marker = find_quality_marker(raw, pos, &label_end);
+        if (marker == std::string::npos)
             break;
-        std::string quality_label = strip_tags(raw.substr(pos + 1, label_end - (pos + 1)));
-        const size_t next = raw.find('[', label_end + 1);
+        std::string quality_label = strip_tags(raw.substr(marker + 1, label_end - (marker + 1)));
+        size_t next_end = 0;
+        const size_t next = find_quality_marker(raw, label_end + 1, &next_end);
         std::string blob = raw.substr(label_end + 1,
                                       (next == std::string::npos ? raw.size() : next) - (label_end + 1));
         pos = next == std::string::npos ? raw.size() : next;
 
-        const std::string best_url = pick_direct_stream_url(blob);
+        const std::string best_url = strip_hls_wrapper(pick_direct_stream_url(blob));
         if (best_url.rfind("http", 0) != 0)
             continue;
         StreamQuality sq;

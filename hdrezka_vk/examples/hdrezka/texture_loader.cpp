@@ -317,6 +317,8 @@ bool VideoTexture::update_frame(const uint8_t *rgba_pixels, size_t nbytes)
     const VkDeviceSize image_size = static_cast<VkDeviceSize>(width) * height * 4;
     if (nbytes < image_size || image_size == 0)
         return false;
+    // Same size as init(): reuse the image, the view, and this persistent staging map.
+    // A new VkImage is created only from VideoTexture::init when the resolution changes.
     std::memcpy(mapped_staging, rgba_pixels, static_cast<size_t>(image_size));
 
     VkCommandBuffer cmd = device->createCommandBuffer(VK_COMMAND_BUFFER_LEVEL_PRIMARY, true);

@@ -770,15 +770,26 @@ class Store final : public app::Concept
                 feedback.play(audio::Cue::select);
                 if (pl_quality_focus_ != app.playing_quality_idx)
                 {
-                    // The same place in the other quality
+                    // Applied next App::update. stop_playback here would free the
+                    // frame the current DrawList still samples.
                     const int index = app.playing_movie_idx;
                     const int voice = app.playing_translator_idx;
                     const int season = app.playing_season_idx;
                     const int episode = app.playing_episode_idx;
-                    write_log("[DEBUG] player quality change focus=%d playing=%d pos=%.1f\n",
-                              pl_quality_focus_, app.playing_quality_idx, position);
-                    app.stop_playback();
-                    app.play_title_async(index, voice, pl_quality_focus_, season, episode, position);
+                    std::string label;
+                    {
+                        std::lock_guard<std::mutex> lock(app.catalog_mutex);
+                        if (index >= 0 && index < static_cast<int>(app.movies.size())) {
+                            const auto &streams = app.movies[static_cast<std::size_t>(index)].streams;
+                            if (pl_quality_focus_ >= 0 &&
+                                pl_quality_focus_ < static_cast<int>(streams.size()))
+                                label = streams[static_cast<std::size_t>(pl_quality_focus_)].quality;
+                        }
+                    }
+                    write_log("[DEBUG] player quality change focus=%d playing=%d label=%s pos=%.1f\n",
+                              pl_quality_focus_, app.playing_quality_idx, label.c_str(), position);
+                    app.queue_playback(index, voice, pl_quality_focus_, season, episode, position,
+                                       std::move(label));
                 }
             }
             return;
@@ -917,7 +928,20 @@ class Store final : public app::Concept
             pl_spinner(frame.scene);
             return;
         }
-        frame.scene.image(app.video_texture.hui_handle, {0.0f, 0.0f, kWidth, kHeight}, gfx::kFullUv, kWhite, 0.0f);
+        float vw = static_cast<float>(app.player.get_width());
+        float vh = static_cast<float>(app.player.get_height());
+        if (vw < 1.0f || vh < 1.0f) {
+            vw = static_cast<float>(app.video_texture.width);
+            vh = static_cast<float>(app.video_texture.height);
+        }
+        Rect picture{0.0f, 0.0f, kWidth, kHeight};
+        if (vw >= 1.0f && vh >= 1.0f) {
+            const float scale = std::min(kWidth / vw, kHeight / vh);
+            const float dw = vw * scale;
+            const float dh = vh * scale;
+            picture = {(kWidth - dw) * 0.5f, (kHeight - dh) * 0.5f, dw, dh};
+        }
+        frame.scene.image(app.video_texture.hui_handle, picture, gfx::kFullUv, kWhite, 0.0f);
 
         const float shown = pl_in_.value;
         if (shown > 0.01f)
