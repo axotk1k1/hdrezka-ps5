@@ -1265,7 +1265,7 @@ class Store final : public app::Concept
         }
 
         const bool triangle_pressed = input.is_pressed(Action::north) || ((ps5_pad().pressed & PAD_TRIANGLE) != 0);
-        if (!search_open_ && sx_screen_ == SxScreen::none && triangle_pressed)
+        if (!search_open_ && sx_screen_ == SxScreen::none && !upd_open_ && triangle_pressed)
         {
             search_open_ = true;
             search_query_.clear();
@@ -1296,14 +1296,18 @@ class Store final : public app::Concept
             if (!error.empty())
                 show_message(error);
         }
+        upd_poll();
 
         age_ += dt;
         clock_ += dt;
         if (page_open_)
             rebuild_page_model();
         search_tick(dt, feedback);
-        // The console's keyboard (or the sheet of keys) takes the pad while it is up.
-        if (kb_active())
+        // The update's dialog, then the console's keyboard (or the sheet of
+        // keys), take the pad while they are up.
+        if (upd_open_)
+            upd_update(input, feedback);
+        else if (kb_active())
             kb_update(input, feedback);
         // The topmost layer takes the input; the layers under it only animate.
         else if (sx_screen_ != SxScreen::none)
@@ -1375,6 +1379,7 @@ class Store final : public app::Concept
         draw_profile(overlay);
         draw_settings(overlay);
         wd_draw(overlay);
+        upd_draw(overlay);
         draw_toast(overlay, frame.glass_texture);
     }
 
@@ -4371,6 +4376,14 @@ class Store final : public app::Concept
         kStList,
         kStRange,
         kStMulti,
+        kStAction, // Cross does something: О приложении's rows
+    };
+    // О приложении's QR cards.
+    enum class StModal : std::uint8_t
+    {
+        none,
+        telegram,
+        donate,
     };
     enum StPref : int
     {
@@ -4394,6 +4407,10 @@ class Store final : public app::Concept
         kStBackBuffer,
         kStSubtitlePlace,
         kStSubtitleSize,
+        kStAppInfo,
+        kStAutoUpdate,
+        kStTelegram,
+        kStDonate,
     };
     struct StDef
     {
@@ -4448,6 +4465,18 @@ class Store final : public app::Concept
         {kStSubtitlePlace, kStList, "Расположение субтитров", nullptr, kTvIconSubtitles},
         {kStSubtitleSize, kStList, "Размер шрифта субтитров", nullptr, kTvIconTextFields},
     };
+    // О приложении, as the app's section is laid out (the version first, the
+    // update check under it), with this title's own links: the version row
+    // checks for an update, the channel and the donation open their QR codes.
+    static constexpr StDef kStAboutItems[] = {
+        {kStAppInfo, kStAction, "HDrezka homebrew for PS5", "Версия: 1.0.1", kTvIconInfoOutlined},
+        {kStAutoUpdate, kStSwitch, "Автоматическая проверка обновлений", "Проверять наличие обновлений при запуске приложения",
+         kTvIconBrowserUpdated},
+        {kStTelegram, kStAction, "Telegram канал", "t.me/hdrezkaps5", kTvIconSend},
+        {kStDonate, kStAction, "Поддержать автора", "Донат от 5$ в USDT (TRC20)", kTvIconCoffee},
+    };
+    static constexpr const char *kTelegramUrl = "https://t.me/hdrezkaps5";
+    static constexpr const char *kDonateAddress = "TANuxMByEoucUwMfgHpjjqfCvWtuyyPCop";
     static constexpr int kStGroups = 5;
     static constexpr int kStAbout = 4;
     static StGroup st_group(int g)
@@ -4463,7 +4492,7 @@ class Store final : public app::Concept
         case 3:
             return {"Субтитры", kTvIconSubtitles, kStSubtitle, static_cast<int>(std::size(kStSubtitle))};
         default:
-            return {"О приложении", kTvIconInfoOutlined, nullptr, 0};
+            return {"О приложении", kTvIconInfoOutlined, kStAboutItems, static_cast<int>(std::size(kStAboutItems))};
         }
     }
 
@@ -4480,6 +4509,7 @@ class Store final : public app::Concept
         case kStRainbow: return &s.rainbow_progress;
         case kStSsl: return &s.bypass_ssl;
         case kStAutoNext: return &s.auto_next_episode;
+        case kStAutoUpdate: return &s.check_update;
         default: return nullptr;
         }
     }
@@ -4520,7 +4550,9 @@ class Store final : public app::Concept
     std::string st_supporting(const StDef &def) const
     {
         rezka::AppSettings s = rezka::App::instance().settings();
-        if (def.kind == kStSwitch || def.kind == kStMulti)
+        if (def.key == kStAppInfo)
+            return std::string("Версия: ") + rezka::kAppVersion;
+        if (def.kind == kStSwitch || def.kind == kStMulti || def.kind == kStAction)
         {
             return def.summary ? def.summary : "";
         }
@@ -4561,6 +4593,7 @@ class Store final : public app::Concept
         st_sheet_ = false;
         st_scroll_.snap(0.0f);
         st_filter_dirty_ = false;
+        st_modal_ = StModal::none;
         rezka::App::instance().mirror_check = 0;
         feedback.play(audio::Cue::open);
     }
@@ -4641,6 +4674,16 @@ class Store final : public app::Concept
         }
         st_scroll_.update(dt, omega(16.0f));
         st_sheet_scroll_.update(dt, omega(16.0f));
+        if (st_modal_ != StModal::none)
+        {
+            // The QR card: Circle (or Cross) closes it
+            if (input.is_pressed(Action::back) || input.is_pressed(Action::confirm))
+            {
+                st_modal_ = StModal::none;
+                feedback.play(audio::Cue::modal_close);
+            }
+            return;
+        }
         if (st_sheet_)
         {
             update_settings_sheet(input, feedback);
@@ -4749,6 +4792,26 @@ class Store final : public app::Concept
         case kStRange:
             st_editing_ = true;
             feedback.play(audio::Cue::select);
+            break;
+        case kStAction:
+            if (def.key == kStAppInfo)
+            {
+                // The version: a check for an update, by hand
+                app.check_updates_async(true);
+                show_message("Проверка обновлений...");
+                feedback.play(audio::Cue::select);
+            }
+            else
+            {
+                const bool telegram = def.key == kStTelegram;
+                if (!qr::encode(telegram ? kTelegramUrl : kDonateAddress, st_qr_))
+                {
+                    tv_refuse(feedback, false);
+                    break;
+                }
+                st_modal_ = telegram ? StModal::telegram : StModal::donate;
+                feedback.play(audio::Cue::modal_open);
+            }
             break;
         case kStList:
         case kStMulti:
@@ -4958,31 +5021,6 @@ class Store final : public app::Concept
         }
 
         const StGroup group = st_group(st_group_);
-        if (st_group_ == kStAbout)
-        {
-            // О приложении: a plate for now, the section is filled later
-            const Rect card{right_x, top + 16.0f * dp, item_w, 200.0f * dp};
-            list.rounded_rect(card, 16.0f * dp, tv_surface_variant().with_alpha(0.35f));
-            list.bordered_rect(card, 16.0f * dp, kClear, 1.0f * dp, tv_border_variant());
-            tv_icon(list, kTvIconInfoOutlined, card.x + 24.0f * dp, card.y + 24.0f * dp, 40.0f * dp, tv_primary());
-            tv_text(list, tv_medium(), "HDRezka для PlayStation 5", card.x + 80.0f * dp, card.y + 24.0f * dp, 18.0f * dp,
-                    24.0f * dp, tv_on_surface(), gfx::Align::left, 0.1f * dp);
-            tv_text(list, tv_regular(), "Версия: 1.4.0", card.x + 80.0f * dp, card.y + 50.0f * dp, 14.0f * dp, 20.0f * dp,
-                    tv_on_surface_variant());
-            std::string lines[2];
-            tv_two_lines(*tv_regular().font,
-                         "Здесь появятся сведения о приложении, язык, обновления и ссылки. Раздел в разработке.",
-                         14.0f * dp, card.w - 48.0f * dp, lines);
-            tv_text(list, tv_regular(), lines[0], card.x + 24.0f * dp, card.y + 96.0f * dp, 14.0f * dp, 20.0f * dp,
-                    tv_on_surface());
-            tv_text(list, tv_regular(), lines[1], card.x + 24.0f * dp, card.y + 118.0f * dp, 14.0f * dp, 20.0f * dp,
-                    tv_on_surface());
-            const Rect chip{card.x + 24.0f * dp, card.y + card.h - 52.0f * dp, 140.0f * dp, 32.0f * dp};
-            list.rounded_rect(chip, 16.0f * dp, tv_secondary_container());
-            tv_text(list, tv_medium(), "В разработке", chip.cx(), chip.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp,
-                    tv_on_secondary_container(), gfx::Align::center, 0.1f * dp);
-        }
-        else
         {
             // The focused row kept in view: the list scrolls by whole rows
             float y = 16.0f * dp, focus_top = 0.0f, focus_bottom = 0.0f;
@@ -5047,7 +5085,253 @@ class Store final : public app::Concept
 
         if (st_sheet_)
             draw_settings_sheet(list, s);
+        st_draw_modal(list);
         kb_draw(list);
+    }
+
+    // The QR code on a white plate (a phone's camera reads dark on light): the
+    // quiet zone of four modules round it.
+    void draw_qr_plate(gfx::DrawList &list, const qr::Code &code, const Rect &plate) const
+    {
+        const float dp = kTvDp;
+        list.rounded_rect(plate, 12.0f * dp, kWhite);
+        const int n = code.size;
+        if (n <= 0)
+            return;
+        const float module = plate.w / static_cast<float>(n + 8);
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x)
+                if (code.at(x, y))
+                    list.rounded_rect({plate.x + static_cast<float>(x + 4) * module, plate.y + static_cast<float>(y + 4) * module,
+                                       module + 0.6f, module + 0.6f},
+                                      0.0f, Color::rgb(0x191c1e));
+    }
+
+    // ---- the updater's dialog ------------------------------------------------
+    //
+    // "Доступно обновление!": the new version and its notes, Обновить and
+    // Пропустить; then the download's progress, then what came of it. A check
+    // by hand that finds nothing says so in a toast.
+
+    void upd_poll()
+    {
+        auto &app = rezka::App::instance();
+        const std::uint32_t version = app.update_version.load();
+        if (version == upd_version_)
+            return;
+        upd_version_ = version;
+        std::string message;
+        {
+            std::lock_guard<std::mutex> lock(app.catalog_mutex);
+            message = app.update_message;
+        }
+        const bool manual = app.update_manual.load();
+        switch (app.update_status())
+        {
+        case rezka::UpdateState::available:
+            if (manual || !app.update_skipped.load())
+            {
+                upd_open_ = true;
+                upd_focus_ = 0;
+            }
+            break;
+        case rezka::UpdateState::latest:
+        case rezka::UpdateState::check_failed:
+            if (manual)
+                show_message(message);
+            break;
+        case rezka::UpdateState::downloading:
+        case rezka::UpdateState::installed:
+        case rezka::UpdateState::install_failed:
+            upd_open_ = true;
+            upd_focus_ = 0;
+            break;
+        default:
+            break;
+        }
+    }
+
+    void upd_update(const InputFrame &input, app::Feedback &feedback)
+    {
+        auto &app = rezka::App::instance();
+        const rezka::UpdateState state = app.update_status();
+        if (state == rezka::UpdateState::downloading)
+            return; // the download runs to its end
+        if (state != rezka::UpdateState::available)
+        {
+            // Installed or failed: one button, Ок
+            if (input.is_pressed(Action::confirm) || input.is_pressed(Action::back))
+            {
+                upd_open_ = false;
+                feedback.play(audio::Cue::modal_close);
+            }
+            return;
+        }
+        if (input.nav == Direction::left || input.nav == Direction::right)
+        {
+            const int next = input.nav == Direction::right ? 1 : 0;
+            if (next == upd_focus_)
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                upd_focus_ = next;
+                tv_tick(feedback, kWidth * (next ? 0.55f : 0.45f));
+            }
+            return;
+        }
+        const bool skip = input.is_pressed(Action::back) || (input.is_pressed(Action::confirm) && upd_focus_ == 1);
+        if (skip)
+        {
+            // Пропустить: not asked again this session
+            app.update_skipped = true;
+            app.update_state = static_cast<int>(rezka::UpdateState::idle);
+            upd_open_ = false;
+            feedback.play(audio::Cue::modal_close);
+            return;
+        }
+        if (input.is_pressed(Action::confirm))
+        {
+            app.download_update_async();
+            feedback.play(audio::Cue::select);
+        }
+    }
+
+    // A dialog button: a pill, light under the focus.
+    void upd_button(gfx::DrawList &list, const Rect &r, const char *label, bool focused, bool primary) const
+    {
+        const float dp = kTvDp;
+        const Rect g = focused ? scaled(r, 1.05f) : r;
+        list.rounded_rect(g, g.h * 0.5f,
+                          focused ? tv_on_surface() : primary ? tv_primary_container() : tv_surface_variant().with_alpha(0.5f));
+        tv_text(list, tv_medium(), label, g.cx(), g.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp,
+                focused ? tv_inverse_on_surface() : primary ? tv_on_primary_container() : tv_on_surface(), gfx::Align::center,
+                0.1f * dp);
+    }
+
+    void upd_draw(gfx::DrawList &list) const
+    {
+        if (!upd_open_)
+            return;
+        const float dp = kTvDp;
+        auto &app = rezka::App::instance();
+        const rezka::UpdateState state = app.update_status();
+        rezka::UpdateInfo info;
+        std::string message;
+        {
+            std::lock_guard<std::mutex> lock(app.catalog_mutex);
+            info = app.update_info;
+            message = app.update_message;
+        }
+        list.rounded_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, kBlack.with_alpha(0.6f));
+        const float w = 560.0f * dp;
+        const float text_w = w - 48.0f * dp;
+        // The notes, at most ten lines
+        std::vector<std::string> notes;
+        if (state == rezka::UpdateState::available)
+            for (const std::string &part : tv_regular().font->wrap(info.notes, 14.0f * dp, text_w))
+                if (notes.size() < 10)
+                    notes.push_back(part);
+        float h = 24.0f * dp + 36.0f * dp + 28.0f * dp + 24.0f * dp + 40.0f * dp + 24.0f * dp;
+        if (!notes.empty())
+            h += 12.0f * dp + static_cast<float>(notes.size()) * 20.0f * dp;
+        if (state == rezka::UpdateState::downloading)
+            h += 8.0f * dp;
+        const Rect card{(kWidth - w) * 0.5f, (kHeight - h) * 0.5f, w, h};
+        list.bordered_rect(card, 28.0f * dp, tv_surface(), 1.0f * dp, tv_border_variant());
+        const float x = card.x + 24.0f * dp;
+        float y = card.y + 24.0f * dp;
+        tv_icon(list, kTvIconBrowserUpdated, x, y + 4.0f * dp, 28.0f * dp, tv_primary());
+        const char *title = state == rezka::UpdateState::installed        ? "Обновление установлено"
+                            : state == rezka::UpdateState::install_failed ? "Обновление не установлено"
+                                                                          : "Доступно обновление!";
+        tv_text(list, tv_regular(), title, x + 40.0f * dp, y, 24.0f * dp, 36.0f * dp, tv_on_surface());
+        y += 36.0f * dp;
+        const std::string version = "Версия " + info.version + " (у вас " + rezka::kAppVersion + ")";
+        tv_text(list, tv_medium(), version, x, y, 14.0f * dp, 28.0f * dp, tv_primary(), gfx::Align::left, 0.1f * dp);
+        y += 28.0f * dp;
+        if (!notes.empty())
+        {
+            y += 12.0f * dp;
+            for (const std::string &line : notes)
+            {
+                tv_text(list, tv_regular(), line, x, y, 14.0f * dp, 20.0f * dp, tv_on_surface_variant());
+                y += 20.0f * dp;
+            }
+        }
+        y += 24.0f * dp;
+        const float buttons_y = card.y + card.h - 24.0f * dp - 40.0f * dp;
+        switch (state)
+        {
+        case rezka::UpdateState::available:
+            upd_button(list, {card.x + card.w - 24.0f * dp - 2.0f * 148.0f * dp - 12.0f * dp, buttons_y, 148.0f * dp, 40.0f * dp},
+                       "Обновить", upd_focus_ == 0, true);
+            upd_button(list, {card.x + card.w - 24.0f * dp - 148.0f * dp, buttons_y, 148.0f * dp, 40.0f * dp}, "Пропустить",
+                       upd_focus_ == 1, false);
+            break;
+        case rezka::UpdateState::downloading:
+        {
+            const float p = static_cast<float>(app.update_progress.load()) / 1000.0f;
+            char text[64];
+            std::snprintf(text, sizeof(text), "Скачивание обновления... %d%%", static_cast<int>(p * 100.0f + 0.5f));
+            tv_text(list, tv_regular(), text, x, buttons_y - 4.0f * dp, 14.0f * dp, 20.0f * dp, tv_on_surface());
+            const Rect bar{x, buttons_y + 28.0f * dp, text_w, 8.0f * dp};
+            list.rounded_rect(bar, 4.0f * dp, tv_surface_variant());
+            list.rounded_rect({bar.x, bar.y, std::max(8.0f * dp, bar.w * p), bar.h}, 4.0f * dp, tv_primary());
+            break;
+        }
+        default:
+            tv_text(list, tv_regular(), tv_regular().font->fit(message, 14.0f * dp, text_w - 140.0f * dp), x,
+                    buttons_y + 10.0f * dp, 14.0f * dp, 20.0f * dp,
+                    state == rezka::UpdateState::installed ? tv_on_surface() : tv_error());
+            upd_button(list, {card.x + card.w - 24.0f * dp - 120.0f * dp, buttons_y, 120.0f * dp, 40.0f * dp}, "Ок", true,
+                       true);
+            break;
+        }
+    }
+
+    // О приложении's cards: the project's channel and the donation, each a
+    // dialog of the app's (corners 28 dp, the surface, a hairline border) over
+    // a dimmed screen: the title, the QR code, what it holds and how to close.
+    void st_draw_modal(gfx::DrawList &list) const
+    {
+        if (st_modal_ == StModal::none)
+            return;
+        const float dp = kTvDp;
+        const bool donate = st_modal_ == StModal::donate;
+        list.rounded_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, kBlack.with_alpha(0.6f));
+        const float w = 480.0f * dp;
+        const float qr_side = 240.0f * dp;
+        const float h = (donate ? 452.0f : 404.0f) * dp;
+        const Rect card{(kWidth - w) * 0.5f, (kHeight - h) * 0.5f, w, h};
+        list.bordered_rect(card, 28.0f * dp, tv_surface(), 1.0f * dp, tv_border_variant());
+        float y = card.y + 24.0f * dp;
+        tv_text(list, tv_regular(), donate ? "Поддержать автора" : "Telegram проекта", card.cx(), y, 24.0f * dp, 32.0f * dp,
+                tv_on_surface(), gfx::Align::center);
+        y += 36.0f * dp;
+        if (donate)
+        {
+            tv_text(list, tv_regular(), "USDT (сеть TRC20) — на любую сумму от 5$", card.cx(), y, 14.0f * dp, 20.0f * dp,
+                    tv_on_surface_variant(), gfx::Align::center);
+            y += 28.0f * dp;
+        }
+        else
+            y += 4.0f * dp;
+        draw_qr_plate(list, st_qr_, {card.cx() - qr_side * 0.5f, y, qr_side, qr_side});
+        y += qr_side + 20.0f * dp;
+        if (donate)
+        {
+            // The address whole, large enough to read and to type
+            tv_text(list, tv_medium(), tv_medium().font->fit(kDonateAddress, 18.0f * dp, w - 32.0f * dp), card.cx(), y,
+                    18.0f * dp, 28.0f * dp, tv_on_surface(), gfx::Align::center, 0.3f * dp);
+            y += 32.0f * dp;
+            tv_text(list, tv_regular(), "Адрес кошелька USDT TRC20", card.cx(), y, 12.0f * dp, 16.0f * dp,
+                    tv_on_surface_variant(), gfx::Align::center);
+        }
+        else
+            tv_text(list, tv_medium(), kTelegramUrl, card.cx(), y, 18.0f * dp, 28.0f * dp, tv_primary(), gfx::Align::center,
+                    0.2f * dp);
+        tv_text(list, tv_regular(), "Нажмите Кружок для закрытия", card.cx(), card.y + card.h - 40.0f * dp, 14.0f * dp,
+                20.0f * dp, tv_on_surface_variant().with_alpha(0.8f), gfx::Align::center);
     }
 
     void draw_settings_sheet(gfx::DrawList &list, rezka::AppSettings &s) const
@@ -11542,6 +11826,12 @@ class Store final : public app::Concept
     int st_kb_ = 0;           // the keyboard is up for: 1 the mirror, 2 the countries' search
     std::string st_text_;
     bool st_filter_dirty_ = false;
+    StModal st_modal_ = StModal::none; // О приложении's QR card
+    qr::Code st_qr_;
+    // "Доступно обновление!": over everything, until it is answered
+    bool upd_open_ = false;
+    int upd_focus_ = 0; // 0 Обновить, 1 Пропустить
+    std::uint32_t upd_version_ = 0;
     bool st_reconnect_ = false;
     mutable tween::Spring st_scroll_;
     mutable tween::Spring st_sheet_scroll_;

@@ -23,6 +23,34 @@
 namespace rezka
 {
 
+// The title's version: what the updater compares GitHub's releases with.
+inline constexpr const char *kAppVersion = "1.0.1";
+// The releases of the title (Настройки → О приложении, the updater).
+inline constexpr const char *kUpdateRepo = "axotk1k1/hdrezka-ps5";
+
+// A newer title found on GitHub: its version, notes and eboot.bin.
+struct UpdateInfo
+{
+    std::string version;
+    std::string notes;
+    std::string url;    // eboot.bin's address
+    std::string sha256; // when the release states it
+    size_t size = 0;    // when the release states it
+};
+
+// Where an update stands (App::update_state).
+enum class UpdateState : int
+{
+    idle,
+    checking,
+    latest,      // nothing newer
+    available,   // update_info holds it
+    downloading, // update_progress counts it
+    installed,   // the new eboot.bin is in place: restart
+    check_failed,
+    install_failed,
+};
+
 struct MovieData
 {
     std::string id;
@@ -337,6 +365,23 @@ public:
     // The cue on screen at `t`, empty when none.
     std::string subtitle_at(double t);
 
+    // The updater: GitHub's latest release of kUpdateRepo (the API, then
+    // version.json on raw.githubusercontent.com when the API refuses), its
+    // eboot.bin downloaded beside the running one, checked (size, SHA-256)
+    // and put in its place. At start when "Автоматическая проверка
+    // обновлений" is on, or by hand. update_version counts the changes;
+    // update_info, update_message are guarded by catalog_mutex.
+    std::atomic<int> update_state{static_cast<int>(UpdateState::idle)};
+    std::atomic<uint32_t> update_version{0};
+    std::atomic<int> update_progress{0}; // per mille of the download
+    std::atomic<bool> update_manual{false}; // the last check was asked for by hand
+    std::atomic<bool> update_skipped{false}; // "Пропустить": not again this session
+    UpdateInfo update_info;
+    std::string update_message;
+    void check_updates_async(bool manual);
+    void download_update_async();
+    UpdateState update_status() const { return static_cast<UpdateState>(update_state.load()); }
+
     // Bookmarks, by page url. toggle_favorite returns the new state.
     bool is_favorite(const std::string &url);
     bool toggle_favorite(const std::string &url, const std::string &title);
@@ -400,6 +445,8 @@ private:
     BigThread hero_thread_;
     std::atomic<bool> stop_hero_{false};
     float hero_retry_ = 0.0f; // seconds until a failed banner is asked for again
+    bool update_auto_done_ = false; // the check at start has been made
+    void set_update_state(UpdateState state, const std::string &message = {});
     void load_hero_async();
     bool network_started_ = false;
     void init_defaults();

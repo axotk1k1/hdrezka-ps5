@@ -1,148 +1,119 @@
-# HdRezka for PS5
+# HDRezka for PlayStation 5
 
-Homebrew-клиент для просмотра каталога [HDrezka](https://hdrezka.ag) на jailbroken PS5. Архитектура как у [Orbit Store](https://github.com/saawant12/orbit-store-ps5): **ELF-сервис + 10-foot веб-интерфейс** под DualSense.
+**Нативный C++ / Vulkan клиент онлайн-кинотеатра HDRezka для PS5 (homebrew).**
 
-Это **неофициальный** клиент. Он не связан с HDrezka и Sony. Используйте только материал, на который у вас есть права.
+Интерфейс повторяет Android TV-приложение HDrezkaTV (Material TV Dark) и полностью управляется геймпадом DualSense. Рендеринг идёт через Vulkan (RADV) прямо на консоли, без браузера и WebKit.
 
-## Какие API используются
+> Текущая версия: **1.0.1** · Telegram: [t.me/hdrezkaps5](https://t.me/hdrezkaps5)
 
-На HDrezka нет публичного REST API. Все три библиотеки, которые вы указали, ходят в одни и те же внутренние эндпоинты сайта. Клиент в `www/js/hdrezka.js` повторяет их.
+---
 
-| Задача | Эндпоинт | Откуда взято |
-|---|---|---|
-| Быстрый поиск | `POST /engine/ajax/search.php` (`q`) | [SuperZombi/HdRezkaApi](https://github.com/SuperZombi/HdRezkaApi) `HdRezkaSearch`, [n0madic/go-hdrezka](https://github.com/n0madic/go-hdrezka) `QuickSearch` |
-| Полный поиск | `GET /search/?do=search&subaction=search&q=` | SuperZombi `find_all=True`, kristal374 `HDrezka.search()`, go-hdrezka `Search` |
-| Новинки по типу | `POST /engine/ajax/get_newest_slider_content.php` (`id`: 1 фильмы, 2 сериалы, 3 мульт, 82 аниме) | go-hdrezka `GetCoversNewest` |
-| Каталог / обложки | `GET /films/`, `/series/`, `/cartoons/`, `/animation/`, `/new/?filter=popular` | go-hdrezka `GetCovers`, kristal374 навигация |
-| Карточка тайтла | HTML страницы: `#post_id`, `#translators-list`, `.b-post__*` | SuperZombi `HdRezkaApi`, kristal374 `movie_page_descriptor` |
-| Сезоны / серии | `POST /ajax/get_cdn_series/` `action=get_episodes` | SuperZombi `seriesInfo` |
-| Стрим фильма | `POST /ajax/get_cdn_series/` `action=get_movie` | SuperZombi `getStream()`, go-hdrezka `GetStream()` |
-| Стрим серии | `POST /ajax/get_cdn_series/` `action=get_stream` + `season` + `episode` | SuperZombi, go-hdrezka |
-| Расшифровка URL | соли `//_//` + Base64, как в официальном приложении; запасной вариант SuperZombi `clearTrash` | go-hdrezka `decodeURL`, SuperZombi `clearTrash` |
-| Вход | `POST /ajax/login/` `login_name` + `login_password` | SuperZombi `login()` |
-| Cookie аккаунта | `dle_user_id` + `dle_password` | SuperZombi `make_cookies` |
+## Возможности
 
-Поток ответа (`url`) приходит в обфусцированном виде. После `clearTrash` получается строка вида:
+- **Интерфейс Android TV на PS5.** Material TV Dark, шрифты Roboto, размеры 1:1 с оригинальным APK (1 dp = 2 px при 1920×1080).
+- **Анимированный Hero-баннер** на главной: 10 фильмов из «Смотрят сейчас», плавная смена слайдов, кнопки «Смотреть» и «Мой список».
+- **Каталог с фильтрацией.** Фильмы, сериалы, мультфильмы, аниме; вкладки «Смотрят сейчас», «Последние поступления», «Популярное»; разделы «Новинки» и «Анонсы»; постраничная подгрузка.
+- **Расширенный поиск** по категории, жанру и году, а также поиск по стране.
+- **Карточка тайтла.** Рейтинги Кинопоиск, IMDb и HDRezka; франшизы; «Смотрите также»; актёры с фильмографией; расписание серий; статистика озвучек; комментарии.
+- **Плеер.** Выбор озвучки, сезона, серии и качества (вплоть до 1080p Ultra / 4K при наличии Premium), субтитры, скорость, быстрая перемотка.
+- **Аккаунт HDRezka.** Вход, «Досмотреть» (синхронизация прогресса с сайтом), закладки по папкам аккаунта.
+- **Поиск.** Живые подсказки, история, полнотекстовый поиск, ввод через системную клавиатуру PS5 и голосовой поиск через микрофон DualSense.
+- **Обновления через GitHub Releases.** Автоматическая проверка при запуске и установка новой версии прямо из приложения («Настройки → О приложении»).
 
-```
-[360p]https://cdn…/360.mp4 or https://cdn…/360.mp4:hls:manifest.m3u8,[720p]…
-```
-
-MP4 отдаётся в `<video>` через локальный `/stream` (Range / перемотка). HLS на WebKit PS5 ненадёжен, поэтому плеер предпочитает MP4.
-
-Anubis (proof-of-work) прокси решает сам и сохраняет clearance-cookie, руками ничего вставлять не нужно. Cloudflare / DDoS-Guard headless не решаются. Для 1080p Ultra нужен премиум-аккаунт зеркала.
-
-## Как это устроено (как Orbit)
-
-Два артефакта:
-
-1. **Native title** (иконка в Games через ShadowMountPlus) — `eboot.bin` + `sce_module/libc.prx` + `sce_sys/`.
-2. **Payload ELF** (websrv / :9021) — `rezka-ps5.elf` + HTTP `:34178` + `www/`.
-
-```
-PS5 ELF loader :9021
-        │
-        ▼
- rezka-ps5.elf  ──HTTP :34178──►  WebKit PS5 / телефон
-        │                            │
-        │  GET /                     │  10-foot UI (DualSense)
-        │  POST /proxy               │  поиск, каталог, карточка
-        │  GET /stream?url=…         │  <video> + качество / субтитры
-        ▼
-   зеркало HDrezka + CDN
-```
-
-### Иконка в Games (ShadowMountPlus)
-
-Нужны jailbreak, **kstuff**, [ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus).
-
-```bash
-cd native
-# PATH с llvm21 wrappers: см. native/.tools/bin
-make app
-```
-
-Готовая папка: `native/dist/PPSA99380/`  
-Готовая USB-раскладка: `dist/usb/homebrew/PPSA99380/` — копируйте содержимое `dist/usb/` на корень флешки.
-
-ShadowMountPlus (по умолчанию `scan_depth=1`) видит **только**:
-
-```
-/data/homebrew/PPSA99380/eboot.bin
-/data/homebrew/PPSA99380/sce_sys/param.json
-# или
-/mnt/usb0/homebrew/PPSA99380/...
-```
-
-Не сработает: `…/homebrew/dist/PPSA99380`, `…/homebrew/native/…`, ZIP целиком, папка без `homebrew/`, вложенный лишний уровень.
-
-Нужны **kstuff** + ShadowMountPlus; после копирования подождите ~15–30 с (scan/stability) или перезапустите SM. Не держите рядом второй источник с тем же `PPSA99380` (старый payload-folder / `.ffpkg`).
-
-Фаза 1: HTTP+proxy **внутри** native title (elfldr не нужен). WebKit открывает `http://<LAN-IP>:34178/` (не `127.0.0.1` — DNS на консоли). В пакете есть `www/`. На экране должно быть `HTTP INPROCESS OK`.
-
-### Payload для websrv / ELF loader
-
-```
-/data/homebrew/PPSA99380/     # путь websrv, не путать с native-папкой выше
-├── eboot.elf                 # скопируйте rezka-ps5.elf
-├── homebrew.js
-├── param.json
-├── sce_sys/icon0.png
-├── www/
-└── data/
-```
-## Запуск на ПК (проверка UI и API)
-
-```bash
-cd hdrezka-ps5
-python3 host/server.py --port 34178
-```
-
-Откройте [http://127.0.0.1:34178/](http://127.0.0.1:34178/). Управление: стрелки, Enter, Escape, `[` `]` — вкладки. Настройки → зеркало, если `hdrezka.ag` не открывается.
-
-Опционально тот же сервис на libcurl:
-
-```bash
-make -f Makefile.pc
-./rezka-pc --root "$PWD" --port 34178
-```
-
-## Сборка ELF для PS5
-
-Нужны [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk) и libcurl из [pacbrew-repo](https://github.com/ps5-payload-dev/pacbrew-repo).
-
-```bash
-export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
-make -f Makefile.ps5
-```
-
-Загрузка (как websrv / Orbit): сначала [elfldr](https://github.com/ps5-payload-dev/elfldr) на `:9021`, затем:
-
-```bash
-nc -q0 "$PS5_HOST" 9021 < rezka-ps5.elf
-```
-
-Откройте `http://<ip-ps5>:34178/` в браузере консоли или с телефона в той же сети. Если установлен [websrv](https://github.com/ps5-payload-dev/websrv), положите папку в `/data/homebrew/PPSA99380/` и запускайте с его карусели.
-
-Payload Manager: укажите свой хост ELF в `payloads.json` (поля `url` / `sha256`) и добавьте файл как custom source — формат как у [Orbit payloads.json](https://github.com/saawant12/orbit-store-ps5/blob/main/payloads.json).
-
-## Управление
+## Управление (DualSense)
 
 | Кнопка | Действие |
 |---|---|
-| D-pad / стрелки | Фокус |
-| Cross / Enter | Выбор |
-| Circle / Escape | Назад |
-| L1 R1 / `[` `]` | Вкладки |
-| Space (в плеере) | Пауза |
+| `D-Pad` / левый стик | Перемещение фокуса |
+| `Cross (×)` | Выбор / воспроизведение / пауза |
+| `Circle (○)` | Назад / закрытие окон |
+| `Square (□)` | Стереть символ в строке поиска |
+| `Triangle (△)` | Быстрый переход в поиск |
+| `Options` | Профиль (удержание ~1 с — выход из приложения) |
+| `L1` / `R1` | Слайды баннера на главной, сезоны на странице тайтла, амплуа в фильмографии |
 
-## Ограничения
+Закладки ставятся кнопкой с флажком на странице тайтла или кнопкой «Мой список» на баннере.
 
-- Native title: `cd native && make app` → `dist/PPSA99380/`. Опционально `make ffpkg` (нужен .NET 8). Иконка на главной — только через ShadowMountPlus + kstuff.
-- Cloudflare / DDoS-Guard по-прежнему требуют cookie из браузера. Anubis решается автоматически.
-- HTML5-плеер PS5 играет MP4; экзотические CDN-кодеки могут не открыться.
-- Приложение не обходит DRM легальных сервисов и не поставляет аккаунты.
+## Установка
 
-## Лицензия
+Нужна PS5 с запущенным эксплойтом и **kstuff**.
 
-MIT. Библиотеки, с которых сняты эндпоинты: HdRezkaApi, hdrezka-api (MIT), go-hdrezka (MIT).
+1. Скачайте архив папки `PPSA99380` со страницы [Releases](https://github.com/axotk1k1/hdrezka-ps5/releases).
+2. Скопируйте папку целиком (FTP или USB) так, чтобы получилось:
+   ```
+   /data/homebrew/PPSA99380/eboot.bin
+   /data/homebrew/PPSA99380/sce_sys/param.json
+   ```
+   или `/mnt/usb0/homebrew/PPSA99380/...` на флешке.
+3. Иконка появится на главном экране через [ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus), Itemzflow или PS5 Homebrew Store. После копирования подождите 15–30 секунд или перезапустите загрузчик.
+
+Дальнейшие обновления приложение скачивает само: новый `eboot.bin` из последнего релиза заменяет старый, после этого нужен перезапуск.
+
+## Поддержка и контакты
+
+- Telegram-канал: <https://t.me/hdrezkaps5>
+- Поддержать автора, USDT (сеть **TRC20**), на любую сумму от 5$:
+  ```
+  TANuxMByEoucUwMfgHpjjqfCvWtuyyPCop
+  ```
+
+## Disclaimer
+
+Это **неофициальный** homebrew-клиент, созданный в образовательных целях. Проект не связан с HDRezka, Sony Interactive Entertainment или правообладателями контента. Приложение не хранит и не распространяет видео: весь контент предоставляется сторонними источниками. Используйте его только в соответствии с законодательством вашей страны и правами на просматриваемый материал.
+
+---
+
+## Для разработчиков
+
+### Структура репозитория
+
+| Каталог | Что в нём |
+|---|---|
+| `hdrezka_vk/` | Основное приложение: C++ / Vulkan-титул `PPSA99380` |
+| `hdrezka_vk/examples/hdrezka/kit/screen.cpp` | Весь UI: главная, баннер, тайтл, плеер, поиск, профиль, настройки |
+| `hdrezka_vk/examples/hdrezka/hdrezka_app.*` | Состояние приложения, фоновые загрузки, обновления |
+| `hdrezka_vk/examples/hdrezka/rezka_api.*` | Сетевой клиент HDRezka (libcurl), разбор HTML/AJAX |
+| `hdrezka_vk/ps5/` | Слой PS5: платформа, сборка, ассеты, `sce_sys/` |
+| `native/`, `www/` | Ранний вариант: нативный титул с веб-интерфейсом |
+
+Сборка опирается на соседние checkout'ы `PS5_Vulkan`, `PS5_PayloadSDK` и `PS5_VKHomebrewUI`, они в этот репозиторий не входят (подробности — в `hdrezka_vk/README.md`).
+
+### Сборка
+
+```bash
+cd hdrezka_vk
+ps5/tools/build.sh                       # PS5: dist/PPSA99380/ (eboot.bin, sce_sys, assets)
+ninja -C build/ps5-host ps5-samples-host # версия для ПК (Linux, Vulkan)
+env -u VK_INSTANCE_LAYERS VK_LOADER_DRIVERS_SELECT="*lvp*" ps5/tools/host-reference.sh
+ps5/tools/deploy.sh                      # отправить на консоль по FTP
+```
+
+### Публикация обновления
+
+Приложение проверяет `https://api.github.com/repos/axotk1k1/hdrezka-ps5/releases/latest`:
+
+1. Поднимите `kAppVersion` в `hdrezka_vk/examples/hdrezka/hdrezka_app.hpp` и соберите титул.
+2. Создайте релиз с тегом новой версии (например, `v1.0.2`) и приложите `eboot.bin`. Описание релиза показывается в окне «Доступно обновление!».
+3. Запасной путь, если API недоступен: файл `version.json` в ветке `main`:
+   ```json
+   {"version": "1.0.2", "url": "https://github.com/.../eboot.bin", "sha256": "…", "size": 0, "notes": "…"}
+   ```
+
+### Эндпоинты HDRezka
+
+Публичного API у сайта нет, клиент повторяет запросы официального приложения:
+
+| Задача | Запрос |
+|---|---|
+| Быстрый поиск | `POST /engine/ajax/search.php` (`q`) |
+| Полный поиск | `GET /search/?do=search&subaction=search&q=…&page=N` |
+| Списки | `GET /?filter=watching\|last\|popular&genre=1\|2\|3\|82`, `/page/N/` |
+| Сезоны и серии | `POST /ajax/get_cdn_series/` `action=get_episodes` |
+| Поток фильма / серии | `POST /ajax/get_cdn_series/` `action=get_movie` / `get_stream` |
+| Вход | `POST /ajax/login/` |
+| Закладки | `GET /favorites/`, `POST /ajax/favorites/` `action=add_post` |
+| «Досмотреть» | `GET /continue/`, `POST /ajax/send_save/` |
+
+### Лицензии
+
+Приложение в собранном виде распространяется под **GPL-3.0** (UI-кит, модуль UI и программа титула); основа шаблона PS5 Vulkan Template — MIT. Подробности и тексты лицензий — в `hdrezka_vk/README.md` и `hdrezka_vk/ps5/licenses/`.

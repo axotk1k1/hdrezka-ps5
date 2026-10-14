@@ -12,3 +12,18 @@ rezka-pc
 __pycache__/
 *.o
 .DS_Store
+
+# Build output and fetched dependencies, at any depth
+build/
+**/build/
+**/dist/
+**/.deps/
+
+# Private, per machine: the account session, logs, preferences, history
+**/cookies.txt
+**/debug.log
+**/settings.cfg
+**/search_history.txt
+
+# Assistant workspace
+.claude/

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 #include <memory>
@@ -389,6 +391,16 @@ public:
                                            std::vector<SubtitleTrack> *subtitles = nullptr);
 
     bool http_get_binary(const std::string &url, std::vector<uint8_t> &out_bytes);
+
+    // An address outside the site (GitHub's API and release files): no
+    // mirror headers or cookies, redirects followed. progress(now, total) is
+    // called as it arrives (total 0 while unknown); returning false stops it.
+    // http_code gets the answer's status. True for a 2xx answer.
+    static bool fetch_url(const std::string &url, std::vector<uint8_t> &out,
+                          const std::function<bool(size_t, size_t)> &progress = {}, long *http_code = nullptr,
+                          const char *accept = "*/*");
+    // The SHA-256 of bytes, as 64 lower-case hex digits.
+    static std::string sha256_hex(const uint8_t *data, size_t size);
 
     // Probe known mirrors and keep the first one that returns a catalog page.
     // With a preferred mirror (the settings' "Источник") only that one is tried.

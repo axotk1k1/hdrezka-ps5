@@ -143,6 +143,8 @@ struct AppSettings
     // Субтитры
     int subtitle_arrangement = 3;     // subtitleArrangement: BottomCenter
     int subtitle_font_size = 1;       // subtitleFontSize: Medium
+    // О приложении
+    bool check_update = true;         // isCheckUpdate: GitHub's releases at start
 
     // The mirror the source names; empty for the default (probe the known ones).
     std::string mirror() const
@@ -217,6 +219,7 @@ struct AppSettings
                    subtitle_arrangement);
         put_choice("subtitleFontSize", kSubtitleFontSizeChoices, setting_count(kSubtitleFontSizeChoices),
                    subtitle_font_size);
+        put_bool("isCheckUpdate", check_update);
         std::fclose(f);
         return true;
     }
@@ -273,6 +276,7 @@ struct AppSettings
         else if (key == "backBufferDuration") set_choice(back_buffer_duration, kBackBufferDurationChoices, value);
         else if (key == "subtitleArrangement") set_choice(subtitle_arrangement, kSubtitleArrangementChoices, value);
         else if (key == "subtitleFontSize") set_choice(subtitle_font_size, kSubtitleFontSizeChoices, value);
+        else if (key == "isCheckUpdate") check_update = on;
     }
 };
 

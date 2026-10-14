@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -896,6 +897,320 @@ std::vector<unsigned char> wav_of(const std::vector<int16_t> &samples, int rate)
     return out;
 }
 } // namespace
+
+// ---- the updater -----------------------------------------------------------
+
+namespace
+{
+// A JSON string member from `from` on, unescaped (\" \\ \/ \n \t \uXXXX); `at`
+// gets where its value ends. Empty when there is none.
+std::string json_text(const std::string &json, const char *key, size_t from = 0, size_t *at = nullptr)
+{
+    const std::string mark = std::string("\"") + key + "\"";
+    size_t k = json.find(mark, from);
+    if (k == std::string::npos)
+        return "";
+    size_t i = json.find(':', k + mark.size());
+    if (i == std::string::npos)
+        return "";
+    ++i;
+    while (i < json.size() && isspace(static_cast<unsigned char>(json[i])))
+        ++i;
+    if (i >= json.size() || json[i] != '"')
+        return "";
+    std::string out;
+    for (++i; i < json.size() && json[i] != '"'; ++i) {
+        if (json[i] != '\\' || i + 1 >= json.size()) {
+            out.push_back(json[i]);
+            continue;
+        }
+        const char e = json[++i];
+        if (e == 'n') out.push_back('\n');
+        else if (e == 't') out.push_back(' ');
+        else if (e == 'r') continue;
+        else if (e == 'u' && i + 4 < json.size()) {
+            const unsigned cp = static_cast<unsigned>(strtoul(json.substr(i + 1, 4).c_str(), nullptr, 16));
+            i += 4;
+            if (cp < 0x80) out.push_back(static_cast<char>(cp));
+            else if (cp < 0x800) {
+                out.push_back(static_cast<char>(0xc0 | (cp >> 6)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+            } else {
+                out.push_back(static_cast<char>(0xe0 | (cp >> 12)));
+                out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+            }
+        } else
+            out.push_back(e);
+    }
+    if (at)
+        *at = i;
+    return out;
+}
+
+// A JSON number member from `from` on; -1 when there is none.
+long long json_number(const std::string &json, const char *key, size_t from = 0, size_t to = std::string::npos)
+{
+    const std::string mark = std::string("\"") + key + "\"";
+    const size_t k = json.find(mark, from);
+    if (k == std::string::npos || k >= to)
+        return -1;
+    size_t i = json.find(':', k + mark.size());
+    if (i == std::string::npos)
+        return -1;
+    ++i;
+    while (i < json.size() && isspace(static_cast<unsigned char>(json[i])))
+        ++i;
+    char *end = nullptr;
+    const long long v = strtoll(json.c_str() + i, &end, 10);
+    return end == json.c_str() + i ? -1 : v;
+}
+
+// The first run of 64 hex digits after "sha256" in text, else any such run.
+std::string find_sha256(const std::string &text)
+{
+    auto run_at = [&](size_t from) -> std::string {
+        for (size_t i = from; i + 64 <= text.size(); ++i) {
+            size_t n = 0;
+            while (i + n < text.size() && isxdigit(static_cast<unsigned char>(text[i + n])))
+                ++n;
+            if (n == 64) {
+                std::string out = text.substr(i, 64);
+                for (char &c : out)
+                    c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+                return out;
+            }
+            i += n;
+        }
+        return "";
+    };
+    std::string lower = text;
+    for (char &c : lower)
+        c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    const size_t mark = lower.find("sha256");
+    std::string found = mark == std::string::npos ? std::string() : run_at(mark);
+    return found.empty() ? run_at(0) : found;
+}
+
+// "v1.2.10" against "1.2.9": -1, 0 or 1 by each dotted number.
+int compare_versions(const std::string &a, const std::string &b)
+{
+    auto parts = [](const std::string &v) {
+        std::vector<long> out;
+        size_t i = 0;
+        while (i < v.size() && !isdigit(static_cast<unsigned char>(v[i])))
+            ++i;
+        while (i < v.size()) {
+            char *end = nullptr;
+            out.push_back(strtol(v.c_str() + i, &end, 10));
+            i = static_cast<size_t>(end - v.c_str());
+            if (i >= v.size() || v[i] != '.')
+                break;
+            ++i;
+        }
+        return out;
+    };
+    const std::vector<long> x = parts(a), y = parts(b);
+    for (size_t i = 0; i < std::max(x.size(), y.size()); ++i) {
+        const long p = i < x.size() ? x[i] : 0, q = i < y.size() ? y[i] : 0;
+        if (p != q)
+            return p < q ? -1 : 1;
+    }
+    return 0;
+}
+
+// GitHub's release: tag_name, body, and the asset named eboot.bin (its size,
+// its digest "sha256:…" when GitHub states one, its download address).
+bool parse_release(const std::string &json, UpdateInfo &info)
+{
+    info = {};
+    info.version = json_text(json, "tag_name");
+    info.notes = json_text(json, "body");
+    for (size_t at = json.find("\"assets\""); at != std::string::npos;) {
+        const size_t name_at = json.find("\"name\"", at);
+        if (name_at == std::string::npos)
+            break;
+        size_t after = 0;
+        const std::string name = json_text(json, "name", name_at, &after);
+        const size_t url_at = json.find("\"browser_download_url\"", after);
+        if (url_at == std::string::npos)
+            break;
+        if (name == "eboot.bin") {
+            info.url = json_text(json, "browser_download_url", url_at);
+            const long long size = json_number(json, "size", after, url_at);
+            if (size > 0)
+                info.size = static_cast<size_t>(size);
+            const std::string digest = json_text(json, "digest", after);
+            const size_t digest_at = json.find("\"digest\"", after);
+            if (digest_at != std::string::npos && digest_at < url_at && digest.rfind("sha256:", 0) == 0)
+                info.sha256 = digest.substr(7);
+            break;
+        }
+        at = url_at + 1;
+    }
+    if (info.sha256.empty())
+        info.sha256 = find_sha256(info.notes);
+    return !info.version.empty();
+}
+
+// version.json: {"version", "url", "sha256", "size", "notes"}.
+bool parse_version_json(const std::string &json, UpdateInfo &info)
+{
+    info = {};
+    info.version = json_text(json, "version");
+    info.url = json_text(json, "url");
+    info.sha256 = json_text(json, "sha256");
+    info.notes = json_text(json, "notes");
+    const long long size = json_number(json, "size");
+    if (size > 0)
+        info.size = static_cast<size_t>(size);
+    return !info.version.empty();
+}
+
+// Where the running title's eboot.bin is, writable: the new one goes there.
+std::vector<std::string> update_targets()
+{
+#if defined(PS5_HOST_REFERENCE)
+    // The reference build has no eboot.bin of its own: a folder beside it
+    ::mkdir("update", 0755);
+    return {"update/eboot.bin"};
+#else
+    std::vector<std::string> out;
+    for (const char *path : {"/data/homebrew/PPSA99380/eboot.bin", "/mnt/usb0/homebrew/PPSA99380/eboot.bin",
+                             "/mnt/usb1/homebrew/PPSA99380/eboot.bin", "/app0/eboot.bin"})
+        if (access(path, F_OK) == 0)
+            out.push_back(path);
+    return out;
+#endif
+}
+} // namespace
+
+void App::set_update_state(UpdateState state, const std::string &message)
+{
+    {
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        update_message = message;
+    }
+    update_state = static_cast<int>(state);
+    update_version++;
+}
+
+void App::check_updates_async(bool manual)
+{
+    const UpdateState now = update_status();
+    if (now == UpdateState::checking || now == UpdateState::downloading)
+        return;
+    update_manual = manual;
+    if (manual)
+        update_skipped = false;
+    set_update_state(UpdateState::checking, "Проверка обновлений...");
+    BigThread([this]() {
+        UpdateInfo info;
+        bool found = false;
+        std::vector<uint8_t> bytes;
+        long code = 0;
+        // HDREZKA_UPDATE_FEED: a version.json to try instead (a test feed, file:// too)
+        const char *feed = std::getenv("HDREZKA_UPDATE_FEED");
+        if (feed && *feed) {
+            found = Client::fetch_url(feed, bytes, {}, &code) &&
+                    parse_version_json(std::string(bytes.begin(), bytes.end()), info);
+        } else {
+            const std::string api = std::string("https://api.github.com/repos/") + kUpdateRepo + "/releases/latest";
+            found = Client::fetch_url(api, bytes, {}, &code, "application/vnd.github+json") &&
+                    parse_release(std::string(bytes.begin(), bytes.end()), info);
+            if (!found) {
+                // The API's hourly limit, or no release: the repository's version.json
+                const std::string raw = std::string("https://raw.githubusercontent.com/") + kUpdateRepo + "/main/version.json";
+                found = Client::fetch_url(raw, bytes, {}, &code) &&
+                        parse_version_json(std::string(bytes.begin(), bytes.end()), info);
+            }
+        }
+        if (!found) {
+            write_log("[DEBUG] updater: no release found (http %ld)\n", code);
+            set_update_state(UpdateState::check_failed, "Не удалось проверить обновления");
+            return;
+        }
+        write_log("[DEBUG] updater: latest %s, here %s, url=%s size=%zu sha=%s\n", info.version.c_str(), kAppVersion,
+                  info.url.c_str(), info.size, info.sha256.c_str());
+        if (compare_versions(info.version, kAppVersion) <= 0) {
+            set_update_state(UpdateState::latest, std::string("У вас последняя версия ") + kAppVersion);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            update_info = info;
+        }
+        set_update_state(UpdateState::available);
+    }).detach();
+}
+
+void App::download_update_async()
+{
+    if (update_status() != UpdateState::available)
+        return;
+    UpdateInfo info;
+    {
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        info = update_info;
+    }
+    update_progress = 0;
+    set_update_state(UpdateState::downloading);
+    BigThread([this, info]() {
+        if (info.url.empty()) {
+            set_update_state(UpdateState::install_failed, "В релизе нет файла eboot.bin");
+            return;
+        }
+        std::vector<uint8_t> bytes;
+        const bool got = Client::fetch_url(info.url, bytes, [this, &info](size_t now, size_t total) {
+            if (total == 0)
+                total = info.size;
+            if (total > 0)
+                update_progress = static_cast<int>(std::min<size_t>(1000, now * 1000 / total));
+            return true;
+        });
+        if (!got || bytes.empty()) {
+            set_update_state(UpdateState::install_failed, "Не удалось скачать обновление");
+            return;
+        }
+        update_progress = 1000;
+        // Whole and the same as the release says
+        if (info.size > 0 && bytes.size() != info.size) {
+            set_update_state(UpdateState::install_failed,
+                             "Файл обновления повреждён (размер " + std::to_string(bytes.size()) + " вместо " +
+                                 std::to_string(info.size) + ")");
+            return;
+        }
+        if (!info.sha256.empty()) {
+            const std::string sha = Client::sha256_hex(bytes.data(), bytes.size());
+            if (sha != info.sha256) {
+                write_log("[DEBUG] updater: sha256 %s, expected %s\n", sha.c_str(), info.sha256.c_str());
+                set_update_state(UpdateState::install_failed, "Контрольная сумма обновления не совпадает");
+                return;
+            }
+        }
+        // Beside the running eboot.bin, then renamed over it in one step
+        for (const std::string &target : update_targets()) {
+            const std::string temp = target + ".tmp";
+            FILE *f = fopen(temp.c_str(), "wb");
+            if (!f) {
+                write_log("[DEBUG] updater: cannot write %s\n", temp.c_str());
+                continue;
+            }
+            const bool written = fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size() && fflush(f) == 0;
+            fclose(f);
+            if (!written || rename(temp.c_str(), target.c_str()) != 0) {
+                write_log("[DEBUG] updater: cannot replace %s\n", target.c_str());
+                remove(temp.c_str());
+                continue;
+            }
+            write_log("[DEBUG] updater: %s installed at %s (%zu bytes)\n", info.version.c_str(), target.c_str(),
+                      bytes.size());
+            set_update_state(UpdateState::installed, "Обновление установлено! Перезапустите приложение");
+            return;
+        }
+        set_update_state(UpdateState::install_failed, "Не удалось записать eboot.bin: папка приложения только для чтения");
+    }).detach();
+}
 
 #if defined(PS5_HOST_REFERENCE)
 // The reference build has no microphone: HDREZKA_HOST_VOICE stands for what
@@ -2521,6 +2836,12 @@ void App::update(float dt)
     }
     if (hero_state == 0 && network_started_ && !catalog_loading)
         load_hero_async();
+    // "Автоматическая проверка обновлений": once, after the first page is in
+    if (!update_auto_done_ && network_started_ && !catalog_loading) {
+        update_auto_done_ = true;
+        if (settings_.check_update)
+            check_updates_async(false);
+    }
     {
         HeroPending hp;
         bool have = false;

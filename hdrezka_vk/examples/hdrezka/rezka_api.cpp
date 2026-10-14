@@ -2276,6 +2276,91 @@ std::vector<CatalogItem> Client::search_suggest(const std::string &query)
     return out;
 }
 
+namespace
+{
+struct FetchState {
+    std::vector<uint8_t> *out;
+    const std::function<bool(size_t, size_t)> *progress;
+};
+
+size_t fetch_write(void *contents, size_t size, size_t nmemb, void *userp)
+{
+    auto *state = static_cast<FetchState *>(userp);
+    const size_t total = size * nmemb;
+    const uint8_t *src = static_cast<const uint8_t *>(contents);
+    state->out->insert(state->out->end(), src, src + total);
+    return total;
+}
+
+int fetch_progress(void *userp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t)
+{
+    auto *state = static_cast<FetchState *>(userp);
+    if (state->progress && *state->progress &&
+        !(*state->progress)(static_cast<size_t>(dlnow), static_cast<size_t>(dltotal)))
+        return 1; // stopped
+    return 0;
+}
+} // namespace
+
+bool Client::fetch_url(const std::string &url, std::vector<uint8_t> &out,
+                       const std::function<bool(size_t, size_t)> &progress, long *http_code, const char *accept)
+{
+    out.clear();
+    if (http_code)
+        *http_code = 0;
+    CURL *curl = curl_easy_init();
+    if (!curl)
+        return false;
+    console_curl_setup(curl);
+    struct curl_slist *headers = nullptr;
+    headers = curl_slist_append(headers, (std::string("Accept: ") + accept).c_str());
+    // GitHub's API asks for a User-Agent and answers JSON for this version
+    headers = curl_slist_append(headers, "X-GitHub-Api-Version: 2022-11-28");
+    FetchState state{&out, &progress};
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "HDRezka-PS5-Updater");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
+    // No limit for the whole of a large file: a stalled transfer ends instead
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 256L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+    const long verify = g_ssl_bypass.load() ? 0L : 1L;
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, verify);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, verify ? 2L : 0L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fetch_write);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, fetch_progress);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &state);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, progress ? 0L : 1L);
+    const CURLcode res = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    if (http_code)
+        *http_code = code;
+    // file:// (a test feed) answers 0 for a good read
+    const bool ok_code = (code >= 200 && code < 300) || (code == 0 && url.rfind("file://", 0) == 0);
+    write_log("[DEBUG] fetch_url %s -> rc=%d http=%ld bytes=%zu\n", url.c_str(), (int)res, code, out.size());
+    return res == CURLE_OK && ok_code;
+}
+
+std::string Client::sha256_hex(const uint8_t *data, size_t size)
+{
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(data, size, digest);
+    static const char *const kHex = "0123456789abcdef";
+    std::string out;
+    for (unsigned char b : digest) {
+        out.push_back(kHex[b >> 4]);
+        out.push_back(kHex[b & 15]);
+    }
+    return out;
+}
+
 std::string Client::stt_recognize(const std::string &endpoint, const std::vector<unsigned char> &wav)
 {
     if (endpoint.empty() || wav.empty())
