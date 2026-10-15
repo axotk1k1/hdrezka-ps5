@@ -481,14 +481,33 @@ audio_stop(void)
    audio_port = -1;
 }
 
-/* The console's keyboard. libSceImeDialog is not among the modules a title
- * starts with, so it is loaded when first asked for and its calls are looked
- * up by name: a console that has no such module costs a false, not a title
- * that will not start. The structures are the IME dialog's as PS4 and PS5
- * share them; its text is UTF-16. */
+/* The console's keyboard. A title's sandbox has no path to the system's
+ * modules (sceKernelLoadStartModule of /system/common/lib/... gave ENOENT,
+ * 0x80020002, on the console), so the IME dialog's calls are imported, as the
+ * pad's and the audio's are: the SDK's stubs (libSceSysmodule.so and
+ * libSceImeDialog.so, which tools/link-title.sh links --as-needed with the
+ * rest of target/lib) make the title name libSceSysmodule.sprx and
+ * libSceImeDialog.sprx for the system's loader to bring in. The module is
+ * then asked for through sceSysmoduleLoadModule before the first dialog. The
+ * structures are the IME dialog's as PS4 and PS5 share them (no sdkVersion in
+ * it: that is the Vita's); its text is UTF-16. */
 int sceKernelLoadStartModule(const char *path, size_t argc, const void *argv, uint32_t flags,
                              void *option, int *result);
 int sceKernelDlsym(int handle, const char *symbol, void **address);
+
+struct ime_dialog_param;
+struct ime_dialog_result;
+int sceSysmoduleLoadModule(uint16_t id);
+int sceSysmoduleIsLoaded(uint16_t id);
+int sceImeDialogInit(const struct ime_dialog_param *param, void *extended);
+int sceImeDialogGetStatus(void);
+int sceImeDialogGetResult(struct ime_dialog_result *result);
+int sceImeDialogTerm(void);
+
+/* libSceSysmodule's module ids (the PS4 / PS5 SDK's): libSceIme, which the
+ * dialog stands on, and libSceImeDialog. */
+#define SYSMODULE_LIBIME 0x0095
+#define SYSMODULE_IME_DIALOG 0x0096
 
 struct ime_dialog_param {
    int32_t user_id;
@@ -604,49 +623,24 @@ ime_look_up(void)
       return ime.available;
    ime.looked_up = true;
 
-   /* The system dialogs' common layer first, as the SDK's samples bring it
-    * up before any dialog; "already initialised" is fine. */
-   static const char *const common_paths[2] = { "/system/common/lib/libSceCommonDialog.sprx",
-                                                "libSceCommonDialog.sprx" };
-   for (int i = 0; i < 2; i++) {
-      const int common = sceKernelLoadStartModule(common_paths[i], 0, NULL, 0, NULL, NULL);
-      ime_log("load %s -> 0x%08x", common_paths[i], (unsigned)common);
-      if (common < 0)
-         continue;
-      void *initialize = NULL;
-      if (sceKernelDlsym(common, "sceCommonDialogInitialize", &initialize) >= 0 && initialize)
-         ime_log("sceCommonDialogInitialize -> 0x%08x", (unsigned)((int (*)(void))initialize)());
-      else
-         ime_log("libSceCommonDialog has no sceCommonDialogInitialize");
-      break;
-   }
-
-   static const char *const paths[2] = { "/system/common/lib/libSceImeDialog.sprx", "libSceImeDialog.sprx" };
-   int module = -1;
-   for (int i = 0; i < 2 && module < 0; i++) {
-      module = sceKernelLoadStartModule(paths[i], 0, NULL, 0, NULL, NULL);
-      ime_log("load %s -> 0x%08x", paths[i], (unsigned)module);
-   }
-   if (module < 0) {
+   /* libSceIme, which the dialog stands on, then libSceImeDialog: 0 loaded,
+    * or already there */
+   ime_log("sceSysmoduleIsLoaded(0x%04x libSceImeDialog) -> 0x%08x", SYSMODULE_IME_DIALOG,
+           (unsigned)sceSysmoduleIsLoaded(SYSMODULE_IME_DIALOG));
+   const int ime_base = sceSysmoduleLoadModule(SYSMODULE_LIBIME);
+   ime_log("sceSysmoduleLoadModule(0x%04x libSceIme) -> 0x%08x", SYSMODULE_LIBIME, (unsigned)ime_base);
+   const int loaded = sceSysmoduleLoadModule(SYSMODULE_IME_DIALOG);
+   ime_log("sceSysmoduleLoadModule(0x%04x libSceImeDialog) -> 0x%08x", SYSMODULE_IME_DIALOG, (unsigned)loaded);
+   if (loaded < 0) {
       ime_log("no libSceImeDialog: the sheet of keys instead");
       return false;
    }
-   void *address[4] = { NULL, NULL, NULL, NULL };
-   static const char *const names[4] = { "sceImeDialogInit", "sceImeDialogGetStatus",
-                                         "sceImeDialogGetResult", "sceImeDialogTerm" };
-   for (int i = 0; i < 4; i++) {
-      const int found = sceKernelDlsym(module, names[i], &address[i]);
-      if (found < 0 || !address[i]) {
-         ime_log("libSceImeDialog has no %s (0x%08x)", names[i], (unsigned)found);
-         return false;
-      }
-   }
-   ime.init = (int (*)(const struct ime_dialog_param *, void *))address[0];
-   ime.get_status = (int (*)(void))address[1];
-   ime.get_result = (int (*)(struct ime_dialog_result *))address[2];
-   ime.term = (int (*)(void))address[3];
+   ime.init = sceImeDialogInit;
+   ime.get_status = sceImeDialogGetStatus;
+   ime.get_result = sceImeDialogGetResult;
+   ime.term = sceImeDialogTerm;
    ime.available = true;
-   ime_log("libSceImeDialog ready (handle 0x%08x)", (unsigned)module);
+   ime_log("libSceImeDialog ready");
    return true;
 }
 
