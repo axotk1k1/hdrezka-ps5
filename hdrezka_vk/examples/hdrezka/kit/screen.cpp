@@ -4397,6 +4397,7 @@ class Store final : public app::Concept
         kStSource,
         kStSsl,
         kStCountries,
+        kStClearCache,
         kStQuality,
         kStAutoNext,
         kStStepForward,
@@ -4443,6 +4444,7 @@ class Store final : public app::Concept
          kTvIconLockOpen},
         {kStCountries, kStMulti, "Фильтры контента", "Выберите страны, контент из которых Вы бы не хотели видеть",
          kTvIconDoNotDisturbOn},
+        {kStClearCache, kStAction, "Очистить кэш", nullptr, kTvIconCached},
     };
     static constexpr StDef kStPlayer[] = {
         {kStQuality, kStList, "Качество по умолчанию", nullptr, kTvIconHighQuality},
@@ -4552,6 +4554,16 @@ class Store final : public app::Concept
         rezka::AppSettings s = rezka::App::instance().settings();
         if (def.key == kStAppInfo)
             return std::string("Версия: ") + rezka::kAppVersion;
+        if (def.key == kStClearCache)
+        {
+            auto &app = rezka::App::instance();
+            if (app.cache_clearing.load())
+                return "Очистка…";
+            const double mb = static_cast<double>(app.cache_size_bytes()) / (1024.0 * 1024.0);
+            char line[48];
+            std::snprintf(line, sizeof(line), mb < 0.05 ? "Занято: 0 МБ" : "Занято: %.1f МБ", mb);
+            return line;
+        }
         if (def.kind == kStSwitch || def.kind == kStMulti || def.kind == kStAction)
         {
             return def.summary ? def.summary : "";
@@ -4799,6 +4811,13 @@ class Store final : public app::Concept
                 // The version: a check for an update, by hand
                 app.check_updates_async(true);
                 show_message("Проверка обновлений...");
+                feedback.play(audio::Cue::select);
+            }
+            else if (def.key == kStClearCache)
+            {
+                // data/cache/ goes on a worker; the line under the title counts down to 0
+                app.clear_cache_async();
+                show_message("Кэш очищен");
                 feedback.play(audio::Cue::select);
             }
             else

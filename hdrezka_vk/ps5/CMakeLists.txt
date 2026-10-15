@@ -87,6 +87,7 @@ else()
 endif()
 set(rezka_sources
 	${rezka_platform_sources}
+	${ROOT}/examples/hdrezka/disk_cache.cpp
 	${ROOT}/examples/hdrezka/rezka_api.cpp
 	${ROOT}/examples/hdrezka/qr_code.cpp
 	${ROOT}/examples/hdrezka/texture_loader.cpp

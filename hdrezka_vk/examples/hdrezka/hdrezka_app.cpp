@@ -9,6 +9,7 @@
 #include <cstring>
 #include <curl/curl.h>
 
+#include "disk_cache.hpp"
 #include "logger.hpp"
 #include "platform.h"
 
@@ -141,6 +142,27 @@ void App::init(vks::VulkanDevice *dev, VkQueue q, hui::gfx::VkRenderer *rend, hu
                 break;
             }
         }
+    }
+
+    // The disk cache: beside the cookies (the data folder), else the first
+    // writable data folder. Its size is counted, and kept under the limit, on a worker.
+    {
+        std::vector<std::string> roots;
+        const std::string &cookie = client.get_cookie_file();
+        const auto slash = cookie.find_last_of('/');
+        if (slash != std::string::npos)
+            roots.push_back(cookie.substr(0, slash + 1) + "cache/");
+        roots.push_back("/data/homebrew/PPSA99380/data/cache/");
+        roots.push_back("/mnt/usb0/homebrew/PPSA99380/data/cache/");
+        roots.push_back("data/cache/");
+        disk_cache::init(roots);
+        cache_client.set_cache_only(true);
+        const std::string last = disk_cache::read_note("last_mirror.txt");
+        if (last.rfind("http", 0) == 0) {
+            cache_client.set_mirror(last);
+            client.set_mirror(last);
+        }
+        BigThread([]() { disk_cache::trim(); }).detach();
     }
 
     // Preload local poster textures
@@ -478,7 +500,8 @@ void App::load_home_async(int filter_idx)
 // the rows the focus is on are not kept waiting behind the whole list. A page
 // appended to the list restarts the worker, and what the last run did not
 // reach is picked up again here.
-static void queue_missing_posters(App *self, std::atomic<bool> &stop)
+// With the cache-only client it takes what the disk has, at once.
+static void queue_missing_posters(App *self, std::atomic<bool> &stop, Client &client)
 {
     std::set<std::string> tried;
     while (!stop) {
@@ -502,11 +525,11 @@ static void queue_missing_posters(App *self, std::atomic<bool> &stop)
             break;
         // One connection, one lock, and no queue at it: without this pause a
         // title's page would wait for the whole list's posters.
-        while (self->urgent_requests > 0 && !stop)
+        while (&client == &self->client && self->urgent_requests > 0 && !stop)
             usleep(20000);
         tried.insert(cover_url);
         std::vector<uint8_t> img_bytes;
-        if (!self->client.http_get_binary(cover_url, img_bytes))
+        if (!client.http_get_binary(cover_url, img_bytes))
             continue;
         int w = 0, h = 0;
         uint8_t *rgba = TextureLoader::decode_image_rgba(img_bytes.data(), img_bytes.size(), &w, &h);
@@ -576,9 +599,39 @@ void App::load_movie_list_async(int tab, int type, int kind)
             catalog_status = "Загрузка...";
             catalog_version++;
         }
+        const auto to_movies = [this](const std::vector<CatalogItem> &items) {
+            std::vector<MovieData> out;
+            out.reserve(items.size());
+            for (const auto &it : items)
+                if (!hidden_by_filter(it.info))
+                    out.push_back(movie_from_catalog(it, ""));
+            return out;
+        };
+        // Stale-while-revalidate: the list as the last run saw it, with the
+        // posters the disk has, before the mirror or the network is asked.
+        bool shown_cached = false;
+        const uint32_t opened_before = details_requests.load();
+        {
+            bool cached_next = false;
+            std::vector<MovieData> cached = to_movies(fetch_list_page(cache_client, tab, type, kind, 1, &cached_next));
+            if (!cached.empty() && !stop_worker_) {
+                {
+                    std::lock_guard<std::mutex> lock(catalog_mutex);
+                    movies = std::move(cached);
+                    list_page = 1;
+                    list_has_next = cached_next;
+                    catalog_status.clear();
+                    catalog_version++;
+                }
+                shown_cached = true;
+                write_log("[DEBUG] list tab %d type %d kind %d shown from the disk cache\n", tab, type, kind);
+                queue_missing_posters(this, stop_worker_, cache_client);
+            }
+        }
         if (!client.pick_mirror()) {
             std::lock_guard<std::mutex> lock(catalog_mutex);
-            catalog_status = "Ошибка сети";
+            if (!shown_cached)
+                catalog_status = "Ошибка сети";
             catalog_loading = false;
             catalog_version++;
             return;
@@ -589,21 +642,48 @@ void App::load_movie_list_async(int tab, int type, int kind)
             catalog_loading = false;
             return;
         }
-        std::vector<MovieData> new_movies;
-        new_movies.reserve(items.size());
-        for (const auto &it : items)
-            if (!hidden_by_filter(it.info))
-                new_movies.push_back(movie_from_catalog(it, ""));
+        std::vector<MovieData> new_movies = to_movies(items);
         {
             std::lock_guard<std::mutex> lock(catalog_mutex);
-            movies = std::move(new_movies);
-            list_page = 1;
-            list_has_next = has_next && !movies.empty();
-            catalog_status = movies.empty() ? "Ничего не найдено" : "";
+            if (shown_cached && new_movies.empty()) {
+                // The network failed: the kept list stays
+            } else if (shown_cached && details_requests.load() != opened_before) {
+                // A title was opened from the kept list: its index must keep
+                // pointing at it, so the list is not swapped under it now
+                list_has_next = has_next;
+            } else {
+                if (shown_cached) {
+                    // The same titles keep what they have (poster, page);
+                    // a poster seen already is not uploaded again
+                    std::map<std::string, const MovieData *> before;
+                    for (const MovieData &m : movies)
+                        before[m.url] = &m;
+                    for (MovieData &m : new_movies) {
+                        auto it = before.find(m.url);
+                        if (it == before.end())
+                            continue;
+                        const MovieData &old = *it->second;
+                        if (old.texture_ready && old.cover_url == m.cover_url) {
+                            m.texture_id = old.texture_id;
+                            m.texture_ready = true;
+                        }
+                        if (old.details_loaded) {
+                            m.details = old.details;
+                            m.details_loaded = true;
+                        }
+                    }
+                    std::lock_guard<std::mutex> p_lock(pending_mutex);
+                    pending_textures.clear(); // indices of the kept list
+                }
+                movies = std::move(new_movies);
+                list_page = 1;
+                list_has_next = has_next && !movies.empty();
+                catalog_status = movies.empty() ? "Ничего не найдено" : "";
+            }
             catalog_version++;
         }
         catalog_loading = false;
-        queue_missing_posters(this, stop_worker_);
+        queue_missing_posters(this, stop_worker_, client);
     });
 }
 
@@ -656,7 +736,7 @@ void App::load_movie_list_more_async()
             catalog_version++;
         }
         list_more_loading = false;
-        queue_missing_posters(this, stop_worker_);
+        queue_missing_posters(this, stop_worker_, client);
     });
 }
 
@@ -726,7 +806,7 @@ void App::paged_list_async(const std::string &title, std::function<std::string(C
             catalog_version++;
         }
         catalog_loading = false;
-        queue_missing_posters(this, stop_worker_);
+        queue_missing_posters(this, stop_worker_, client);
     });
 }
 
@@ -1748,41 +1828,81 @@ void App::load_hero_async()
                 usleep(50000);
             return !stop_hero_;
         };
+        const auto list_slides = [this](Client &from) {
+            bool has_next = false;
+            const std::vector<CatalogItem> items = fetch_list_page(from, 0, 1, 0, 1, &has_next);
+            std::vector<HeroSlide> slides;
+            for (const CatalogItem &it : items) {
+                if (slides.size() >= 10)
+                    break;
+                if (it.url.empty() || hidden_by_filter(it.info))
+                    continue;
+                HeroSlide s;
+                s.item = it;
+                s.title = it.title;
+                s.quality = it.quality;
+                s.description = it.description;
+                split_info(it.info, s.year, s.country, s.genre);
+                if (it.year > 0)
+                    s.year = std::to_string(it.year);
+                slides.push_back(std::move(s));
+            }
+            return slides;
+        };
+        // The slides the last run showed, from the disk, at once; the network
+        // pass below brings them up to date (the same pictures come from the disk).
+        bool shown_cached = false;
+        {
+            std::vector<HeroSlide> slides = list_slides(cache_client);
+            if (!slides.empty()) {
+                {
+                    std::lock_guard<std::mutex> lock(catalog_mutex);
+                    hero_slides = slides;
+                }
+                hero_state = 2;
+                hero_version++;
+                shown_cached = true;
+                write_log("[DEBUG] hero: %zu slides from the disk cache\n", slides.size());
+                fill_hero_slides(cache_client, slides, [this]() { return !stop_hero_; });
+            }
+        }
         if (!wait_turn())
             return;
-        bool has_next = false;
-        const std::vector<CatalogItem> items = fetch_list_page(client, 0, 1, 0, 1, &has_next);
-        std::vector<HeroSlide> slides;
-        for (const CatalogItem &it : items) {
-            if (slides.size() >= 10)
-                break;
-            if (it.url.empty() || hidden_by_filter(it.info))
-                continue;
-            HeroSlide s;
-            s.item = it;
-            s.title = it.title;
-            s.quality = it.quality;
-            s.description = it.description;
-            split_info(it.info, s.year, s.country, s.genre);
-            if (it.year > 0)
-                s.year = std::to_string(it.year);
-            slides.push_back(std::move(s));
-        }
+        std::vector<HeroSlide> slides = list_slides(client);
         write_log("[DEBUG] hero: %zu slides\n", slides.size());
+        if (slides.empty() && shown_cached)
+            return; // the kept banner stays
         {
             std::lock_guard<std::mutex> lock(catalog_mutex);
+            // A slide already showing keeps its picture and its page's text
+            std::map<std::string, HeroSlide> before;
+            for (const HeroSlide &s : hero_slides)
+                before[s.item.url] = s;
             hero_slides = slides;
+            for (HeroSlide &s : hero_slides) {
+                auto it = before.find(s.item.url);
+                if (it != before.end())
+                    s = it->second;
+            }
         }
         hero_state = slides.empty() ? 3 : 2;
         hero_version++;
+        fill_hero_slides(client, slides, wait_turn);
+    });
+}
 
+// Each slide's page (description, genre, the full cover) and its picture,
+// from `from`: the cache-only client at start, then the network's.
+void App::fill_hero_slides(Client &from, std::vector<HeroSlide> slides, const std::function<bool()> &wait_turn)
+{
+    {
         for (size_t i = 0; i < slides.size(); ++i) {
             if (!wait_turn())
                 return;
             const std::string page = slides[i].item.url;
             std::string cover = slides[i].item.cover_url;
             VideoDetails det;
-            if (client.get_details(page, det)) {
+            if (from.get_details(page, det)) {
                 HeroSlide &s = slides[i];
                 if (!det.name.empty())
                     s.title = det.name;
@@ -1809,9 +1929,15 @@ void App::load_hero_async()
             }
             if (!wait_turn())
                 return;
-            const std::string address = photo_address(cover, client.get_mirror());
+            {
+                // Pictured already (by the disk pass): not decoded again
+                std::lock_guard<std::mutex> lock(catalog_mutex);
+                if (i < hero_slides.size() && hero_slides[i].item.url == page && hero_slides[i].texture != 0)
+                    continue;
+            }
+            const std::string address = photo_address(cover, from.get_mirror());
             std::vector<uint8_t> bytes;
-            if (address.empty() || !client.http_get_binary(address, bytes))
+            if (address.empty() || !from.http_get_binary(address, bytes))
                 continue;
             int w = 0, h = 0;
             uint8_t *rgba = TextureLoader::decode_image_rgba(bytes.data(), bytes.size(), &w, &h);
@@ -1828,7 +1954,7 @@ void App::load_hero_async()
             std::lock_guard<std::mutex> p_lock(pending_mutex);
             hero_pending_.push_back(std::move(hp));
         }
-    });
+    }
 }
 
 uint32_t App::photo_texture(const std::string &raw)
@@ -1934,6 +2060,7 @@ void App::list_async(std::function<std::vector<CatalogItem>(Client &)> fetch, co
 
 void App::load_details_async(int movie_idx)
 {
+    details_requests++;
     BigThread([this, movie_idx]() {
         std::string url;
         {
@@ -2030,6 +2157,8 @@ void App::login_async(const std::string &email, const std::string &password)
             ok = client.login(email, password, error);
         Account acc;
         if (ok) {
+            // The kept titles' pages are the guest's: bookmarks, the session's token
+            disk_cache::clear_bucket(disk_cache::Bucket::meta);
             client.get_account(acc);
             acc.logged_in = true;
             acc.email = email;
@@ -2081,6 +2210,7 @@ void App::logout_async()
     BigThread([this]() {
         UrgentRequest urgent(urgent_requests);
         client.logout();
+        disk_cache::clear_bucket(disk_cache::Bucket::meta); // the account's pages
     }).detach();
 }
 
@@ -2160,13 +2290,14 @@ void App::load_bookmark_choices_async(int movie_idx)
 
 void App::toggle_bookmark_folder_async(int movie_idx, const std::string &cat_id)
 {
-    std::string post_id;
+    std::string post_id, page_url;
     {
         std::lock_guard<std::mutex> lock(catalog_mutex);
         if (movie_idx < 0 || movie_idx >= static_cast<int>(movies.size()))
             return;
         MovieData &m = movies[static_cast<size_t>(movie_idx)];
         post_id = m.details.id;
+        page_url = m.url;
         for (BookmarkFolder &f : m.details.bookmarks)
             if (f.id == cat_id) {
                 if (f.pending)
@@ -2175,10 +2306,12 @@ void App::toggle_bookmark_folder_async(int movie_idx, const std::string &cat_id)
             }
         catalog_version++;
     }
-    BigThread([this, movie_idx, post_id, cat_id]() {
+    BigThread([this, movie_idx, post_id, cat_id, page_url]() {
         UrgentRequest urgent(urgent_requests);
         std::string error;
         const bool ok = !post_id.empty() && client.add_to_bookmarks(post_id, cat_id, error);
+        if (ok)
+            Client::forget_page(page_url); // its kept page shows the old folders
         {
             std::lock_guard<std::mutex> lock(catalog_mutex);
             if (movie_idx < static_cast<int>(movies.size()) && movies[static_cast<size_t>(movie_idx)].details.id == post_id)
@@ -2834,7 +2967,9 @@ void App::update(float dt)
             hero_state = 0;
         }
     }
-    if (hero_state == 0 && network_started_ && !catalog_loading)
+    // At once: its disk pass shows the kept slides, and its network pass
+    // waits for the catalogue's first page by itself.
+    if (hero_state == 0 && network_started_)
         load_hero_async();
     // "Автоматическая проверка обновлений": once, after the first page is in
     if (!update_auto_done_ && network_started_ && !catalog_loading) {
@@ -2854,10 +2989,13 @@ void App::update(float dt)
             }
         }
         if (have && renderer) {
-            const uint32_t handle = renderer->create_texture(hp.width, hp.height, hp.rgba.data());
             std::lock_guard<std::mutex> lock(catalog_mutex);
-            if (handle != 0 && hp.index < static_cast<int>(hero_slides.size()) &&
-                hero_slides[static_cast<size_t>(hp.index)].item.url == hp.url) {
+            // A slide pictured already (the disk pass, then the network's) keeps its texture
+            const bool wanted = hp.index < static_cast<int>(hero_slides.size()) &&
+                                hero_slides[static_cast<size_t>(hp.index)].item.url == hp.url &&
+                                hero_slides[static_cast<size_t>(hp.index)].texture == 0;
+            const uint32_t handle = wanted ? renderer->create_texture(hp.width, hp.height, hp.rgba.data()) : 0;
+            if (handle != 0) {
                 HeroSlide &s = hero_slides[static_cast<size_t>(hp.index)];
                 s.texture = handle;
                 s.tex_w = hp.width;
@@ -2972,11 +3110,26 @@ void App::check_mirror_async(const std::string &mirror)
         return;
     BigThread([this, mirror]() {
         UrgentRequest urgent(urgent_requests);
-        const bool ok = mirror.empty() ? client.pick_mirror() : client.check_mirror(mirror);
+        const bool ok = mirror.empty() ? client.pick_mirror(true) : client.check_mirror(mirror);
         mirror_check = ok ? 2 : 3;
         std::lock_guard<std::mutex> lock(catalog_mutex);
         catalog_version++;
     }).detach();
+}
+
+void App::clear_cache_async()
+{
+    if (cache_clearing.exchange(true))
+        return;
+    BigThread([this]() {
+        disk_cache::clear();
+        cache_clearing = false;
+    }).detach();
+}
+
+uint64_t App::cache_size_bytes() const
+{
+    return disk_cache::size_bytes();
 }
 
 namespace

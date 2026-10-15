@@ -24,6 +24,9 @@ build/
 **/debug.log
 **/settings.cfg
 **/search_history.txt
+# The title's disk cache: pictures, lists, pages, the last mirror
+data/cache/
+**/data/cache/
 
 # Assistant workspace
 .claude/
@@ -31,3 +34,7 @@ build/
 # Local assistant instructions: kept on disk, never committed
 CLAUDE.md
 **/CLAUDE.md
+
+**/continue.txt
+**/favorites.txt
+**/data/

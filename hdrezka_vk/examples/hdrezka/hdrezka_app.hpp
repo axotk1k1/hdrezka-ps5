@@ -114,6 +114,9 @@ public:
     }
 
     Client client;
+    // Answers from the disk cache only (data/cache/): what the last run saw,
+    // shown at start before the network is asked.
+    Client cache_client;
     Account account;
     VideoPlayer player;
     VideoTexture video_texture;
@@ -354,6 +357,13 @@ public:
     // 2 it answers (and is now the mirror), 3 it does not.
     void check_mirror_async(const std::string &mirror);
     std::atomic<int> mirror_check{0};
+    // "Очистить кэш": data/cache/ emptied on a worker; cache_clearing while it runs.
+    void clear_cache_async();
+    std::atomic<bool> cache_clearing{false};
+    uint64_t cache_size_bytes() const;
+    // Counts the titles opened (load_details_async): a list shown from the
+    // cache is not swapped under a title opened from it.
+    std::atomic<uint32_t> details_requests{0};
 
     // The playing stream's subtitles: its tracks (from get_streams), the one
     // chosen (-1: off) and its cues once loaded. Guarded by catalog_mutex.
@@ -448,6 +458,7 @@ private:
     bool update_auto_done_ = false; // the check at start has been made
     void set_update_state(UpdateState state, const std::string &message = {});
     void load_hero_async();
+    void fill_hero_slides(Client &from, std::vector<HeroSlide> slides, const std::function<bool()> &wait_turn);
     bool network_started_ = false;
     void init_defaults();
 };

@@ -19,6 +19,7 @@
 
 #include "console_curl.h"
 #include <atomic>
+#include "disk_cache.hpp"
 #include "logger.hpp"
 #include <openssl/sha.h>
 
@@ -522,6 +523,8 @@ void Client::set_preferred_mirror(const std::string &mirror)
     if (!m.empty() && m.find("://") == std::string::npos)
         m = "https://" + m;
     std::lock_guard<std::mutex> lock(preferred_mu_);
+    if (preferred_mirror_ != m)
+        mirror_verified_at_ = 0; // another source: asked again
     preferred_mirror_ = m;
 }
 
@@ -547,35 +550,116 @@ bool Client::check_mirror(const std::string &mirror)
     return ok;
 }
 
-bool Client::pick_mirror()
+// A mirror that answered this long ago is taken without asking it again: the
+// lists, the search and the actors' pages each begin with pick_mirror.
+static constexpr time_t kMirrorTrust = 5 * 60;
+
+bool Client::pick_mirror(bool force)
 {
     const std::string preferred = preferred_mirror();
+    {
+        std::lock_guard<std::recursive_mutex> lock(net_mu_);
+        const time_t at = mirror_verified_at_.load();
+        if (!force && at != 0 && time(nullptr) - at < kMirrorTrust && (preferred.empty() || preferred == mirror_))
+            return true;
+    }
+    const auto verified = [this](bool ok) {
+        std::lock_guard<std::recursive_mutex> lock(net_mu_);
+        mirror_verified_at_ = ok ? time(nullptr) : 0;
+        if (ok)
+            disk_cache::write_note("last_mirror.txt", mirror_);
+        return ok;
+    };
     if (!preferred.empty())
-        return check_mirror(preferred);
-    static const char *candidates[] = {
+        return verified(check_mirror(preferred));
+    static const char *known[] = {
         "https://hdrezka.ag",
         "https://rezka.ag",
         "https://hdrezka.me",
         "https://hdrezka-home.tv",
     };
-    for (const char *candidate : candidates) {
+    // The one that answered last time first, then the others
+    std::vector<std::string> candidates;
+    const std::string last = disk_cache::read_note("last_mirror.txt");
+    if (last.rfind("http", 0) == 0)
+        candidates.push_back(last);
+    for (const char *k : known)
+        if (k != last)
+            candidates.push_back(k);
+    for (const std::string &candidate : candidates) {
+        std::lock_guard<std::recursive_mutex> lock(net_mu_);
         set_mirror(candidate);
-        write_log("[DEBUG] pick_mirror trying %s\n", candidate);
+        write_log("[DEBUG] pick_mirror trying %s\n", candidate.c_str());
         const std::string html = http_get("/films/?filter=popular");
         const bool ok = html.find("class=\"b-content__inline_item\"") != std::string::npos;
         write_log("[DEBUG] pick_mirror %s -> %zu bytes, catalog %s (mirror now %s)\n",
-                  candidate, html.size(), ok ? "found" : "missing", mirror_.c_str());
+                  candidate.c_str(), html.size(), ok ? "found" : "missing", mirror_.c_str());
         if (!ok && !html.empty()) {
             write_log("[DEBUG] pick_mirror head: %.300s\n", html.c_str());
         }
         if (ok)
-            return true;
+            return verified(true);
     }
     set_mirror("https://hdrezka.ag");
-    return false;
+    return verified(false);
 }
 
+void Client::forget_page(const std::string &url)
+{
+    disk_cache::remove(disk_cache::Bucket::meta, disk_cache::url_key(url));
+}
+
+namespace
+{
+// The address of a picture: its path ends in an image's extension.
+bool image_address(const std::string &url)
+{
+    std::string path = url.substr(0, url.find_first_of("?#"));
+    const size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos || path.find('/', dot) != std::string::npos)
+        return false;
+    std::string ext = path.substr(dot + 1);
+    for (char &c : ext)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return ext == "jpg" || ext == "jpeg" || ext == "png" || ext == "webp" || ext == "gif";
+}
+
+// What a JPEG, PNG, GIF or WebP file begins with: an error page is not kept.
+bool image_bytes(const std::vector<uint8_t> &b)
+{
+    if (b.size() < 12)
+        return false;
+    if (b[0] == 0xFF && b[1] == 0xD8)
+        return true;
+    if (b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G')
+        return true;
+    if (b[0] == 'G' && b[1] == 'I' && b[2] == 'F')
+        return true;
+    return std::memcmp(b.data(), "RIFF", 4) == 0 && std::memcmp(b.data() + 8, "WEBP", 4) == 0;
+}
+} // namespace
+
 bool Client::http_get_binary(const std::string &url, std::vector<uint8_t> &out_bytes)
+{
+    out_bytes.clear();
+    // A picture kept on the disk: no request, and not the network's lock either
+    const bool picture = image_address(url);
+    const std::string key = picture ? disk_cache::url_key(url) : std::string();
+    if (picture && disk_cache::read(disk_cache::Bucket::images, key, out_bytes) && image_bytes(out_bytes))
+        return true;
+    out_bytes.clear();
+    if (cache_only_)
+        return false;
+    if (picture) {
+        const bool ok = fetch_binary(url, out_bytes);
+        if (ok && image_bytes(out_bytes))
+            disk_cache::write(disk_cache::Bucket::images, key, out_bytes.data(), out_bytes.size());
+        return ok;
+    }
+    return fetch_binary(url, out_bytes);
+}
+
+bool Client::fetch_binary(const std::string &url, std::vector<uint8_t> &out_bytes)
 {
     std::lock_guard<std::recursive_mutex> net_lock(net_mu_);
     out_bytes.clear();
@@ -1466,7 +1550,16 @@ std::vector<CatalogItem> Client::get_movie_list(const std::string &filter, int g
     if (genre > 0)
         path += "&genre=" + std::to_string(genre);
 
-    const std::string html = http_get(path);
+    // The last answer is kept for the next start: the list shows it at once
+    std::string html;
+    const std::string key = disk_cache::url_key(path);
+    if (cache_only_) {
+        disk_cache::read(disk_cache::Bucket::catalog, key, html);
+    } else {
+        html = http_get(path);
+        if (html.find("b-content__inline_item") != std::string::npos)
+            disk_cache::write(disk_cache::Bucket::catalog, key, html.data(), html.size());
+    }
     if (has_next)
         *has_next = page_has_next(html);
     return parse_catalog_html(html, "home", mirror_);
@@ -1951,9 +2044,19 @@ bool Client::get_person_page(const std::string &person_url, int page, PersonDeta
         page = 1;
     out.url = person_page_url(out.url, 1);
 
-    std::string html = http_get(person_page_url(out.url, page));
-    if (html.empty() || !person_document(html))
-        return false;
+    // The filmography is kept a week
+    const std::string address = person_page_url(out.url, page);
+    const std::string key = disk_cache::url_key(address);
+    std::string html;
+    if (!disk_cache::read(disk_cache::Bucket::meta, key, html, cache_only_ ? 0 : disk_cache::kPersonTtl) ||
+        !person_document(html)) {
+        if (cache_only_)
+            return false;
+        html = http_get(address);
+        if (html.empty() || !person_document(html))
+            return false;
+        disk_cache::write(disk_cache::Bucket::meta, key, html.data(), html.size());
+    }
 
     auto take_between = [&](const std::string &open_mark, const std::string &close_tag) -> std::string {
         size_t p = html.find(open_mark);
@@ -2422,7 +2525,19 @@ std::string Client::stt_recognize(const std::string &endpoint, const std::vector
 
 bool Client::get_details(const std::string &item_url, VideoDetails &out_details)
 {
-    std::string html = http_get(item_url);
+    // The title's page is kept a day; the streams it carries are not taken
+    // from a kept one (their links expire), get_streams asks for them.
+    const std::string key = disk_cache::url_key(item_url);
+    std::string html;
+    const bool from_disk = disk_cache::read(disk_cache::Bucket::meta, key, html, cache_only_ ? 0 : disk_cache::kTitleTtl) &&
+                           html.find("b-post__title") != std::string::npos;
+    if (!from_disk) {
+        if (cache_only_)
+            return false;
+        html = http_get(item_url);
+        if (html.find("b-post__title") != std::string::npos)
+            disk_cache::write(disk_cache::Bucket::meta, key, html.data(), html.size());
+    }
     if (html.empty()) return false;
 
     // Title: <div class="b-post__title"><h1>...</h1></div>
@@ -2522,8 +2637,8 @@ bool Client::get_details(const std::string &item_url, VideoDetails &out_details)
     }
     out_details.bookmarks = parse_page_bookmarks(html);
 
-    // Check embedded streams in HTML e.g. "streams":"..."
-    size_t st_pos = html.find("\"streams\":");
+    // Check embedded streams in HTML e.g. "streams":"..." (a kept page's are stale)
+    size_t st_pos = from_disk ? std::string::npos : html.find("\"streams\":");
     if (st_pos != std::string::npos) {
         size_t val_start = html.find("\"", st_pos + 10);
         if (val_start != std::string::npos) {
@@ -3115,10 +3230,20 @@ bool Client::get_episodes(const VideoDetails &video,
         fields["favs"] = video.favs;
     }
 
-    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                   std::chrono::system_clock::now().time_since_epoch()).count();
-    std::string path = "/ajax/get_cdn_series/?t=" + std::to_string(now);
-    std::string response = http_post(path, fields);
+    // The seasons of a voice are kept a day, as the title's page is
+    const std::string key = disk_cache::url_key("/episodes/" + video.id + "/" + fields["translator_id"]);
+    std::string response;
+    if (!disk_cache::read(disk_cache::Bucket::meta, key, response, cache_only_ ? 0 : disk_cache::kTitleTtl)) {
+        if (cache_only_)
+            return false;
+        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::system_clock::now().time_since_epoch()).count();
+        std::string path = "/ajax/get_cdn_series/?t=" + std::to_string(now);
+        response = http_post(path, fields);
+        if (response.find("\"success\":true") != std::string::npos &&
+            response.find("data-tab_id") != std::string::npos)
+            disk_cache::write(disk_cache::Bucket::meta, key, response.data(), response.size());
+    }
     write_log("[DEBUG] get_episodes id=%s tr=%s resp_len=%zu\n",
               video.id.c_str(), translator_id.c_str(), response.size());
     if (response.empty()) {

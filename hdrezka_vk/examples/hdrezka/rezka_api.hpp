@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <ctime>
 #include <functional>
 #include <string>
 #include <vector>
@@ -404,7 +406,10 @@ public:
 
     // Probe known mirrors and keep the first one that returns a catalog page.
     // With a preferred mirror (the settings' "Источник") only that one is tried.
-    bool pick_mirror();
+    // The last mirror that answered (data/cache/last_mirror.txt) is tried
+    // first; one that answered in the last minutes is not asked again unless
+    // `force`.
+    bool pick_mirror(bool force = false);
     void set_preferred_mirror(const std::string &mirror);
     std::string preferred_mirror() const;
     // Whether `mirror` answers with a catalog page; it becomes the mirror when it does.
@@ -416,13 +421,25 @@ public:
     static std::string clear_trash(const std::string &data);
     static std::vector<StreamQuality> parse_stream_string(const std::string &raw);
 
+    // The disk cache (disk_cache.hpp): pictures, list pages, the titles' and
+    // actors' pages are kept as they arrive. A cache-only client never goes
+    // to the network: get_movie_list, get_details, get_person_page,
+    // get_episodes and http_get_binary answer from the disk at any age, or
+    // fail. The streams and the comments are never kept.
+    void set_cache_only(bool on) { cache_only_ = on; }
+    // A title's kept page goes (its bookmarks changed).
+    static void forget_page(const std::string &url);
+
 private:
+    bool cache_only_ = false;
+    std::atomic<time_t> mirror_verified_at_{0}; // when pick_mirror last saw mirror_ answer
     std::string mirror_{"https://hdrezka.ag"};
     mutable std::mutex preferred_mu_;
     std::string preferred_mirror_;
     std::string cookie_file_;
     std::recursive_mutex net_mu_;
     std::string http_get(const std::string &url);
+    bool fetch_binary(const std::string &url, std::vector<uint8_t> &out_bytes);
     std::string http_post(const std::string &url, const std::map<std::string, std::string> &fields);
     bool solve_anubis_challenge(const std::string &html, const std::string &page_url);
 };
