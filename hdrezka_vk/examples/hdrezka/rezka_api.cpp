@@ -2659,7 +2659,12 @@ bool Client::get_details(const std::string &item_url, VideoDetails &out_details)
         }
     }
 
-    // Translators list: <li class="b-translator__item" data-translator_id="56" ...>
+    // Translators list: <a class="b-translator__item" data-translator_id="56" ...>
+    // (an <li> of its own on older pages). The site lists every voice twice:
+    // a decoy <a class="b-translator__items"> first, hidden by its style
+    // (.b-translator__items{display: none;}) and with a scrambled href, then
+    // the real one. The decoys are skipped, and an id seen already too.
+    out_details.translators.clear();
     size_t tr_pos = 0;
     while ((tr_pos = html.find("data-translator_id=\"", tr_pos)) != std::string::npos) {
         size_t tr_end = html.find("\"", tr_pos + 20);
@@ -2669,11 +2674,49 @@ bool Client::get_details(const std::string &item_url, VideoDetails &out_details)
         t.id = html.substr(tr_pos + 20, tr_end - (tr_pos + 20));
 
         size_t tag_end = html.find(">", tr_end);
+        {
+            const size_t open = html.rfind('<', tr_pos);
+            const std::string tag = open != std::string::npos && tag_end != std::string::npos
+                                        ? html.substr(open, tag_end - open) : std::string();
+            bool seen = false;
+            for (const Translator &other : out_details.translators)
+                seen = seen || other.id == t.id;
+            if (tag.find("b-translator__items") != std::string::npos || seen || t.id.empty()) {
+                tr_pos = tr_end;
+                continue;
+            }
+        }
         size_t li_end = html.find("</li>", tag_end);
         if (tag_end != std::string::npos && li_end != std::string::npos) {
-            t.name = strip_tags(html.substr(tag_end + 1, li_end - (tag_end + 1)));
+            const std::string inner = html.substr(tag_end + 1, li_end - (tag_end + 1));
+            t.name = strip_tags(inner);
+            while (!t.name.empty() && std::isspace(static_cast<unsigned char>(t.name.back())))
+                t.name.pop_back();
+            while (!t.name.empty() && std::isspace(static_cast<unsigned char>(t.name.front())))
+                t.name.erase(t.name.begin());
+            // The language's flag: <img src="https://static.hdrezka.ac/i/flags/ua.png" ...>
+            const size_t flags = inner.find("/flags/");
+            if (flags != std::string::npos) {
+                const size_t dot = inner.find('.', flags + 7);
+                if (dot != std::string::npos && dot - (flags + 7) == 2) {
+                    std::string code = inner.substr(flags + 7, 2);
+                    for (char &c : code)
+                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (std::isalpha(static_cast<unsigned char>(code[0])) && std::isalpha(static_cast<unsigned char>(code[1])))
+                        t.flag = code;
+                }
+            }
         }
         if (t.name.empty()) t.name = "Озвучка #" + t.id;
+
+        // A voice for the subscribers: <li class="b-translator__item b-prem_translator" ...>
+        if (tag_end != std::string::npos) {
+            const size_t open = html.rfind('<', tr_pos);
+            if (open != std::string::npos) {
+                const std::string tag = html.substr(open, tag_end - open);
+                t.is_premium = tag.find("b-prem_translator") != std::string::npos;
+            }
+        }
 
         // Attributes: camrip, ads, director
         if (tag_end != std::string::npos) {

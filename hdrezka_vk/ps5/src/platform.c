@@ -517,14 +517,34 @@ struct ime_dialog_result {
 #define IME_DIALOG_FINISHED 2
 
 static struct {
-   bool looked_up, available, open;
+   bool looked_up, available, open, password;
    int (*init)(const struct ime_dialog_param *param, void *extended);
    int (*get_status)(void);
    int (*get_result)(struct ime_dialog_result *result);
    int (*term)(void);
+   int last_status;
    uint16_t text[256];
    uint16_t title[64];
 } ime;
+
+/* The title's debug.log (hdrezka_app.cpp), when it is linked in: the IME's
+ * steps go there as "[DEBUG] ime_dialog: ...", and to klog as ever. */
+__attribute__((weak)) void console_write_log(const char *fmt, ...);
+
+static void
+ime_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static void
+ime_log(const char *format, ...)
+{
+   char line[256];
+   va_list args;
+   va_start(args, format);
+   vsnprintf(line, sizeof(line), format, args);
+   va_end(args);
+   say("ime_dialog: %s", line);
+   if (console_write_log)
+      console_write_log("[DEBUG] ime_dialog: %s\n", line);
+}
 
 static size_t
 utf8_to_utf16(const char *in, uint16_t *out, size_t capacity)
@@ -583,17 +603,41 @@ ime_look_up(void)
    if (ime.looked_up)
       return ime.available;
    ime.looked_up = true;
-   const int module = sceKernelLoadStartModule("/system/common/lib/libSceImeDialog.sprx", 0, NULL, 0, NULL, NULL);
+
+   /* The system dialogs' common layer first, as the SDK's samples bring it
+    * up before any dialog; "already initialised" is fine. */
+   static const char *const common_paths[2] = { "/system/common/lib/libSceCommonDialog.sprx",
+                                                "libSceCommonDialog.sprx" };
+   for (int i = 0; i < 2; i++) {
+      const int common = sceKernelLoadStartModule(common_paths[i], 0, NULL, 0, NULL, NULL);
+      ime_log("load %s -> 0x%08x", common_paths[i], (unsigned)common);
+      if (common < 0)
+         continue;
+      void *initialize = NULL;
+      if (sceKernelDlsym(common, "sceCommonDialogInitialize", &initialize) >= 0 && initialize)
+         ime_log("sceCommonDialogInitialize -> 0x%08x", (unsigned)((int (*)(void))initialize)());
+      else
+         ime_log("libSceCommonDialog has no sceCommonDialogInitialize");
+      break;
+   }
+
+   static const char *const paths[2] = { "/system/common/lib/libSceImeDialog.sprx", "libSceImeDialog.sprx" };
+   int module = -1;
+   for (int i = 0; i < 2 && module < 0; i++) {
+      module = sceKernelLoadStartModule(paths[i], 0, NULL, 0, NULL, NULL);
+      ime_log("load %s -> 0x%08x", paths[i], (unsigned)module);
+   }
    if (module < 0) {
-      say("keyboard: no libSceImeDialog (0x%08x)", (unsigned)module);
+      ime_log("no libSceImeDialog: the sheet of keys instead");
       return false;
    }
    void *address[4] = { NULL, NULL, NULL, NULL };
    static const char *const names[4] = { "sceImeDialogInit", "sceImeDialogGetStatus",
                                          "sceImeDialogGetResult", "sceImeDialogTerm" };
    for (int i = 0; i < 4; i++) {
-      if (sceKernelDlsym(module, names[i], &address[i]) < 0 || !address[i]) {
-         say("keyboard: libSceImeDialog has no %s", names[i]);
+      const int found = sceKernelDlsym(module, names[i], &address[i]);
+      if (found < 0 || !address[i]) {
+         ime_log("libSceImeDialog has no %s (0x%08x)", names[i], (unsigned)found);
          return false;
       }
    }
@@ -602,18 +646,30 @@ ime_look_up(void)
    ime.get_result = (int (*)(struct ime_dialog_result *))address[2];
    ime.term = (int (*)(void))address[3];
    ime.available = true;
+   ime_log("libSceImeDialog ready (handle 0x%08x)", (unsigned)module);
    return true;
 }
 
 bool
 keyboard_open(const char *title, const char *text, bool password, int max_chars)
 {
-   if (ime.open || !ime_look_up())
+   ime_log("open \"%s\" (password %d, max %d)", title ? title : "", password ? 1 : 0, max_chars);
+   if (!ime_look_up())
       return false;
+   if (ime.open) {
+      /* One left over (its result never read): closed before the new one */
+      const int status = ime.get_status();
+      ime_log("a dialog is still open (status %d): terminating it", status);
+      ime_log("sceImeDialogTerm -> 0x%08x", (unsigned)ime.term());
+      ime.open = false;
+   }
    struct ime_dialog_param param;
    memset(&param, 0, sizeof(param));
-   if (sceUserServiceGetInitialUser(&param.user_id) < 0)
+   const int user = sceUserServiceGetInitialUser(&param.user_id);
+   if (user < 0) {
+      ime_log("sceUserServiceGetInitialUser -> 0x%08x", (unsigned)user);
       return false;
+   }
    utf8_to_utf16(text, ime.text, sizeof(ime.text) / sizeof(ime.text[0]));
    utf8_to_utf16(title, ime.title, sizeof(ime.title) / sizeof(ime.title[0]));
    param.option = IME_OPTION_NO_AUTO_CAPITALIZATION | IME_OPTION_NO_LEARNING | (password ? IME_OPTION_PASSWORD : 0);
@@ -626,11 +682,12 @@ keyboard_open(const char *title, const char *text, bool password, int max_chars)
    param.horizontal_alignment = 1; /* centred on the position */
    param.vertical_alignment = 1;
    const int result = ime.init(&param, NULL);
-   if (result < 0) {
-      say("keyboard: sceImeDialogInit 0x%08x", (unsigned)result);
+   ime_log("sceImeDialogInit(user %d, max %u) -> 0x%08x", param.user_id, param.max_text_length, (unsigned)result);
+   if (result < 0)
       return false;
-   }
    ime.open = true;
+   ime.password = password;
+   ime.last_status = -1;
    return true;
 }
 
@@ -639,16 +696,30 @@ keyboard_poll(char *out, size_t size)
 {
    if (!ime.open)
       return -1;
-   if (ime.get_status() != IME_DIALOG_FINISHED)
+   const int status = ime.get_status();
+   if (status != ime.last_status) {
+      ime_log("sceImeDialogGetStatus -> %d", status);
+      ime.last_status = status;
+   }
+   /* 0 none (not up yet), 1 running: still waiting; an error ends it */
+   if (status >= 0 && status != IME_DIALOG_FINISHED)
       return 0;
    struct ime_dialog_result result;
    memset(&result, 0, sizeof(result));
-   const int got = ime.get_result(&result);
-   ime.term();
+   int got = -1;
+   if (status == IME_DIALOG_FINISHED) {
+      got = ime.get_result(&result);
+      ime_log("sceImeDialogGetResult -> 0x%08x, end status %d", (unsigned)got, result.end_status);
+   }
+   ime_log("sceImeDialogTerm -> 0x%08x", (unsigned)ime.term());
    ime.open = false;
    if (got < 0 || result.end_status != 0)
       return -1;
    utf16_to_utf8(ime.text, out, size);
+   if (ime.password)
+      ime_log("text: %zu bytes (a password, not logged)", strlen(out));
+   else
+      ime_log("text \"%s\"", out);
    return 1;
 }
 

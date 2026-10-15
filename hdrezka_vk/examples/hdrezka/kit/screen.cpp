@@ -83,6 +83,43 @@ const char *kKeysSYM[48] = {
     "*", "&", "(", ")", "-", "_", ".", ",", "/", "\\", "|", "~"
 };
 
+// The TV sheet of keys, laid out as the console's own keyboard: five rows of
+// ten characters over two rows of wide keys. Each layout has its lower and
+// upper case (Shift); the symbols are the same in both.
+constexpr int kPsKeyCols = 10;
+constexpr int kPsCharRows = 5;
+constexpr int kPsKeyRows = 7;
+const char *const kPsKeysRU[2][50] = {
+    {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+     "ё", "@", "-", ",", ".", "/", "_", "+", "х", "ъ",
+     "й", "ц", "у", "к", "е", "н", "г", "ш", "щ", "з",
+     "ф", "ы", "в", "а", "п", "р", "о", "л", "д", "ж",
+     "я", "ч", "с", "м", "и", "т", "ь", "б", "ю", "э"},
+    {"!", "\"", "#", ";", "%", ":", "?", "*", "(", ")",
+     "Ё", "@", "$", "^", "&", "/", "_", "+", "Х", "Ъ",
+     "Й", "Ц", "У", "К", "Е", "Н", "Г", "Ш", "Щ", "З",
+     "Ф", "Ы", "В", "А", "П", "Р", "О", "Л", "Д", "Ж",
+     "Я", "Ч", "С", "М", "И", "Т", "Ь", "Б", "Ю", "Э"},
+};
+const char *const kPsKeysEN[2][50] = {
+    {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+     "q", "w", "e", "r", "t", "y", "u", "i", "o", "p",
+     "a", "s", "d", "f", "g", "h", "j", "k", "l", "'",
+     "z", "x", "c", "v", "b", "n", "m", ",", ".", "?",
+     "@", "-", "_", "/", ":", "&", "=", "+", "#", "!"},
+    {"!", "@", "#", "$", "%", "^", "&", "*", "(", ")",
+     "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P",
+     "A", "S", "D", "F", "G", "H", "J", "K", "L", "\"",
+     "Z", "X", "C", "V", "B", "N", "M", ";", ":", "?",
+     "@", "-", "_", "/", ":", "&", "=", "+", "#", "!"},
+};
+const char *const kPsKeysSYM[50] = {
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+    "!", "@", "#", "$", "%", "^", "&", "*", "(", ")",
+    "-", "_", "=", "+", "[", "]", "{", "}", "\\", "|",
+    ";", ":", "'", "\"", ",", ".", "<", ">", "/", "?",
+    "`", "~", "«", "»", "°", "§", "£", "¥", "©", "¿"};
+
 // ---- the design language ---------------------------------------------------
 
 const Color kWhite = Color::rgb(0xffffff);
@@ -103,6 +140,19 @@ const Color kPlayBottom = Color::rgb(0x2d6cc0);
 const Color kClockBlue = Color::rgb(0x2c5f96);
 const Color kFocusText = Color::rgb(0x151922); // text on a white focus plate
 const Color kFocusHint = Color::rgb(0x1f5ca6);
+// The console keyboard's greys
+const Color kKbCard = Color::rgb(0x232629);
+const Color kKbChars = Color::rgb(0x17191b);
+const Color kKbKey = Color::rgb(0x33363a);
+const Color kKbFocus = Color::rgb(0x45494e);
+const Color kKbFocusEdge = Color::rgb(0xd5d8db);
+const Color kKbInk = Color::rgb(0xe4e6e8);
+const Color kKbCorner = Color::rgb(0x9a9fa5);
+// The DualSense face buttons' colours, as the kit's glyphs tint them
+const Color kPadCross = Color::rgb(0x7fa7ff);
+const Color kPadCircle = Color::rgb(0xff6b7d);
+const Color kPadSquare = Color::rgb(0xe98fd8);
+const Color kPadTriangle = Color::rgb(0x46d6b0);
 
 constexpr float kWidth = gfx::kVirtualWidth;
 constexpr float kHeight = gfx::kVirtualHeight;
@@ -1259,7 +1309,11 @@ class Store final : public app::Concept
                     host_touch_.down = true;
                 }
                 // "type=text": into the field the keyboard sheet is open for
-                else if (key.rfind("type=", 0) == 0 && kb_open_ && kb_target_) *kb_target_ += key.substr(5);
+                else if (key.rfind("type=", 0) == 0 && kb_open_ && kb_target_)
+                {
+                    *kb_target_ += key.substr(5);
+                    kb_caret_ = kb_target_->size();
+                }
             }
             p = end ? end + 1 : nullptr;
         }
@@ -4298,6 +4352,12 @@ class Store final : public app::Concept
             tv_youtube_ = app.renderer->create_texture(w, h, rgba);
         if (rgba)
             rezka::TextureLoader::free_decoded_image(rgba);
+        // The voices' flags, as Android's emoji font draws them
+        rgba = rezka::TextureLoader::load_file_rgba(VK_EXAMPLE_ASSETS_DIR "tv/flags.png", &w, &h);
+        if (rgba && w > 0 && h > 0)
+            tv_flags_ = app.renderer->create_texture(w, h, rgba);
+        if (rgba)
+            rezka::TextureLoader::free_decoded_image(rgba);
         // The profile's illustrations
         static const char *const ill_files[5] = {
             VK_EXAMPLE_ASSETS_DIR "tv/ill-enter.png", VK_EXAMPLE_ASSETS_DIR "tv/ill-welcome_cats.png",
@@ -4380,6 +4440,9 @@ class Store final : public app::Concept
         kTvIconRemove,
         kTvIconAdd,
         kTvIconSend,
+        // HDrezkaTV's own: a voice for the subscribers, a voice with ads
+        kTvIconPremTranslator,
+        kTvIconAd,
         kTvIconCount,
     };
     void tv_icon(gfx::DrawList &list, int icon, float x, float y, float size, Color color) const
@@ -4389,6 +4452,36 @@ class Store final : public app::Concept
         const float u = 1.0f / static_cast<float>(kTvIconCount);
         list.image(tv_icons_, {x, y, size, size}, {u * static_cast<float>(icon), 0.0f, u, 1.0f},
                    color);
+    }
+
+    // A country's emoji flag in a line of text, as Android appends it to a
+    // voice's name (the regional-indicator pair of its code): Noto Color
+    // Emoji's glyph, 1.245 em on, its bitmap 1.248 x 1.174 em with the top
+    // 0.927 em over the baseline. Returns the advance; 0 for no flag.
+    static float tv_flag_advance(const std::string &code, float size)
+    {
+        return code.size() == 2 ? 1.245f * size : 0.0f;
+    }
+    float tv_flag(gfx::DrawList &list, const std::string &code, float x, float baseline, float size,
+                  float alpha = 1.0f) const
+    {
+        if (code.size() != 2 || code[0] < 'a' || code[0] > 'z' || code[1] < 'a' || code[1] > 'z')
+            return 0.0f;
+        if (tv_flags_ != 0)
+        {
+            const float u = 1.0f / 26.0f;
+            list.image(tv_flags_, {x, baseline - 0.927f * size, 1.248f * size, 1.174f * size},
+                       {u * static_cast<float>(code[1] - 'a'), u * static_cast<float>(code[0] - 'a'), u, u},
+                       kWhite.with_alpha(alpha));
+        }
+        return tv_flag_advance(code, size);
+    }
+    // The baseline tv_text puts a line of `font` on in its line box.
+    static float tv_baseline(const ui::FontRef &font, float top, float size, float line_height)
+    {
+        const float ascent = font.font->ascent(size);
+        const float descent = font.font->descent(size);
+        return top + (line_height - (ascent + descent)) * 0.5f + ascent;
     }
 
     // ---- the settings: HDrezkaTV's Settings screen ---------------------------
@@ -6635,28 +6728,157 @@ class Store final : public app::Concept
         kb_before_ = *target;
         if (keyboard_open(title, target->c_str(), password, 64))
         {
+            write_log("[DEBUG] ime_dialog: the console's keyboard is up for \"%s\"\n", title);
             kb_system_ = true;
             return;
         }
+        write_log("[DEBUG] ime_dialog: no console keyboard for \"%s\": the sheet of keys\n", title);
         kb_open_ = true;
-        key_row_ = 1;
+        key_row_ = 2;
         key_col_ = 0;
         key_lang_ = 0;
+        kb_caret_ = target->size();
+        kb_shift_ = 0;
         feedback.play(audio::Cue::modal_open);
     }
     bool kb_active() const
     {
         return kb_open_ || kb_system_;
     }
-    // The key under a finger at (x, y) on the touch pad (0..1 each): the pad is
-    // laid over the five rows of keys, a thin rim at its edges left out.
-    static void kb_touch_key(float x, float y, int &row, int &col)
+    // The sheet's keys, as the console's keyboard has them: five rows of ten
+    // characters, then Shift, the layouts (Ру, ABC, @#:), Space and Erase, then
+    // the caret's arrows, Очистить and Готово. A wide key spans columns.
+    enum class KbAct : std::uint8_t
+    {
+        chr,
+        shift,
+        lang_ru,
+        lang_en,
+        lang_sym,
+        space,
+        erase,
+        left,
+        right,
+        clear,
+        done,
+    };
+    struct KbKey
+    {
+        KbAct act;
+        int from, to; // the columns it spans
+    };
+    static KbKey kb_key_at(int row, int col)
+    {
+        if (row < kPsCharRows)
+            return {KbAct::chr, col, col};
+        if (row == kPsCharRows)
+        {
+            if (col <= 1)
+                return {KbAct::shift, 0, 1};
+            if (col == 2)
+                return {KbAct::lang_ru, 2, 2};
+            if (col == 3)
+                return {KbAct::lang_en, 3, 3};
+            if (col == 4)
+                return {KbAct::lang_sym, 4, 4};
+            if (col <= 7)
+                return {KbAct::space, 5, 7};
+            return {KbAct::erase, 8, 9};
+        }
+        if (col == 0)
+            return {KbAct::left, 0, 0};
+        if (col == 1)
+            return {KbAct::right, 1, 1};
+        if (col <= 5)
+            return {KbAct::clear, 2, 5};
+        return {KbAct::done, 6, 9};
+    }
+    // The grid in dp: a key's size, the gap between keys, and the wider one
+    // between the characters and the wide keys.
+    static constexpr float kKbCellW = 56.0f, kKbCellH = 40.0f, kKbGap = 4.0f, kKbSplit = 10.0f;
+    static float kb_row_top(int row)
+    {
+        return static_cast<float>(row) * (kKbCellH + kKbGap) + (row >= kPsCharRows ? kKbSplit : 0.0f);
+    }
+    static float kb_grid_w()
+    {
+        return kPsKeyCols * kKbCellW + (kPsKeyCols - 1) * kKbGap;
+    }
+    static float kb_grid_h()
+    {
+        return kb_row_top(kPsKeyRows - 1) + kKbCellH;
+    }
+    // Where a finger at (x, y) on the touch pad (0..1 each) rests over the
+    // keys, in dp from the grid's corner: the pad is laid over the whole grid,
+    // a thin rim at its edges left out.
+    static void kb_touch_point(float x, float y, float &gx, float &gy)
     {
         constexpr float kRim = 0.04f;
-        const float u = std::clamp((x - kRim) / (1.0f - 2.0f * kRim), 0.0f, 0.9999f);
-        const float v = std::clamp((y - kRim) / (1.0f - 2.0f * kRim), 0.0f, 0.9999f);
-        row = static_cast<int>(v * 5.0f);
-        col = static_cast<int>(u * static_cast<float>(kKeyCols));
+        gx = std::clamp((x - kRim) / (1.0f - 2.0f * kRim), 0.0f, 1.0f) * kb_grid_w();
+        gy = std::clamp((y - kRim) / (1.0f - 2.0f * kRim), 0.0f, 1.0f) * kb_grid_h();
+    }
+    static void kb_touch_key(float x, float y, int &row, int &col)
+    {
+        float gx = 0.0f, gy = 0.0f;
+        kb_touch_point(x, y, gx, gy);
+        col = std::clamp(static_cast<int>((gx + kKbGap * 0.5f) / (kKbCellW + kKbGap)), 0, kPsKeyCols - 1);
+        row = 0;
+        for (int r = kPsKeyRows - 1; r > 0; --r)
+            if (gy >= kb_row_top(r) - (r == kPsCharRows ? kKbSplit + kKbGap : kKbGap) * 0.5f)
+            {
+                row = r;
+                break;
+            }
+    }
+    const char *const *kb_chars() const
+    {
+        if (key_lang_ == 2)
+            return kPsKeysSYM;
+        return (key_lang_ == 1 ? kPsKeysRU : kPsKeysEN)[kb_shift_ != 0 ? 1 : 0];
+    }
+    // The caret's neighbours: a whole UTF-8 character either side.
+    static std::size_t kb_prev(const std::string &text, std::size_t at)
+    {
+        while (at > 0 && (static_cast<unsigned char>(text[--at]) & 0xc0) == 0x80)
+            ;
+        return at;
+    }
+    static std::size_t kb_next(const std::string &text, std::size_t at)
+    {
+        if (at < text.size())
+            ++at;
+        while (at < text.size() && (static_cast<unsigned char>(text[at]) & 0xc0) == 0x80)
+            ++at;
+        return at;
+    }
+    void kb_insert(std::string &target, const char *text)
+    {
+        const std::size_t n = std::strlen(text);
+        if (target.size() + n > 96)
+            return;
+        target.insert(kb_caret_, text);
+        kb_caret_ += n;
+    }
+    void kb_erase(std::string &target)
+    {
+        const std::size_t from = kb_prev(target, kb_caret_);
+        target.erase(from, kb_caret_ - from);
+        kb_caret_ = from;
+    }
+    void kb_navigate(const InputFrame &input, app::Feedback &feedback)
+    {
+        const KbKey key = kb_key_at(key_row_, key_col_);
+        if (input.nav == Direction::left)
+            key_col_ = key.from == 0 ? kPsKeyCols - 1 : key.from - 1;
+        else if (input.nav == Direction::right)
+            key_col_ = key.to == kPsKeyCols - 1 ? 0 : key.to + 1;
+        else if (input.nav == Direction::up)
+            key_row_ = (key_row_ + kPsKeyRows - 1) % kPsKeyRows;
+        else if (input.nav == Direction::down)
+            key_row_ = (key_row_ + 1) % kPsKeyRows;
+        else
+            return;
+        feedback.play(audio::Cue::focus);
     }
     void kb_update(const InputFrame &input, app::Feedback &feedback)
     {
@@ -6692,68 +6914,82 @@ class Store final : public app::Concept
             feedback.play(audio::Cue::modal_close);
             return;
         }
-        // Square: the last character goes
+        kb_caret_ = std::min(kb_caret_, target.size());
+        // The console's own buttons: Square erases, Triangle is the space, L2
+        // Shift, R1 РУС <-> ENG
+        KbAct act = KbAct::chr;
+        bool pressed = true;
         if (input.is_pressed(Action::west))
+            act = KbAct::erase;
+        else if (input.is_pressed(Action::north))
+            act = KbAct::space;
+        else if (input.is_pressed(Action::jump_prev))
+            act = KbAct::shift;
+        else if (input.is_pressed(Action::page_next))
+            act = key_lang_ == 1 ? KbAct::lang_en : KbAct::lang_ru;
+        else
         {
-            erase_from(target);
-            feedback.play(audio::Cue::toggle);
-            return;
-        }
-        // R1: РУС <-> ENG; Triangle goes through every layout, the symbols too
-        if (input.is_pressed(Action::page_next))
-        {
-            key_lang_ = key_lang_ == 1 ? 0 : 1;
-            feedback.play(audio::Cue::toggle);
-            return;
-        }
-        if (input.is_pressed(Action::north))
-        {
-            cycle_key_lang();
-            feedback.play(audio::Cue::toggle);
-            return;
-        }
-        // A finger on the touch pad: the key under it, the pad laid over the keys
-        if (touch_.down)
-        {
-            int row = 0, col = 0;
-            kb_touch_key(touch_.x, touch_.y, row, col);
-            if (row != key_row_ || col != key_col_)
+            // A finger on the touch pad: the key under it, the pad laid over the keys
+            if (touch_.down)
             {
+                int row = 0, col = 0;
+                kb_touch_key(touch_.x, touch_.y, row, col);
+                if (kb_key_at(row, col).from != kb_key_at(key_row_, key_col_).from || row != key_row_)
+                    feedback.play(audio::Cue::focus);
                 key_row_ = row;
                 key_col_ = col;
-                feedback.play(audio::Cue::focus);
             }
+            else
+                kb_navigate(input, feedback);
+            pressed = input.is_pressed(Action::confirm) || touch_.click;
+            act = kb_key_at(key_row_, key_col_).act;
         }
-        else
-            navigate_key_grid(input, feedback);
-        if (!input.is_pressed(Action::confirm) && !touch_.click)
+        if (!pressed)
             return;
-        if (key_row_ < 4)
+        switch (act)
         {
-            const int index = key_row_ * kKeyCols + key_col_;
-            if (target.size() < 96)
-                target += keys_for_lang(key_lang_)[index];
+        case KbAct::chr:
+            kb_insert(target, kb_chars()[key_row_ * kPsKeyCols + key_col_]);
+            // Shift holds for one letter; Caps Lock until it is pressed again
+            if (kb_shift_ == 1)
+                kb_shift_ = 0;
             feedback.play(audio::Cue::select);
-        }
-        else if (key_col_ <= 2)
-        {
-            cycle_key_lang();
+            break;
+        case KbAct::shift:
+            kb_shift_ = (kb_shift_ + 1) % 3;
             feedback.play(audio::Cue::toggle);
-        }
-        else if (key_col_ <= 6)
-        {
-            target.push_back(' ');
+            break;
+        case KbAct::lang_ru:
+        case KbAct::lang_en:
+        case KbAct::lang_sym:
+            key_lang_ = act == KbAct::lang_ru ? 1 : act == KbAct::lang_en ? 0 : 2;
+            feedback.play(audio::Cue::toggle);
+            break;
+        case KbAct::space:
+            kb_insert(target, " ");
             feedback.play(audio::Cue::select);
-        }
-        else if (key_col_ <= 8)
-        {
-            erase_from(target);
+            break;
+        case KbAct::erase:
+            kb_erase(target);
             feedback.play(audio::Cue::toggle);
-        }
-        else
-        {
+            break;
+        case KbAct::left:
+            kb_caret_ = kb_prev(target, kb_caret_);
+            feedback.play(audio::Cue::focus);
+            break;
+        case KbAct::right:
+            kb_caret_ = kb_next(target, kb_caret_);
+            feedback.play(audio::Cue::focus);
+            break;
+        case KbAct::clear:
+            target.clear();
+            kb_caret_ = 0;
+            feedback.play(audio::Cue::toggle);
+            break;
+        case KbAct::done:
             kb_open_ = false;
             feedback.play(audio::Cue::modal_close);
+            break;
         }
     }
     // What a password field shows: a dot a character.
@@ -6770,57 +7006,164 @@ class Store final : public app::Concept
         if (!kb_open_ || !kb_target_)
             return;
         const float dp = kTvDp;
-        const float cell = 36.0f * dp, gap = 4.0f * dp;
-        const float grid_w = kKeyCols * cell + (kKeyCols - 1) * gap;
+        const float grid_w = kb_grid_w() * dp;
         const float w = grid_w + 40.0f * dp;
-        const float h = (20.0f + 28.0f + 16.0f + 48.0f + 16.0f) * dp + 5.0f * (cell + gap) + 16.0f * dp;
+        const float h = (20.0f + 28.0f + 16.0f + 48.0f + 20.0f) * dp + kb_grid_h() * dp + 20.0f * dp;
         const Rect card{(kWidth - w) * 0.5f, kHeight - h - 24.0f * dp, w, h};
         list.rounded_rect({0.0f, 0.0f, kWidth, kHeight}, 0.0f, kBlack.with_alpha(0.6f));
-        list.bordered_rect(card, 28.0f * dp, tv_surface(), 1.0f * dp, tv_border_variant());
+        list.bordered_rect(card, 16.0f * dp, kKbCard, 1.0f * dp, tv_border_variant());
         tv_text(list, tv_regular(), kb_title_, card.x + 20.0f * dp, card.y + 20.0f * dp, 22.0f * dp, 28.0f * dp, tv_on_surface());
-        // The field being typed into, with a caret
+
+        // The field being typed into, the caret where the next character goes;
+        // a long text slides left to keep the caret in view.
         const Rect field{card.x + 20.0f * dp, card.y + 64.0f * dp, grid_w, 48.0f * dp};
-        list.bordered_rect(field, 8.0f * dp, kClear, 2.0f * dp, tv_primary());
-        const std::string shown = tv_regular().font->fit(kb_password_ ? kb_masked(*kb_target_) : *kb_target_, 16.0f * dp, grid_w - 40.0f * dp);
-        const float text_w = tv_text(list, tv_regular(), shown, field.x + 16.0f * dp, field.cy() - 12.0f * dp, 16.0f * dp, 24.0f * dp,
-                                     tv_on_surface(), gfx::Align::left, 0.5f * dp);
+        list.bordered_rect(field, 8.0f * dp, kKbChars, 2.0f * dp, tv_primary());
+        const std::string &text = *kb_target_;
+        const std::string shown = kb_password_ ? kb_masked(text) : text;
+        const std::string before = kb_password_ ? kb_masked(text.substr(0, kb_caret_)) : text.substr(0, kb_caret_);
+        const float size = 16.0f * dp, tracking = 0.5f * dp;
+        const float room = field.w - 32.0f * dp;
+        const float caret_w = tv_regular().measure(before, size, tracking);
+        const float shift = std::max(0.0f, caret_w - room);
+        list.push_clip({field.x + 12.0f * dp, field.y, field.w - 24.0f * dp, field.h});
+        tv_text(list, tv_regular(), shown, field.x + 16.0f * dp - shift, field.cy() - 12.0f * dp, size, 24.0f * dp,
+                tv_on_surface(), gfx::Align::left, tracking);
         if (std::fmod(clock_, 1.0f) < 0.5f)
-            list.rounded_rect({field.x + 16.0f * dp + text_w + 2.0f, field.cy() - 11.0f * dp, 2.0f, 22.0f * dp}, 0.0f, tv_primary());
-        const float gx = card.x + 20.0f * dp, gy = field.y + field.h + 16.0f * dp;
-        const char **keys = keys_for_lang(key_lang_);
-        for (int row = 0; row < 4; ++row)
-            for (int col = 0; col < kKeyCols; ++col)
+            list.rounded_rect({field.x + 16.0f * dp + caret_w - shift + 1.0f, field.cy() - 11.0f * dp, 2.0f, 22.0f * dp},
+                              0.0f, tv_primary());
+        list.pop_clip();
+
+        const float gx = card.x + 20.0f * dp, gy = field.y + field.h + 20.0f * dp;
+        const auto key_rect = [&](int row, int from, int to) {
+            return Rect{gx + static_cast<float>(from) * (kKbCellW + kKbGap) * dp, gy + kb_row_top(row) * dp,
+                        (static_cast<float>(to - from + 1) * (kKbCellW + kKbGap) - kKbGap) * dp, kKbCellH * dp};
+        };
+        // The focused key: a lighter plate in a pale frame
+        const auto focus_plate = [&](const Rect &r) {
+            list.bordered_rect(r, 6.0f * dp, kKbFocus, 1.5f * dp, kKbFocusEdge);
+        };
+
+        // The characters on one dark slab, no plate of their own
+        const Rect slab{gx - 4.0f * dp, gy - 4.0f * dp, grid_w + 8.0f * dp, kb_row_top(kPsCharRows) * dp - kKbSplit * dp + 4.0f * dp};
+        list.rounded_rect(slab, 8.0f * dp, kKbChars);
+        const char *const *chars = kb_chars();
+        for (int row = 0; row < kPsCharRows; ++row)
+            for (int col = 0; col < kPsKeyCols; ++col)
             {
-                const Rect r{gx + static_cast<float>(col) * (cell + gap), gy + static_cast<float>(row) * (cell + gap), cell, cell};
+                const Rect r = key_rect(row, col, col);
                 const bool focused = row == key_row_ && col == key_col_;
-                list.rounded_rect(r, 8.0f * dp, focused ? tv_on_surface() : tv_surface_variant().with_alpha(0.4f));
-                tv_text(list, tv_medium(), keys[row * kKeyCols + col], r.cx(), r.cy() - 12.0f * dp, 16.0f * dp, 24.0f * dp,
-                        focused ? tv_inverse_on_surface() : tv_on_surface(), gfx::Align::center);
+                if (focused)
+                    focus_plate(r);
+                tv_text(list, focused ? tv_medium() : tv_regular(), chars[row * kPsKeyCols + col], r.cx(), r.y,
+                        (focused ? 19.0f : 17.0f) * dp, r.h, focused ? kWhite : kKbInk, gfx::Align::center);
             }
-        // The last row: the layout, the space, the erase and the done keys
-        const struct
+
+        // The wide keys, each on its plate, the button that does the same in
+        // the corner
+        const KbKey focus = kb_key_at(key_row_, key_col_);
+        const auto plate = [&](int row, const KbKey &key) {
+            const Rect r = key_rect(row, key.from, key.to);
+            if (key_row_ == row && focus.from == key.from)
+                focus_plate(r);
+            else
+                list.rounded_rect(r, 6.0f * dp, kKbKey);
+            return r;
+        };
+        const auto corner = [&](const Rect &r, const char *name) {
+            tv_text(list, tv_medium(), name, r.x + r.w - 4.0f * dp, r.y + 2.0f * dp, 8.0f * dp, 10.0f * dp, kKbCorner,
+                    gfx::Align::right);
+        };
+        const float s = dp; // the drawn symbols' unit
+
+        // Shift: an arrow, filled while it holds, underlined for Caps Lock
         {
-            int from, to;
-            const char *label;
-        } actions[4] = {{0, 2, lang_button_label(key_lang_)}, {3, 6, "Пробел"}, {7, 8, "Стереть"}, {9, 11, "Готово"}};
-        for (const auto &action : actions)
-        {
-            const Rect r{gx + static_cast<float>(action.from) * (cell + gap), gy + 4.0f * (cell + gap),
-                         static_cast<float>(action.to - action.from + 1) * (cell + gap) - gap, cell};
-            const bool focused = key_row_ == 4 && key_col_ >= action.from && key_col_ <= action.to;
-            const bool done = action.from == 9;
-            list.rounded_rect(r, 8.0f * dp, focused ? tv_on_surface() : done ? tv_primary() : tv_surface_variant().with_alpha(0.4f));
-            tv_text(list, tv_medium(), action.label, r.cx(), r.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp,
-                    focused ? tv_inverse_on_surface() : done ? tv_on_primary() : tv_on_surface(), gfx::Align::center, 0.1f * dp);
+            const Rect r = plate(kPsCharRows, {KbAct::shift, 0, 1});
+            corner(r, "L2");
+            const float cx = r.cx(), cy = r.cy();
+            const float arrow[14] = {cx, cy - 9.0f * s, cx + 8.0f * s, cy - 1.0f * s, cx + 3.5f * s, cy - 1.0f * s,
+                                     cx + 3.5f * s, cy + 7.0f * s, cx - 3.5f * s, cy + 7.0f * s, cx - 3.5f * s,
+                                     cy - 1.0f * s, cx - 8.0f * s, cy - 1.0f * s};
+            if (kb_shift_ != 0)
+                list.polygon(arrow, 7, kWhite);
+            else
+                for (int i = 0; i < 7; ++i)
+                {
+                    const int j = (i + 1) % 7;
+                    list.line(arrow[i * 2], arrow[i * 2 + 1], arrow[j * 2], arrow[j * 2 + 1], 1.5f * s, kKbInk);
+                }
+            if (kb_shift_ == 2)
+                list.rounded_rect({cx - 6.0f * s, cy + 10.0f * s, 12.0f * s, 2.0f * s}, 1.0f * s, kWhite);
         }
+        // The layouts: Ру, ABC and @#: side by side, the one in use lit and underlined
+        {
+            static const char *const names[3] = {"Ру", "ABC", "@#:"};
+            static const int langs[3] = {1, 0, 2};
+            const Rect group = key_rect(kPsCharRows, 2, 4);
+            list.rounded_rect(group, 6.0f * dp, kKbKey);
+            for (int i = 0; i < 3; ++i)
+            {
+                const KbKey key{static_cast<KbAct>(static_cast<int>(KbAct::lang_ru) + i), 2 + i, 2 + i};
+                const Rect r = key_rect(kPsCharRows, key.from, key.to);
+                const bool on = key_lang_ == langs[i];
+                if (key_row_ == kPsCharRows && focus.from == key.from)
+                    focus_plate(r);
+                else if (on)
+                    list.rounded_rect(r, 6.0f * dp, kKbFocus);
+                tv_text(list, on ? tv_medium() : tv_regular(), names[i], r.cx(), r.y, 15.0f * dp, r.h,
+                        on ? kWhite : kKbInk, gfx::Align::center);
+                if (on)
+                    list.rounded_rect({r.cx() - 12.0f * dp, r.y + r.h - 5.0f * dp, 24.0f * dp, 2.0f * dp}, 1.0f * dp, kWhite);
+            }
+            corner(group, "R1");
+        }
+        // Space: the bracket under a gap, Triangle in the corner
+        {
+            const Rect r = plate(kPsCharRows, {KbAct::space, 5, 7});
+            const float cx = r.cx(), cy = r.cy() + 3.0f * s;
+            list.line(cx - 14.0f * s, cy, cx + 14.0f * s, cy, 1.8f * s, kKbInk);
+            list.line(cx - 14.0f * s, cy + 0.9f * s, cx - 14.0f * s, cy - 6.0f * s, 1.8f * s, kKbInk);
+            list.line(cx + 14.0f * s, cy + 0.9f * s, cx + 14.0f * s, cy - 6.0f * s, 1.8f * s, kKbInk);
+            list.triangle({r.x + r.w - 12.0f * s, r.y + 3.0f * s, 8.0f * s, 7.0f * s}, kKbCorner, 1.0f * s);
+        }
+        // Erase: the key pointing left with a cross cut in it, Square in the corner
+        {
+            const Rect r = plate(kPsCharRows, {KbAct::erase, 8, 9});
+            const float cx = r.cx(), cy = r.cy();
+            const float key[10] = {cx - 11.0f * s, cy, cx - 4.0f * s, cy - 7.0f * s, cx + 10.0f * s, cy - 7.0f * s,
+                                   cx + 10.0f * s, cy + 7.0f * s, cx - 4.0f * s, cy + 7.0f * s};
+            list.polygon(key, 5, kKbInk);
+            const bool lit = key_row_ == kPsCharRows && focus.from == 8;
+            const Color cut = lit ? kKbFocus : kKbKey;
+            list.line(cx - 0.5f * s, cy - 3.5f * s, cx + 6.5f * s, cy + 3.5f * s, 1.6f * s, cut);
+            list.line(cx - 0.5f * s, cy + 3.5f * s, cx + 6.5f * s, cy - 3.5f * s, 1.6f * s, cut);
+            list.bordered_rect({r.x + r.w - 11.0f * s, r.y + 3.5f * s, 7.0f * s, 7.0f * s}, 0.0f, kClear, 1.0f * s, kKbCorner);
+        }
+        // The caret's arrows, Очистить and Готово
+        const int last = kPsKeyRows - 1;
+        for (const KbAct act : {KbAct::left, KbAct::right})
+        {
+            const KbKey key = kb_key_at(last, act == KbAct::left ? 0 : 1);
+            const Rect r = plate(last, key);
+            list.triangle({r.cx() - 5.0f * s, r.cy() - 6.0f * s, 10.0f * s, 12.0f * s}, kKbInk, 0.0f,
+                          act == KbAct::left ? -1.5708f : 1.5708f);
+        }
+        {
+            const Rect r = plate(last, kb_key_at(last, 2));
+            tv_text(list, tv_regular(), "Очистить", r.cx(), r.y, 15.0f * dp, r.h, kKbInk, gfx::Align::center);
+        }
+        {
+            const Rect r = plate(last, kb_key_at(last, 6));
+            tv_text(list, tv_medium(), "Готово", r.cx(), r.y, 17.0f * dp, r.h, kWhite, gfx::Align::center);
+            corner(r, "R2");
+        }
+
         // The finger on the touch pad: a soft dot where it rests over the keys
         if (touch_.down)
         {
-            constexpr float kRim = 0.04f;
-            const float u = std::clamp((touch_.x - kRim) / (1.0f - 2.0f * kRim), 0.0f, 1.0f);
-            const float v = std::clamp((touch_.y - kRim) / (1.0f - 2.0f * kRim), 0.0f, 1.0f);
-            const float px = gx + u * grid_w;
-            const float py = gy + v * (5.0f * (cell + gap) - gap);
+            float px = 0.0f, py = 0.0f;
+            kb_touch_point(touch_.x, touch_.y, px, py);
+            px = gx + px * dp;
+            py = gy + py * dp;
             list.circle(px, py, 14.0f * dp, tv_primary().with_alpha(0.25f));
             list.circle(px, py, 5.0f * dp, tv_primary().with_alpha(0.9f));
         }
@@ -6840,6 +7183,7 @@ class Store final : public app::Concept
         l1r1,
         l2r2,
         r1,
+        l2,
         r2,
         touch,
     };
@@ -6853,8 +7197,9 @@ class Store final : public app::Concept
     {
         using G = PadGlyph;
         if (kb_open_)
-            return {{G::cross, "Буква"},          {G::square, "Стереть"},      {G::r2, "Ввод"},
-                    {G::r1, "Язык (RU/EN)"},      {G::touch, "Выбор буквы"},   {G::circle, "Отмена"}};
+            return {{G::cross, "Ввод"},      {G::square, "Стереть"},     {G::triangle, "Пробел"},
+                    {G::l2, "Shift"},        {G::r1, "Язык (RU/EN)"},    {G::r2, "Готово"},
+                    {G::touch, "Выбор буквы"}, {G::circle, "Отмена"}};
         // The console's keyboard and the update's dialog speak for themselves
         if (kb_system_ || upd_open_)
             return {};
@@ -6884,14 +7229,16 @@ class Store final : public app::Concept
         return hints;
     }
 
-    // A face button's disc, or a shoulder button's capsule, its left edge at x;
-    // returns its width.
+    // A face button as on the pad: a black cap with its symbol in the
+    // DualSense colour; a shoulder button a dark capsule with its name. Its
+    // left edge at x; returns its width.
     float draw_pad_glyph(gfx::DrawList &list, PadGlyph glyph, float x, float cy, bool measure_only = false) const
     {
         const float d = 15.0f * kTvDp; // a face button's disc
         const Color fill = tv_on_surface();
-        const Color mark = Color::rgb(0x191c1e);
-        const float stroke = 1.4f * kTvDp;
+        const Color cap = Color::rgb(0x0b0c0e);
+        const Color rim = Color::rgb(0x4a4f55);
+        const float stroke = 1.5f * kTvDp;
         const auto capsule = [&](const char *name, float at, bool trigger) {
             const float size = 9.0f * kTvDp;
             const float w = tv_medium().measure(name, size, 0.0f) + 10.0f * kTvDp;
@@ -6899,8 +7246,8 @@ class Store final : public app::Concept
             if (!measure_only)
             {
                 // A bumper is round; a trigger squarer, deeper at its top
-                list.rounded_rect({at, cy - h * 0.5f, w, h}, trigger ? 3.0f * kTvDp : h * 0.5f, fill);
-                tv_text(list, tv_medium(), name, at + w * 0.5f, cy - h * 0.5f, size, h, mark, gfx::Align::center);
+                list.bordered_rect({at, cy - h * 0.5f, w, h}, trigger ? 3.0f * kTvDp : h * 0.5f, cap, 1.0f, rim);
+                tv_text(list, tv_medium(), name, at + w * 0.5f, cy - h * 0.5f, size, h, fill, gfx::Align::center);
             }
             return w;
         };
@@ -6917,6 +7264,8 @@ class Store final : public app::Concept
         }
         case PadGlyph::r1:
             return capsule("R1", x, false);
+        case PadGlyph::l2:
+            return capsule("L2", x, true);
         case PadGlyph::r2:
             return capsule("R2", x, true);
         case PadGlyph::touch:
@@ -6936,29 +7285,25 @@ class Store final : public app::Concept
         if (measure_only)
             return d;
         const float r = d * 0.5f, cx = x + r;
-        list.circle(cx, cy, r, fill);
+        list.circle(cx, cy, r, rim);
+        list.circle(cx, cy, r - 1.0f, cap);
         const float s = r * 0.46f;
         switch (glyph)
         {
         case PadGlyph::cross:
-            list.line(cx - s, cy - s, cx + s, cy + s, stroke, mark);
-            list.line(cx - s, cy + s, cx + s, cy - s, stroke, mark);
+            list.line(cx - s, cy - s, cx + s, cy + s, stroke, kPadCross);
+            list.line(cx - s, cy + s, cx + s, cy - s, stroke, kPadCross);
             break;
         case PadGlyph::circle:
-            list.ring(cx, cy, s * 1.05f, stroke, mark);
+            list.ring(cx, cy, s * 1.1f, stroke, kPadCircle);
             break;
         case PadGlyph::square:
-            list.bordered_rect({cx - s * 0.9f, cy - s * 0.9f, s * 1.8f, s * 1.8f}, 0.0f, kClear, stroke, mark);
+            list.bordered_rect({cx - s * 0.9f, cy - s * 0.9f, s * 1.8f, s * 1.8f}, 0.0f, kClear, stroke, kPadSquare);
             break;
         default:
-        {
-            // Triangle: its three sides
-            const float top = cy - s * 1.05f, bottom = cy + s * 0.75f, half = s * 1.05f;
-            list.line(cx, top, cx - half, bottom, stroke, mark);
-            list.line(cx - half, bottom, cx + half, bottom, stroke, mark);
-            list.line(cx + half, bottom, cx, top, stroke, mark);
+            // Triangle: its outline
+            list.triangle({cx - s * 1.1f, cy - s * 1.05f, s * 2.2f, s * 1.85f}, kPadTriangle, stroke);
             break;
-        }
         }
         return d;
     }
@@ -7067,6 +7412,7 @@ class Store final : public app::Concept
     static Color tv_inverse_primary() { return Color::rgb(0x00668a); }
     static Color tv_border_variant() { return Color::rgb(0x40484c); }
     static Color tv_error() { return Color::rgb(0xffb4ab); }
+    static Color tv_on_error() { return Color::rgb(0x690005); }
     // The app's colour of a score: ten steps from red (below 1) to green (9 and up).
     static Color tv_rating_color(float value)
     {
@@ -8374,8 +8720,16 @@ class Store final : public app::Concept
             names = {"1080p Ultra", "1080p", "720p", "480p", "360p"};
         return names;
     }
+    // What a voice's chip shows after its name (the app's VoiceChip): the
+    // language's emoji flag, then the subscription's icon or else the ads' one.
+    struct WdVoice
+    {
+        std::string flag;
+        bool premium = false;
+        bool ads = false;
+    };
     // The chips' labels by section, from the title's details.
-    void wd_labels(std::vector<std::string> out[3], std::vector<int> &premium) const
+    void wd_labels(std::vector<std::string> out[3], std::vector<WdVoice> &voices) const
     {
         auto &app = rezka::App::instance();
         std::lock_guard<std::mutex> lock(app.catalog_mutex);
@@ -8386,7 +8740,7 @@ class Store final : public app::Concept
             for (const rezka::Translator &t : d.translators)
             {
                 out[0].push_back(t.name);
-                premium.push_back(t.is_premium ? 1 : 0);
+                voices.push_back({t.flag, t.is_premium, t.ads == "1"});
             }
         if (!d.is_series)
             return;
@@ -8399,7 +8753,21 @@ class Store final : public app::Concept
                 out[2].push_back("Серия " + e.id);
         }
     }
-    WdLayout wd_layout(const std::vector<std::string> labels[3]) const
+    // A chip's content after the 16 dp padding: the name with its flag (one
+    // Text in the app), then 8 dp and a 20 dp icon for a subscribers' or ads' voice.
+    float wd_chip_content_w(const std::string &label, const WdVoice *voice) const
+    {
+        const float dp = kTvDp;
+        float w = tv_medium().measure(label, 16.0f * dp, 0.5f * dp);
+        if (voice)
+        {
+            w += tv_flag_advance(voice->flag, 16.0f * dp);
+            if (voice->premium || voice->ads)
+                w += (8.0f + 20.0f) * dp;
+        }
+        return w;
+    }
+    WdLayout wd_layout(const std::vector<std::string> labels[3], const std::vector<WdVoice> &voices) const
     {
         const float dp = kTvDp;
         WdLayout L;
@@ -8419,7 +8787,8 @@ class Store final : public app::Concept
             float x = 0.0f;
             for (int i = 0; i < static_cast<int>(labels[s].size()); ++i)
             {
-                const float w = tv_medium().measure(labels[s][static_cast<std::size_t>(i)], 16.0f * dp, 0.5f * dp) + 32.0f * dp;
+                const WdVoice *voice = s == 0 && static_cast<std::size_t>(i) < voices.size() ? &voices[static_cast<std::size_t>(i)] : nullptr;
+                const float w = wd_chip_content_w(labels[s][static_cast<std::size_t>(i)], voice) + 32.0f * dp;
                 if (x + w > inner_w && x > 0.0f)
                 {
                     x = 0.0f;
@@ -8480,9 +8849,9 @@ class Store final : public app::Concept
             return;
         }
         std::vector<std::string> labels[3];
-        std::vector<int> premium;
-        wd_labels(labels, premium);
-        const WdLayout L = wd_layout(labels);
+        std::vector<WdVoice> voices;
+        wd_labels(labels, voices);
+        const WdLayout L = wd_layout(labels, voices);
         if (wd_focus_section_ < 0)
         {
             // The app starts on the selected voice, else season, else episode, else the button
@@ -8604,9 +8973,9 @@ class Store final : public app::Concept
             return;
         }
         std::vector<std::string> labels[3];
-        std::vector<int> premium;
-        wd_labels(labels, premium);
-        const WdLayout L = wd_layout(labels);
+        std::vector<WdVoice> voices;
+        wd_labels(labels, voices);
+        const WdLayout L = wd_layout(labels, voices);
         const WdItem &item = L.items[static_cast<std::size_t>(wd_find(L, wd_focus_section_, wd_focus_index_))];
         float target = wd_scroll_.target;
         if (item.r.y - 60.0f * kTvDp < target)
@@ -8646,9 +9015,9 @@ class Store final : public app::Concept
             return;
         }
         std::vector<std::string> labels[3];
-        std::vector<int> premium;
-        wd_labels(labels, premium);
-        const WdLayout L = wd_layout(labels);
+        std::vector<WdVoice> voices;
+        wd_labels(labels, voices);
+        const WdLayout L = wd_layout(labels, voices);
         const Rect &card = L.card;
         list.bordered_rect(card, 28.0f * dp, tv_surface(), 1.0f * dp, tv_border_variant());
         static const char *kHeaders[3] = {"Выберите озвучку", "Выберите сезон", "Выберите серию"};
@@ -8666,7 +9035,9 @@ class Store final : public app::Concept
             const Rect r{left + item.r.x, card.y + item.r.y - scroll, item.r.w, item.r.h};
             const bool focused = item.section == wd_focus_section_ && item.index == wd_focus_index_;
             const bool selected = wd_selected(item.section) == item.index;
-            const bool prem = item.section == 0 && static_cast<std::size_t>(item.index) < premium.size() && premium[static_cast<std::size_t>(item.index)];
+            const WdVoice *voice = item.section == 0 && static_cast<std::size_t>(item.index) < voices.size()
+                                       ? &voices[static_cast<std::size_t>(item.index)] : nullptr;
+            const bool prem = voice && voice->premium;
             Color fill = kClear, content = prem ? Color::rgb(0xc8c2ea) : tv_on_surface_variant();
             if (focused && selected)
             {
@@ -8687,8 +9058,22 @@ class Store final : public app::Concept
             }
             else
                 list.bordered_rect(r, 8.0f * dp, kClear, 1.0f * dp, prem ? Color::rgb(0x7555a7) : tv_border());
-            tv_text(list, tv_medium(), labels[item.section][static_cast<std::size_t>(item.index)], r.x + 16.0f * dp, r.y + 8.0f * dp,
-                    16.0f * dp, 24.0f * dp, content, gfx::Align::left, 0.5f * dp);
+            // The name, its flag right after it (the app's one Text), then
+            // 8 dp on the 20 dp icon: the subscription's in the chip's
+            // content colour, the ads' in error / onError when focused.
+            const float size = 16.0f * dp;
+            float x = r.x + 16.0f * dp;
+            x += tv_text(list, tv_medium(), labels[item.section][static_cast<std::size_t>(item.index)], x, r.y + 8.0f * dp,
+                         size, 24.0f * dp, content, gfx::Align::left, 0.5f * dp);
+            if (voice)
+            {
+                x += tv_flag(list, voice->flag, x, tv_baseline(tv_medium(), r.y + 8.0f * dp, size, 24.0f * dp), size);
+                if (voice->premium)
+                    tv_icon(list, kTvIconPremTranslator, x + 8.0f * dp, r.cy() - 10.0f * dp, 20.0f * dp, content);
+                else if (voice->ads)
+                    tv_icon(list, kTvIconAd, x + 8.0f * dp, r.cy() - 10.0f * dp, 20.0f * dp,
+                            focused ? tv_on_error() : tv_error());
+            }
         }
         list.pop_clip();
         float y = card.y + L.view_h;
@@ -12031,6 +12416,7 @@ class Store final : public app::Concept
     int tv_hero_focus_ = 0;         // 0 Смотреть, 1 Мой список
     float tv_hero_lift_[2] = {0.0f, 0.0f};
     std::uint32_t tv_youtube_ = 0;
+    std::uint32_t tv_flags_ = 0; // tv/flags.png: 26 x 26 emoji flags, by the code's letters
     // The profile
     std::uint32_t tv_ill_[5] = {0, 0, 0, 0, 0}; // tv/ill-*.png, by ProfileIll
     float tv_ill_aspect_[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -12081,6 +12467,8 @@ class Store final : public app::Concept
     bool kb_open_ = false;             // the sheet of keys is up
     bool kb_system_ = false;           // the console's own keyboard is
     std::string kb_before_;            // the field as it was: Circle puts it back
+    std::size_t kb_caret_ = 0;         // where the next character goes, in bytes
+    int kb_shift_ = 0;                 // 0 lower case, 1 the next letter upper, 2 Caps Lock
     // The DualSense touch pad as update() read it this frame.
     struct TouchFrame
     {

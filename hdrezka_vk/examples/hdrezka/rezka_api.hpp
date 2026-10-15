@@ -91,7 +91,11 @@ struct Translator
 {
     std::string id;
     std::string name;
-    bool is_premium = false;
+    // The voice's language as the site's flag shows it (<img src=".../flags/ua.png">
+    // in the item): the country's two letters, lower case; empty when none.
+    // HDrezkaTV's Voice keeps the image's URL and draws the code's emoji flag.
+    std::string flag;
+    bool is_premium = false; // li.b-prem_translator: for the subscription only
     std::string camrip = "0";
     std::string ads = "0";
     std::string director = "0";
