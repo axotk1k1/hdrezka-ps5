@@ -90,12 +90,25 @@ catchReturnFromMain(int status)
 
 /* ----------------------------------------------------------------- the pad */
 
+/* A finger on the touch pad as ScePadData has it. */
+struct pad_touch {
+   uint16_t x, y; /* 0..1919, 0..1079 */
+   uint8_t id;
+   uint8_t reserved[3];
+};
+
 /* One sample as the console writes it: 120 bytes, the layout PS5_vkQuake and
- * ProsperoLight read. */
+ * ProsperoLight read (ScePadData: the motion sensors, then touchData). */
 struct pad_sample {
    uint32_t buttons;
    uint8_t left_x, left_y, right_x, right_y, l2, r2;
-   uint8_t reserved[66];
+   uint8_t analog_padding[2];
+   float orientation[4];
+   float acceleration[3];
+   float angular_velocity[3];
+   uint8_t touch_count; /* touchData.touchNum */
+   uint8_t touch_reserved[7];
+   struct pad_touch touch[2];
    int32_t connected;
    uint64_t timestamp_us;
    uint8_t extension[16];
@@ -105,6 +118,11 @@ struct pad_sample {
 _Static_assert(sizeof(struct pad_sample) == 120, "the console's pad samples are 120 bytes");
 _Static_assert(offsetof(struct pad_sample, connected) == 0x4c, "connection state sits at 0x4c");
 _Static_assert(offsetof(struct pad_sample, timestamp_us) == 0x50, "the timestamp sits at 0x50");
+_Static_assert(offsetof(struct pad_sample, touch_count) == 0x34, "touchData sits at 0x34");
+_Static_assert(offsetof(struct pad_sample, touch) == 0x3c, "the fingers sit at 0x3c");
+
+#define PAD_TOUCH_W 1920.0f
+#define PAD_TOUCH_H 1080.0f
 
 /* The two-motor rumble, as PS5_vkQuake and ProsperoLight drive it (the other
  * mode is the DualSense's haptics). */
@@ -259,6 +277,29 @@ pad_fill(const struct pad_player_state *state, struct pad *pad)
    pad->right_y = stick(state->last.right_y);
    pad->l2 = state->last.l2 / 255.0f;
    pad->r2 = state->last.r2 / 255.0f;
+   const int touches = state->handle >= 0 ? state->last.touch_count : 0;
+   pad->touch_count = touches > 2 ? 2 : touches;
+   if (pad->touch_count > 0) {
+      const float x = state->last.touch[0].x / (PAD_TOUCH_W - 1.0f);
+      const float y = state->last.touch[0].y / (PAD_TOUCH_H - 1.0f);
+      pad->touch_x = x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x;
+      pad->touch_y = y < 0.0f ? 0.0f : y > 1.0f ? 1.0f : y;
+   }
+}
+
+/* L2 and R2 as buttons once the trigger is past PAD_TRIGGER_PRESS, as well as
+ * by the bits the console sets: a light pull is a press too. */
+static uint32_t
+pad_buttons(const struct pad_sample *s)
+{
+   uint32_t buttons = s->buttons;
+   if (buttons & PAD_INTERCEPTED)
+      return buttons;
+   if (s->l2 > PAD_TRIGGER_PRESS)
+      buttons |= PAD_L2;
+   if (s->r2 > PAD_TRIGGER_PRESS)
+      buttons |= PAD_R2;
+   return buttons;
 }
 
 void
@@ -279,12 +320,15 @@ pad_poll(struct pad *pad)
          state->connected = false;
       for (int i = 0; i < count && i < 64; i++) {
          const struct pad_sample *s = &samples[i];
+         const uint32_t buttons = pad_buttons(s);
          state->taken[state->taken_count++] = (struct pad_reading){
-            s->buttons, s->left_x, s->left_y, s->right_x, s->right_y, s->l2, s->r2,
+            buttons, s->left_x, s->left_y, s->right_x, s->right_y, s->l2, s->r2,
             s->connected != 0, s->timestamp_us};
          state->connected = s->connected != 0;
-         if (s->connected && !(s->buttons & PAD_INTERCEPTED))
+         if (s->connected && !(s->buttons & PAD_INTERCEPTED)) {
             state->last = *s;
+            state->last.buttons = buttons;
+         }
       }
    }
    (void)pad_player(0, pad);

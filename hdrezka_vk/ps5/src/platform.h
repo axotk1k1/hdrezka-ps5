@@ -33,6 +33,8 @@ enum {
    PAD_RIGHT = 0x000020,
    PAD_DOWN = 0x000040,
    PAD_LEFT = 0x000080,
+   PAD_L2 = 0x000100, /* also set while the trigger is past 120 of 255 */
+   PAD_R2 = 0x000200,
    PAD_L1 = 0x000400,
    PAD_R1 = 0x000800,
    PAD_TRIANGLE = 0x001000,
@@ -47,7 +49,15 @@ struct pad {
    uint32_t pressed; /* buttons that went down since the last poll */
    float left_x, left_y, right_x, right_y; /* -1..1, a dead zone removed; y is down-positive */
    float l2, r2;                           /* 0..1 */
+   /* The DualSense's touch pad: the fingers on it (0..2), and the first one's
+    * place, 0..1 across and down (the pad reports 1920 x 1080). The pad's
+    * click is PAD_TOUCH_PAD in held / pressed. */
+   int touch_count;
+   float touch_x, touch_y;
 };
+
+/* The trigger travel past which L2 / R2 count as pressed. */
+#define PAD_TRIGGER_PRESS 120
 
 /* Up to four players, one per signed-in user: the console pairs each controller
  * with a user. Player 0 is the user who started the title and stays theirs;

@@ -1215,8 +1215,10 @@ class Store final : public app::Concept
 
 #if defined(PS5_HOST_REFERENCE)
     // The reference build has no pad. HDREZKA_HOST_KEYS scripts one for its
-    // pictures: "2.0:left,2.5:down,3:confirm" presses each at its second;
-    // "4:type=name@mail.ru" types into the open text field.
+    // pictures: "2.0:left,2.5:down,3:confirm" presses each at its second
+    // (also back, menu, west/square, north/triangle, l1, r1, l2, r2, touchpad);
+    // "4:type=name@mail.ru" types into the open text field; "5:touch=0.3/0.6"
+    // puts a finger on the touch pad there (0..1 across/down), "6:untouch" lifts it.
     void host_script(InputFrame &input, float dt)
     {
         static const char *script = std::getenv("HDREZKA_HOST_KEYS");
@@ -1241,9 +1243,21 @@ class Store final : public app::Concept
                 else if (key == "confirm") input.pressed |= action_bit(Action::confirm);
                 else if (key == "back") input.pressed |= action_bit(Action::back);
                 else if (key == "menu") input.pressed |= action_bit(Action::menu);
-                else if (key == "west") input.pressed |= action_bit(Action::west);
+                else if (key == "west" || key == "square") input.pressed |= action_bit(Action::west);
+                else if (key == "north" || key == "triangle") input.pressed |= action_bit(Action::north);
                 else if (key == "l1") input.pressed |= action_bit(Action::page_prev);
                 else if (key == "r1") input.pressed |= action_bit(Action::page_next);
+                else if (key == "l2") input.pressed |= action_bit(Action::jump_prev);
+                else if (key == "r2") input.pressed |= action_bit(Action::jump_next);
+                else if (key == "touchpad") input.pressed |= action_bit(Action::touch);
+                else if (key == "untouch") host_touch_.down = false;
+                else if (key.rfind("touch=", 0) == 0)
+                {
+                    char *slash = nullptr;
+                    host_touch_.x = std::clamp(std::strtof(key.c_str() + 6, &slash), 0.0f, 1.0f);
+                    host_touch_.y = slash && *slash == '/' ? std::clamp(std::strtof(slash + 1, nullptr), 0.0f, 1.0f) : 0.5f;
+                    host_touch_.down = true;
+                }
                 // "type=text": into the field the keyboard sheet is open for
                 else if (key.rfind("type=", 0) == 0 && kb_open_ && kb_target_) *kb_target_ += key.substr(5);
             }
@@ -1258,6 +1272,21 @@ class Store final : public app::Concept
 #if defined(PS5_HOST_REFERENCE)
         host_script(input, dt);
 #endif
+        // The touch pad this frame: the finger's place, and its click
+        {
+            const struct pad &pad = ps5_pad();
+            touch_.down = pad.touch_count > 0;
+            if (touch_.down)
+            {
+                touch_.x = pad.touch_x;
+                touch_.y = pad.touch_y;
+            }
+#if defined(PS5_HOST_REFERENCE)
+            if (host_touch_.down)
+                touch_ = host_touch_;
+#endif
+            touch_.click = input.is_pressed(Action::touch) || (pad.pressed & PAD_TOUCH_PAD) != 0;
+        }
         if (rezka::App::instance().is_playing || rezka::App::instance().is_buffering)
         {
             update_player(input, dt, feedback);
@@ -1265,7 +1294,7 @@ class Store final : public app::Concept
         }
 
         const bool triangle_pressed = input.is_pressed(Action::north) || ((ps5_pad().pressed & PAD_TRIANGLE) != 0);
-        if (!search_open_ && sx_screen_ == SxScreen::none && !upd_open_ && triangle_pressed)
+        if (!search_open_ && sx_screen_ == SxScreen::none && !upd_open_ && !kb_active() && triangle_pressed)
         {
             search_open_ = true;
             search_query_.clear();
@@ -1361,8 +1390,8 @@ class Store final : public app::Concept
                              0);
         tv_draw_home(scene);
         scene.pop_transform();
-        // The home page has no hint row, as the app has none; the layers over
-        // it keep theirs, each arriving once its layer has.
+        // The DualSense hints' bar at the bottom says what the buttons do on
+        // whatever layer has the pad (footer_hints); the player has its own.
         const auto arriving = [](float value) { return tween::clamp01((value - 0.4f) / 0.6f); };
 
         gfx::DrawList &overlay = frame.overlay;
@@ -1380,6 +1409,7 @@ class Store final : public app::Concept
         draw_settings(overlay);
         wd_draw(overlay);
         upd_draw(overlay);
+        draw_footer(overlay);
         draw_toast(overlay, frame.glass_texture);
     }
 
@@ -3967,6 +3997,7 @@ class Store final : public app::Concept
     static constexpr float kTvGap = 12.0f * kTvDp;
     static constexpr float kTvTitleSize = 14.0f * kTvDp;
     static constexpr float kTvSubSize = 12.0f * kTvDp;
+    static constexpr float kTvFooterH = 24.0f * kTvDp;    // the button hints' bar at the bottom
     static constexpr float kTvHeroH = 280.0f * kTvDp;     // the banner on Главная
     static constexpr float kTvHeroGap = 24.0f * kTvDp;    // ... and the space under it
     static constexpr float kTvHeroSeconds = 7.0f;         // a slide's time when left alone
@@ -5549,7 +5580,8 @@ class Store final : public app::Concept
             return 0.0f;
         if (tv_zone_ != TvZone::grid || count == 0)
             return tv_scroll_.target;
-        const float view = kHeight - kTvGridTop;
+        // The hints' bar covers the bottom: the focused row stays above it
+        const float view = kHeight - kTvGridTop - kTvFooterH;
         const int rows = (count + tv_columns() - 1) / tv_columns();
         const float content =
             2.0f * kTvGridPad + tv_grid_offset() + static_cast<float>(rows) * tv_row_pitch() - kTvGap;
@@ -5727,9 +5759,7 @@ class Store final : public app::Concept
         // Without an account, Мой список is this console's own bookmarks
         if (tv_hero_focus_ == 1 && !app.signed_in())
         {
-            const bool on = app.toggle_favorite(h.item.url, h.item.title);
-            show_message(on ? "Добавлено в закладки" : "Убрано из закладок");
-            feedback.play(audio::Cue::select);
+            my_list_toggle(h.item.url, h.item.title, feedback);
             return;
         }
         const int index = app.adopt_catalog_item(h.item);
@@ -5745,6 +5775,60 @@ class Store final : public app::Concept
             app.load_bookmark_choices_async(index);
             dp_open_dialog(DpDialog::bookmarks, feedback);
         }
+    }
+
+    // Мой список by Square: without an account the console's own bookmarks,
+    // put in or taken out at once; signed in, the site's folders, chosen on
+    // the title's page as its bookmark button does.
+    void my_list_toggle(const std::string &url, const std::string &title, app::Feedback &feedback)
+    {
+        auto &app = rezka::App::instance();
+        if (url.empty())
+        {
+            tv_refuse(feedback, false);
+            return;
+        }
+        const bool on = app.toggle_favorite(url, title);
+        show_message(on ? "Добавлено в Мой список" : "Удалено из Моего списка");
+        feedback.play(audio::Cue::select);
+    }
+    void tv_square(app::Feedback &feedback)
+    {
+        auto &app = rezka::App::instance();
+        rezka::CatalogItem item;
+        int index = -1;
+        if (tv_zone_ == TvZone::hero && tv_hero_index_ < static_cast<int>(tv_hero_.size()))
+            item = tv_hero_[static_cast<std::size_t>(tv_hero_index_)].item;
+        else if (tv_zone_ == TvZone::grid && tv_focus_ < static_cast<int>(tv_cards_.size()))
+        {
+            index = tv_focus_;
+            std::lock_guard<std::mutex> lock(app.catalog_mutex);
+            if (index < static_cast<int>(app.movies.size()))
+            {
+                item.url = app.movies[static_cast<std::size_t>(index)].url;
+                item.title = app.movies[static_cast<std::size_t>(index)].title;
+            }
+        }
+        if (item.url.empty())
+        {
+            tv_refuse(feedback, false);
+            return;
+        }
+        if (!app.signed_in())
+        {
+            my_list_toggle(item.url, item.title, feedback);
+            return;
+        }
+        if (index < 0)
+            index = app.adopt_catalog_item(item);
+        if (index < 0)
+        {
+            tv_refuse(feedback, false);
+            return;
+        }
+        open_page(index, false, feedback);
+        app.load_bookmark_choices_async(index);
+        dp_open_dialog(DpDialog::bookmarks, feedback);
     }
 
     void tv_update_home(const InputFrame &input, app::Feedback &feedback)
@@ -5805,12 +5889,49 @@ class Store final : public app::Concept
                 tv_open_drawer(feedback);
             return;
         }
-        // L1 / R1 turn the banner's slides while it has the focus.
-        if (tv_zone_ == TvZone::hero &&
-            (input.is_pressed(Action::page_prev) || input.is_pressed(Action::page_next)))
+        // L1 / R1: the tabs (Смотрят сейчас, Последние поступления, Популярное),
+        // wherever the focus is; the list follows once the presses rest.
+        if (input.is_pressed(Action::page_prev) || input.is_pressed(Action::page_next))
         {
-            tv_hero_show(tv_hero_index_ + (input.is_pressed(Action::page_next) ? 1 : -1));
-            tv_tick(feedback, tv_page_x() + tv_hero_rect().cx());
+            const int next = tv_tab_ + (input.is_pressed(Action::page_next) ? 1 : -1);
+            if (!listing || tv_kind_ != 0 || next < 0 || next >= kTvTabs)
+                tv_refuse(feedback, false);
+            else
+            {
+                tv_tab_ = next;
+                tv_tab_delay_ = 0.25f;
+                tv_focus_ = 0;
+                tv_scroll_.snap(0.0f);
+                Rect tabs[kTvTabs];
+                tv_tab_layout(tabs);
+                tv_tick(feedback, tv_page_x() + tabs[next].cx());
+            }
+            return;
+        }
+        // L2 / R2: the type chips (Все, Фильмы, Сериалы, Мультфильмы, Аниме),
+        // on Главная, Новинки and Анонсы alike
+        if (input.is_pressed(Action::jump_prev) || input.is_pressed(Action::jump_next))
+        {
+            const int next = tv_type_ + (input.is_pressed(Action::jump_next) ? 1 : -1);
+            if (!listing || next < 0 || next >= kTvTypes)
+                tv_refuse(feedback, false);
+            else
+            {
+                tv_type_ = next;
+                tv_chip_focus_ = next;
+                tv_tab_delay_ = 0.25f;
+                tv_focus_ = 0;
+                tv_scroll_.snap(0.0f);
+                Rect chips[kTvTypes];
+                tv_chip_layout(chips);
+                tv_tick(feedback, tv_page_x() + chips[next].cx());
+            }
+            return;
+        }
+        // Square: the card or the banner's title in Мой список, or out of it
+        if (input.is_pressed(Action::west))
+        {
+            tv_square(feedback);
             return;
         }
 
@@ -6000,7 +6121,7 @@ class Store final : public app::Concept
         {
             tv_tab_delay_ -= dt;
             if (tv_tab_delay_ < 0.0f)
-                tv_load(0);
+                tv_load(tv_kind_);
         }
         // Posters come for the rows in view first
         rezka::App::instance().poster_hint =
@@ -6511,6 +6632,7 @@ class Store final : public app::Concept
         kb_target_ = target;
         kb_title_ = title;
         kb_password_ = password;
+        kb_before_ = *target;
         if (keyboard_open(title, target->c_str(), password, 64))
         {
             kb_system_ = true;
@@ -6525,6 +6647,16 @@ class Store final : public app::Concept
     bool kb_active() const
     {
         return kb_open_ || kb_system_;
+    }
+    // The key under a finger at (x, y) on the touch pad (0..1 each): the pad is
+    // laid over the five rows of keys, a thin rim at its edges left out.
+    static void kb_touch_key(float x, float y, int &row, int &col)
+    {
+        constexpr float kRim = 0.04f;
+        const float u = std::clamp((x - kRim) / (1.0f - 2.0f * kRim), 0.0f, 0.9999f);
+        const float v = std::clamp((y - kRim) / (1.0f - 2.0f * kRim), 0.0f, 0.9999f);
+        row = static_cast<int>(v * 5.0f);
+        col = static_cast<int>(u * static_cast<float>(kKeyCols));
     }
     void kb_update(const InputFrame &input, app::Feedback &feedback)
     {
@@ -6545,15 +6677,32 @@ class Store final : public app::Concept
             return;
         }
         std::string &target = *kb_target_;
+        // Circle: Отмена, the field as it was before the sheet came up
         if (input.is_pressed(Action::back) || input.is_pressed(Action::menu))
+        {
+            target = kb_before_;
+            kb_open_ = false;
+            feedback.play(audio::Cue::modal_close);
+            return;
+        }
+        // R2: Ввод, the text kept (the search runs, the form goes on)
+        if (input.is_pressed(Action::jump_next))
         {
             kb_open_ = false;
             feedback.play(audio::Cue::modal_close);
             return;
         }
+        // Square: the last character goes
         if (input.is_pressed(Action::west))
         {
             erase_from(target);
+            feedback.play(audio::Cue::toggle);
+            return;
+        }
+        // R1: РУС <-> ENG; Triangle goes through every layout, the symbols too
+        if (input.is_pressed(Action::page_next))
+        {
+            key_lang_ = key_lang_ == 1 ? 0 : 1;
             feedback.play(audio::Cue::toggle);
             return;
         }
@@ -6563,8 +6712,21 @@ class Store final : public app::Concept
             feedback.play(audio::Cue::toggle);
             return;
         }
-        navigate_key_grid(input, feedback);
-        if (!input.is_pressed(Action::confirm))
+        // A finger on the touch pad: the key under it, the pad laid over the keys
+        if (touch_.down)
+        {
+            int row = 0, col = 0;
+            kb_touch_key(touch_.x, touch_.y, row, col);
+            if (row != key_row_ || col != key_col_)
+            {
+                key_row_ = row;
+                key_col_ = col;
+                feedback.play(audio::Cue::focus);
+            }
+        }
+        else
+            navigate_key_grid(input, feedback);
+        if (!input.is_pressed(Action::confirm) && !touch_.click)
             return;
         if (key_row_ < 4)
         {
@@ -6650,6 +6812,179 @@ class Store final : public app::Concept
             list.rounded_rect(r, 8.0f * dp, focused ? tv_on_surface() : done ? tv_primary() : tv_surface_variant().with_alpha(0.4f));
             tv_text(list, tv_medium(), action.label, r.cx(), r.cy() - 10.0f * dp, 14.0f * dp, 20.0f * dp,
                     focused ? tv_inverse_on_surface() : done ? tv_on_primary() : tv_on_surface(), gfx::Align::center, 0.1f * dp);
+        }
+        // The finger on the touch pad: a soft dot where it rests over the keys
+        if (touch_.down)
+        {
+            constexpr float kRim = 0.04f;
+            const float u = std::clamp((touch_.x - kRim) / (1.0f - 2.0f * kRim), 0.0f, 1.0f);
+            const float v = std::clamp((touch_.y - kRim) / (1.0f - 2.0f * kRim), 0.0f, 1.0f);
+            const float px = gx + u * grid_w;
+            const float py = gy + v * (5.0f * (cell + gap) - gap);
+            list.circle(px, py, 14.0f * dp, tv_primary().with_alpha(0.25f));
+            list.circle(px, py, 5.0f * dp, tv_primary().with_alpha(0.9f));
+        }
+    }
+
+    // ---- the DualSense hints' bar --------------------------------------------
+    //
+    // At the bottom of every screen but the player's: the buttons that do
+    // something on the layer that has the pad, each with the console's glyph.
+
+    enum class PadGlyph : std::uint8_t
+    {
+        cross,
+        circle,
+        square,
+        triangle,
+        l1r1,
+        l2r2,
+        r1,
+        r2,
+        touch,
+    };
+    struct PadHint
+    {
+        PadGlyph glyph;
+        const char *label;
+    };
+
+    std::vector<PadHint> footer_hints() const
+    {
+        using G = PadGlyph;
+        if (kb_open_)
+            return {{G::cross, "Буква"},          {G::square, "Стереть"},      {G::r2, "Ввод"},
+                    {G::r1, "Язык (RU/EN)"},      {G::touch, "Выбор буквы"},   {G::circle, "Отмена"}};
+        // The console's keyboard and the update's dialog speak for themselves
+        if (kb_system_ || upd_open_)
+            return {};
+        const std::vector<PadHint> plain = {{G::cross, "Выбрать"}, {G::circle, "Назад"}};
+        if (sx_screen_ != SxScreen::none)
+            return plain;
+        if (search_open_)
+            return {{G::cross, "Выбрать"}, {G::square, "Стереть"}, {G::triangle, "Найти"}, {G::circle, "Назад"}};
+        if (settings_open_ || profile_open_ || person_open_ || qr_open_ || dialog_open_ || drawer_open_)
+            return plain;
+        if (page_open_)
+        {
+            if (dp_dialog_ != DpDialog::none || comments_open_)
+                return plain;
+            return {{G::cross, "Выбрать"}, {G::square, "В мой список"}, {G::triangle, "Поиск"}, {G::circle, "Назад"}};
+        }
+        if (tv_zone_ == TvZone::drawer)
+            return {{G::cross, "Выбрать"}, {G::triangle, "Поиск"}, {G::circle, "Назад"}};
+        std::vector<PadHint> hints = {{G::cross, "Выбрать"}, {G::square, "В мой список"}, {G::triangle, "Поиск"}};
+        if (home_layout_)
+        {
+            if (tv_kind_ == 0)
+                hints.push_back({G::l1r1, "Категория"});
+            hints.push_back({G::l2r2, "Жанр/Тип"});
+        }
+        hints.push_back({G::circle, "Назад"});
+        return hints;
+    }
+
+    // A face button's disc, or a shoulder button's capsule, its left edge at x;
+    // returns its width.
+    float draw_pad_glyph(gfx::DrawList &list, PadGlyph glyph, float x, float cy, bool measure_only = false) const
+    {
+        const float d = 15.0f * kTvDp; // a face button's disc
+        const Color fill = tv_on_surface();
+        const Color mark = Color::rgb(0x191c1e);
+        const float stroke = 1.4f * kTvDp;
+        const auto capsule = [&](const char *name, float at, bool trigger) {
+            const float size = 9.0f * kTvDp;
+            const float w = tv_medium().measure(name, size, 0.0f) + 10.0f * kTvDp;
+            const float h = 13.0f * kTvDp;
+            if (!measure_only)
+            {
+                // A bumper is round; a trigger squarer, deeper at its top
+                list.rounded_rect({at, cy - h * 0.5f, w, h}, trigger ? 3.0f * kTvDp : h * 0.5f, fill);
+                tv_text(list, tv_medium(), name, at + w * 0.5f, cy - h * 0.5f, size, h, mark, gfx::Align::center);
+            }
+            return w;
+        };
+        switch (glyph)
+        {
+        case PadGlyph::l1r1:
+        case PadGlyph::l2r2:
+        {
+            const bool trigger = glyph == PadGlyph::l2r2;
+            const float a = capsule(trigger ? "L2" : "L1", x, trigger);
+            const float gap = 3.0f * kTvDp;
+            const float b = capsule(trigger ? "R2" : "R1", x + a + gap, trigger);
+            return a + gap + b;
+        }
+        case PadGlyph::r1:
+            return capsule("R1", x, false);
+        case PadGlyph::r2:
+            return capsule("R2", x, true);
+        case PadGlyph::touch:
+        {
+            // The touch pad: a wide rounded plate with a finger's dot on it
+            const float w = 22.0f * kTvDp, h = 13.0f * kTvDp;
+            if (!measure_only)
+            {
+                list.bordered_rect({x, cy - h * 0.5f, w, h}, 3.0f * kTvDp, kClear, stroke, fill);
+                list.circle(x + w * 0.62f, cy, 2.2f * kTvDp, fill);
+            }
+            return w;
+        }
+        default:
+            break;
+        }
+        if (measure_only)
+            return d;
+        const float r = d * 0.5f, cx = x + r;
+        list.circle(cx, cy, r, fill);
+        const float s = r * 0.46f;
+        switch (glyph)
+        {
+        case PadGlyph::cross:
+            list.line(cx - s, cy - s, cx + s, cy + s, stroke, mark);
+            list.line(cx - s, cy + s, cx + s, cy - s, stroke, mark);
+            break;
+        case PadGlyph::circle:
+            list.ring(cx, cy, s * 1.05f, stroke, mark);
+            break;
+        case PadGlyph::square:
+            list.bordered_rect({cx - s * 0.9f, cy - s * 0.9f, s * 1.8f, s * 1.8f}, 0.0f, kClear, stroke, mark);
+            break;
+        default:
+        {
+            // Triangle: its three sides
+            const float top = cy - s * 1.05f, bottom = cy + s * 0.75f, half = s * 1.05f;
+            list.line(cx, top, cx - half, bottom, stroke, mark);
+            list.line(cx - half, bottom, cx + half, bottom, stroke, mark);
+            list.line(cx + half, bottom, cx, top, stroke, mark);
+            break;
+        }
+        }
+        return d;
+    }
+
+    void draw_footer(gfx::DrawList &list) const
+    {
+        const std::vector<PadHint> hints = footer_hints();
+        if (hints.empty())
+            return;
+        const Rect bar{0.0f, kHeight - kTvFooterH, kWidth, kTvFooterH};
+        list.rounded_rect(bar, 0.0f, tv_surface().with_alpha(0.9f));
+        list.rounded_rect({bar.x, bar.y, bar.w, 1.0f}, 0.0f, tv_border_variant());
+        const float size = 9.0f * kTvDp;
+        const float glyph_gap = 5.0f * kTvDp, item_gap = 16.0f * kTvDp;
+        // Laid out from the right edge, as the console's own hints are
+        float total = 0.0f;
+        for (const PadHint &h : hints)
+            total += draw_pad_glyph(list, h.glyph, 0.0f, 0.0f, true) + glyph_gap +
+                     tv_regular().measure(h.label, size, 0.0f) + item_gap;
+        total -= item_gap;
+        float x = std::max(kTvPad, kWidth - kTvPad - total);
+        const float cy = bar.cy();
+        for (const PadHint &h : hints)
+        {
+            x += draw_pad_glyph(list, h.glyph, x, cy) + glyph_gap;
+            x += tv_text(list, tv_regular(), h.label, x, bar.y, size, kTvFooterH, tv_on_surface_variant()) + item_gap;
         }
     }
 
@@ -7255,6 +7590,12 @@ class Store final : public app::Concept
             else
                 page_open_ = false;
             feedback.play(audio::Cue::back);
+            return;
+        }
+        // Square: the title in Мой список, or out of it (its folders, signed in)
+        if (input.is_pressed(Action::west))
+        {
+            toggle_bookmark(feedback);
             return;
         }
         const DpLayout L = dp_layout();
@@ -9250,9 +9591,7 @@ class Store final : public app::Concept
             dp_open_dialog(DpDialog::bookmarks, feedback);
             return;
         }
-        const bool on = app.toggle_favorite(page_model_.url, page_model_.title);
-        show_message(on ? "Добавлено в закладки" : "Убрано из закладок");
-        feedback.play(audio::Cue::select);
+        my_list_toggle(page_model_.url, page_model_.title, feedback);
     }
 
     // The QR code of an address, for reading with a phone.
@@ -11741,6 +12080,19 @@ class Store final : public app::Concept
     bool kb_password_ = false;
     bool kb_open_ = false;             // the sheet of keys is up
     bool kb_system_ = false;           // the console's own keyboard is
+    std::string kb_before_;            // the field as it was: Circle puts it back
+    // The DualSense touch pad as update() read it this frame.
+    struct TouchFrame
+    {
+        bool down = false;  // a finger is on it
+        float x = 0.0f;     // its place, 0..1 across
+        float y = 0.0f;     // ... and down
+        bool click = false; // the pad was pressed in
+    };
+    TouchFrame touch_;
+#if defined(PS5_HOST_REFERENCE)
+    TouchFrame host_touch_; // HDREZKA_HOST_KEYS's finger
+#endif
     // The player's controls.
     bool pl_controls_ = true;
     float pl_timer_ = 4.0f;
