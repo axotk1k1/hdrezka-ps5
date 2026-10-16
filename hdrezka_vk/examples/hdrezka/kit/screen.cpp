@@ -6580,32 +6580,31 @@ class Store final : public app::Concept
     static Color tv_hero_red() { return Color::rgb(0xf2453d); }
     static float tv_smooth(float t) { return t * t * (3.0f - 2.0f * t); }
 
-    // The picture's frame on the right, its width from its own proportions,
-    // and the part of the texture that fills it.
-    static void tv_hero_frame(const Rect &b, float aspect, Rect &frame, Rect &uv)
+    // The backdrop, Netflix-style: the whole screen's width (under the drawer's
+    // rail too) from the screen's top to the banner's bottom, in page
+    // coordinates; b is the banner as tv_draw_hero places it.
+    static Rect tv_hero_backdrop(const Rect &b)
     {
-        const float w = std::min(b.w * 0.62f, b.h * aspect * 1.75f);
-        frame = {b.x + b.w - w, b.y, w, b.h};
+        const float top = b.y - (kTvGridTop + kTvGridPad); // 0 when the grid is not scrolled
+        return {-kTvRail, top, kWidth, b.y + b.h - top};
+    }
+    // Aspect-fill: the part of the texture that covers the frame, never
+    // stretched; cut at the sides around the centre, or below (the top kept,
+    // where the faces are).
+    static Rect tv_hero_cover_uv(const Rect &frame, float aspect)
+    {
         const float box = frame.w / frame.h;
         if (box > aspect)
-        {
-            const float h = aspect / box;
-            uv = {0.0f, (1.0f - h) * 0.2f, 1.0f, h};
-        }
-        else
-        {
-            const float u = box / aspect;
-            uv = {(1.0f - u) * 0.5f, 0.0f, u, 1.0f};
-        }
+            return {0.0f, 0.0f, 1.0f, aspect / box};
+        const float u = box / aspect;
+        return {(1.0f - u) * 0.5f, 0.0f, u, 1.0f};
     }
 
-    void tv_draw_hero_picture(gfx::DrawList &list, const Rect &b, const TvHero &h, float alpha) const
+    void tv_draw_hero_picture(gfx::DrawList &list, const Rect &frame, const TvHero &h, float alpha) const
     {
         if (h.texture == 0 || h.aspect <= 0.0f || alpha <= 0.0f)
             return;
-        Rect frame, uv;
-        tv_hero_frame(b, h.aspect, frame, uv);
-        list.image(h.texture, frame, uv, kWhite.with_alpha(alpha), 16.0f * kTvDp);
+        list.image(h.texture, frame, tv_hero_cover_uv(frame, h.aspect), kWhite.with_alpha(alpha), 0.0f);
     }
 
     // The label, the title, the facts and the description, from the top of the text block.
@@ -6686,61 +6685,84 @@ class Store final : public app::Concept
                 gfx::Align::left, 0.2f * dp);
     }
 
-    void tv_draw_hero(gfx::DrawList &list) const
+    // The banner where it is drawn (page coordinates, scrolled); false when off screen.
+    bool tv_hero_place(Rect &b) const
     {
         if (!tv_hero_shown())
+            return false;
+        b = tv_hero_rect();
+        b.y += kTvGridTop - tv_scroll_.value;
+        return b.y + b.h >= 0.0f && b.y <= kHeight;
+    }
+
+    // The banner's picture across the screen, under the tabs and the chips:
+    // drawn before them. The page's colour (#191C1E) covers it solid behind
+    // the text up to x ~850, fading out by ~1400; it dissolves into the page
+    // at the bottom, over the grid's edge, and darkens a little under the tabs
+    // and the clock at the top.
+    void tv_draw_hero_backdrop(gfx::DrawList &list) const
+    {
+        Rect b;
+        if (!tv_hero_place(b))
+            return;
+        const Rect back = tv_hero_backdrop(b);
+        if (back.y + back.h < 0.0f)
+            return;
+        const Color page = tv_surface();
+        const Color none = page.with_alpha(0.0f);
+        list.push_clip({-kTvRail - kTvSlide, 0.0f, kWidth + 2.0f * kTvSlide, kHeight});
+        if (tv_hero_.empty())
+        {
+            // Loading: the picture's place, pulsing as the grid's placeholders do
+            const float pulse = 0.25f + 0.1f * std::sin(clock_ * 3.0f);
+            list.rounded_rect(back, 0.0f, tv_surface_variant().with_alpha(pulse));
+        }
+        else
+        {
+            const bool fading = tv_hero_prev_ >= 0 && tv_hero_prev_ < static_cast<int>(tv_hero_.size());
+            const float t = fading ? tv_smooth(tv_hero_fade_) : 1.0f;
+            // The old picture whole, the new one coming in over it
+            if (fading)
+                tv_draw_hero_picture(list, back, tv_hero_[static_cast<std::size_t>(tv_hero_prev_)], 1.0f);
+            tv_draw_hero_picture(list, back, tv_hero_[static_cast<std::size_t>(tv_hero_index_)], t);
+        }
+
+        // Screen x to page x: the page's left edge is at kTvRail when the drawer is closed
+        const float solid_to = 850.0f - kTvRail;
+        const float clear_at = 1400.0f - kTvRail;
+        const float far = back.x + back.w + kTvSlide;
+        list.rounded_rect({back.x - kTvSlide, back.y, solid_to - back.x + kTvSlide + 1.0f, back.h}, 0.0f, page);
+        // Eased: two layers from the same edge (no seam between them), the
+        // short one making the fall from solid quicker than the long tail
+        list.gradient_rect_h({solid_to, back.y, clear_at - solid_to, back.h}, 0.0f, page, none);
+        list.gradient_rect_h({solid_to, back.y, (clear_at - solid_to) * 0.5f, back.h}, 0.0f, page.with_alpha(0.5f), none);
+        // The bottom: into the page by the banner's edge, so the grid follows seamlessly
+        const float fall = b.h * 0.45f;
+        list.gradient_rect({back.x - kTvSlide, b.y + b.h - fall, far - back.x + kTvSlide, fall + 1.0f}, 0.0f, none, page);
+        list.gradient_rect({back.x - kTvSlide, b.y + b.h - fall * 0.4f, far - back.x + kTvSlide, fall * 0.4f + 1.0f}, 0.0f, none,
+                           page);
+        list.rounded_rect({back.x - kTvSlide, b.y + b.h, far - back.x + kTvSlide, kTvHeroGap}, 0.0f, page);
+        // The top: a light shade under the tabs, the chips and the clock
+        list.gradient_rect({back.x - kTvSlide, back.y - 1.0f, far - back.x + kTvSlide, kTvGridTop + kTvGridPad}, 0.0f,
+                           kBlack.with_alpha(0.45f), kBlack.with_alpha(0.0f));
+        list.pop_clip();
+    }
+
+    void tv_draw_hero(gfx::DrawList &list) const
+    {
+        Rect b;
+        if (!tv_hero_place(b) || tv_hero_.empty())
             return;
         const float dp = kTvDp;
         const float view = kHeight - kTvGridTop;
-        Rect b = tv_hero_rect();
-        b.y += kTvGridTop - tv_scroll_.value;
-        if (b.y + b.h < kTvGridTop || b.y > kHeight)
-            return;
         list.push_clip({-kTvSlide, kTvGridTop, kWidth + kTvSlide, view});
-        if (tv_hero_.empty())
-        {
-            // Loading: the frame of the picture, pulsing as the grid's placeholders do
-            const float pulse = 0.25f + 0.1f * std::sin(clock_ * 3.0f);
-            const Rect frame{b.x + b.w * 0.38f, b.y, b.w * 0.62f, b.h};
-            list.rounded_rect(frame, 16.0f * dp, tv_surface_variant().with_alpha(pulse));
-            list.gradient_rect_h({frame.x - 1.0f, frame.y, frame.w * 0.6f, frame.h}, 0.0f, tv_surface(),
-                                 tv_surface().with_alpha(0.0f));
-            list.pop_clip();
-            return;
-        }
         const TvHero &now = tv_hero_[static_cast<std::size_t>(tv_hero_index_)];
         const bool fading = tv_hero_prev_ >= 0 && tv_hero_prev_ < static_cast<int>(tv_hero_.size());
         const float t = fading ? tv_smooth(tv_hero_fade_) : 1.0f;
 
-        // The pictures: the old one whole, the new one coming in over it.
-        if (fading)
-            tv_draw_hero_picture(list, b, tv_hero_[static_cast<std::size_t>(tv_hero_prev_)], 1.0f);
-        tv_draw_hero_picture(list, b, now, t);
-
-        // The page's colour over the picture's edges: wide on the left and
-        // below, where the text is, a little at the top and on the right.
-        // They follow the picture's own frame (the wider of the two while fading).
-        const Color page = tv_surface();
-        const Color none = page.with_alpha(0.0f);
-        float left = b.x + b.w * 0.38f;
-        for (int i : {tv_hero_index_, fading ? tv_hero_prev_ : -1})
-        {
-            if (i < 0 || tv_hero_[static_cast<std::size_t>(i)].aspect <= 0.0f)
-                continue;
-            Rect frame, uv;
-            tv_hero_frame(b, tv_hero_[static_cast<std::size_t>(i)].aspect, frame, uv);
-            left = i == tv_hero_index_ ? frame.x : std::min(left, frame.x);
-        }
-        const Rect area{left, b.y, b.x + b.w - left + 1.0f, b.h};
-        list.gradient_rect_h({area.x - 2.0f, area.y, area.w * 0.55f, area.h}, 0.0f, page, none);
-        list.gradient_rect_h({area.x, area.y, area.w * 0.8f, area.h}, 0.0f, page.with_alpha(0.55f), none);
-        list.gradient_rect({area.x, area.y + area.h * 0.5f, area.w, area.h * 0.5f + 2.0f}, 0.0f, none, page);
-        list.gradient_rect({area.x, area.y + area.h * 0.78f, area.w, area.h * 0.22f + 2.0f}, 0.0f, none, page);
-        list.gradient_rect({area.x, area.y - 1.0f, area.w, area.h * 0.14f}, 0.0f, page, none);
-        list.gradient_rect_h({area.x + area.w * 0.9f, area.y, area.w * 0.1f + 1.0f, area.h}, 0.0f, none, page);
-
-        // The text, the old slide's leaving in the first half of the fade, the new one's coming in the second.
-        const float x = b.x + 32.0f * dp;
+        // The text, the old slide's leaving in the first half of the fade, the
+        // new one's coming in the second; on the page's left edge, as the tabs and the grid.
+        const float x = b.x;
         const float buttons_h = 44.0f * dp;
         const auto top_of = [&](const TvHero &h) {
             return b.y + (b.h - (tv_hero_block_h(h) + 20.0f * dp + buttons_h)) * 0.5f;
@@ -6764,17 +6786,18 @@ class Store final : public app::Concept
         tv_draw_hero_button(list, {x + play_w + 16.0f * dp, by, list_w, buttons_h}, 1, false,
                             saved ? kTvIconCheck : kTvIconAdd, list_label);
 
-        // The dots, the slide shown drawn long.
+        // The dots on the banner's bottom right, over the grid: the slide shown
+        // a long white pill, the others grey circles.
         const int count = static_cast<int>(tv_hero_.size());
-        float dx = b.x + b.w - 28.0f * dp;
-        const float dy = b.y + b.h - 24.0f * dp;
+        float dx = b.x + b.w;
+        const float dy = by + buttons_h * 0.5f;
         for (int i = count - 1; i >= 0; --i)
         {
             const bool on = i == tv_hero_index_;
-            const float w = on ? 22.0f * dp : 8.0f * dp;
+            const float w = on ? 24.0f * dp : 8.0f * dp;
             dx -= w;
             list.rounded_rect({dx, dy - 4.0f * dp, w, 8.0f * dp}, 4.0f * dp,
-                              on ? tv_on_surface() : tv_on_surface().with_alpha(0.35f));
+                              on ? kWhite : Color::rgb(0x9a9ea3).with_alpha(0.55f));
             dx -= 8.0f * dp;
         }
         list.pop_clip();
@@ -6787,6 +6810,7 @@ class Store final : public app::Concept
             list.push_transform(1.0f - 0.12f * tv_open_.value, kWidth, kHeight * 0.5f, tv_page_x(), 0.0f);
         else
             list.push_transform(1.0f, 0.0f, 0.0f, tv_page_x(), 0.0f);
+        tv_draw_hero_backdrop(list);
         tv_draw_tabs(list);
         tv_draw_chips(list);
         tv_draw_hero(list);
