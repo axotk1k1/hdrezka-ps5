@@ -24,7 +24,7 @@ namespace rezka
 {
 
 // The title's version: what the updater compares GitHub's releases with.
-inline constexpr const char *kAppVersion = "1.0.1";
+inline constexpr const char *kAppVersion = "1.0.2";
 // The releases of the title (Настройки → О приложении, the updater).
 inline constexpr const char *kUpdateRepo = "axotk1k1/hdrezka-ps5";
 
@@ -302,6 +302,13 @@ public:
     // Legacy name: loads the actor page (does not replace the home catalogue).
     void person_films_async(const std::string &url, const std::string &name);
     void load_details_async(int movie_idx);
+    // A series' seasons and episodes for another voice (each studio has its
+    // own): movies[movie_idx].details.seasons is replaced once the site answers.
+    // episodes_loading while a request runs; episodes_version counts the answers.
+    void get_episodes_async(int movie_idx, const std::string &translator_id);
+    std::atomic<int> episodes_loading{0};
+    std::atomic<uint32_t> episodes_version{0};
+    std::atomic<uint32_t> episodes_serial_{0};
 
     void play_stream(const std::string &title, const std::string &voice, const std::string &url);
     void play_title_async(int movie_idx, int translator_idx, int quality_idx, int season_idx,
@@ -351,6 +358,10 @@ public:
     AppSettings settings_snapshot();
     // Keeps the new preferences, saves them and applies what they change at once.
     void update_settings(const AppSettings &next);
+    // The player's volume (0..1, the right stick): heard at once; save_volume
+    // keeps it in settings.cfg (once the stick is let go, not every frame).
+    void set_volume(float volume);
+    void save_volume();
     // A title the country filter hides ("2024, США, Боевики").
     bool hidden_by_filter(const std::string &info);
     // "Источник": whether a mirror answers. mirror_check: 0 idle, 1 checking,

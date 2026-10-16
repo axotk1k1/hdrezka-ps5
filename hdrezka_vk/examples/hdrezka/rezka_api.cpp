@@ -3303,30 +3303,79 @@ bool Client::get_episodes(const VideoDetails &video,
         return true;
     }
 
-    size_t s_pos = 0;
-    while ((s_pos = response.find("data-tab_id=\"", s_pos)) != std::string::npos) {
-        size_t s_end = response.find("\"", s_pos + 13);
-        if (s_end == std::string::npos) break;
-        std::string sid = response.substr(s_pos + 13, s_end - (s_pos + 13));
+    // "seasons" lists li.b-simple_season__item[data-tab_id]; "episodes" holds a
+    // ul.b-simple_episodes__list per season, each li.b-simple_episode__item
+    // naming its data-season_id and data-episode_id. Both are escaped HTML
+    // inside the JSON, so they are unescaped before their tags are read.
+    std::string seasons_html = json_string(response, "seasons");
+    std::string episodes_html = json_string(response, "episodes");
+    if (seasons_html.empty() && episodes_html.empty() && response.find("data-tab_id=\"") != std::string::npos)
+        seasons_html = episodes_html = response; // plain HTML (an older answer)
 
-        size_t tag_end = response.find(">", s_end);
-        size_t li_end = response.find("</li>", tag_end);
-        std::string s_title = "Сезон " + sid;
-        if (tag_end != std::string::npos && li_end != std::string::npos) {
-            s_title = strip_tags(response.substr(tag_end + 1, li_end - (tag_end + 1)));
-        }
-
+    auto season_of = [&](const std::string &sid) -> Season & {
+        for (auto &s : out_seasons)
+            if (s.id == sid) return s;
         Season s;
         s.id = sid;
-        s.title = s_title;
+        s.title = "Сезон " + sid;
+        out_seasons.push_back(s);
+        return out_seasons.back();
+    };
+
+    for (size_t at = seasons_html.find("<li"); at != std::string::npos; at = seasons_html.find("<li", at + 3)) {
+        const size_t gt = seasons_html.find('>', at);
+        if (gt == std::string::npos) break;
+        const std::string tag = seasons_html.substr(at, gt - at);
+        const std::string sid = attr_of(tag, "data-tab_id");
+        if (sid.empty()) continue;
+        Season &s = season_of(sid);
+        const std::string title = strip_tags(inner_after(seasons_html, at, "</li>"));
+        if (!title.empty()) s.title = title;
+    }
+
+    for (size_t at = episodes_html.find("<li"); at != std::string::npos; at = episodes_html.find("<li", at + 3)) {
+        const size_t gt = episodes_html.find('>', at);
+        if (gt == std::string::npos) break;
+        const std::string tag = episodes_html.substr(at, gt - at);
+        const std::string eid = attr_of(tag, "data-episode_id");
+        if (eid.empty()) continue;
+        std::string sid = attr_of(tag, "data-season_id");
+        if (sid.empty()) {
+            // The list's id names the season: simple-episodes-list-X / -tabs-X
+            const size_t ul = episodes_html.rfind("<ul", at);
+            if (ul != std::string::npos) {
+                const std::string ul_id = attr_of(episodes_html.substr(ul, episodes_html.find('>', ul) - ul), "id");
+                const size_t dash = ul_id.rfind('-');
+                if (dash != std::string::npos) sid = ul_id.substr(dash + 1);
+            }
+            if (sid.empty()) sid = "1";
+        }
+        Season &s = season_of(sid);
+        bool seen = false;
+        for (const auto &e : s.episodes)
+            if (e.id == eid) seen = true;
+        if (seen) continue;
+        Episode ep;
+        ep.id = eid;
+        ep.title = strip_tags(inner_after(episodes_html, at, "</li>"));
+        if (ep.title.empty()) ep.title = "Серия " + eid;
+        s.episodes.push_back(ep);
+    }
+
+    // A season the answer named without its list still gets something to pick
+    for (auto &s : out_seasons) {
+        if (!s.episodes.empty()) continue;
         for (int e = 1; e <= 12; ++e) {
             Episode ep;
             ep.id = std::to_string(e);
             ep.title = "Серия " + std::to_string(e);
             s.episodes.push_back(ep);
         }
-        out_seasons.push_back(s);
-        s_pos = s_end;
+    }
+    {
+        size_t n = 0;
+        for (const auto &s : out_seasons) n += s.episodes.size();
+        write_log("[DEBUG] get_episodes parsed seasons=%zu episodes=%zu\n", out_seasons.size(), n);
     }
 
     if (out_seasons.empty()) {

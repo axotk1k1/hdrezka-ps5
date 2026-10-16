@@ -798,6 +798,32 @@ class Store final : public app::Concept
         pl_in_.update(dt, omega(14.0f));
         app.osd_visible = false; // the controls keep their own time
 
+        // The right stick up / down: the volume, smoothly while it is held
+        // (up to 80% a second at full tilt, ~1.3% a frame), its plate shown
+        // until 1.5 s after the stick is let go; kept in settings.cfg then.
+        {
+            const float sy = input.stick2_y; // down-positive
+            if (std::fabs(sy) > 0.2f)
+            {
+                const float tilt = (std::fabs(sy) - 0.2f) / 0.8f;
+                const float step = (0.15f + 0.65f * tilt) * dt;
+                app.set_volume(app.player.volume() + (sy < 0.0f ? step : -step));
+                pl_vol_idle_ = 0.0f;
+                pl_vol_dirty_ = true;
+            }
+            else
+            {
+                pl_vol_idle_ += dt;
+                if (pl_vol_dirty_)
+                {
+                    app.save_volume();
+                    pl_vol_dirty_ = false;
+                }
+            }
+            pl_vol_in_.target = pl_vol_idle_ < 1.5f ? 1.0f : 0.0f;
+            pl_vol_in_.update(dt, omega(10.0f));
+        }
+
         if (app.is_buffering && !app.is_playing)
         {
             if (input.is_pressed(Action::back))
@@ -1078,6 +1104,55 @@ class Store final : public app::Concept
         list.arc(kWidth * 0.5f, kHeight * 0.5f, 20.0f * dp, 8.0f, buffer_clock_ * 5.0f, 4.4f, tv_primary());
     }
 
+    // The volume's plate, top right: a speaker (struck through at 0%), the
+    // level in words and a bar; it slides in and fades with pl_vol_in_.
+    void pl_draw_volume(gfx::DrawList &list) const
+    {
+        const float dp = kTvDp;
+        const float shown = tween::clamp01(pl_vol_in_.value);
+        const float volume = rezka::App::instance().player.volume();
+        const int percent = static_cast<int>(std::lround(volume * 100.0f));
+        const float w = 300.0f * dp, h = 64.0f * dp;
+        const Rect plate{kWidth - 32.0f * dp - w, 32.0f * dp - (1.0f - shown) * 16.0f * dp, w, h};
+        list.push_opacity(shown);
+        list.rounded_rect(plate, h * 0.5f, kBlack.with_alpha(0.6f));
+
+        // The speaker: a box and its cone, then a wave per third of the level
+        const float s = 28.0f * dp;
+        const float ix = plate.x + 20.0f * dp, iy = plate.cy() - s * 0.5f;
+        const float cone[] = {ix, iy + s * 0.35f, ix + s * 0.25f, iy + s * 0.35f, ix + s * 0.55f, iy + s * 0.08f,
+                              ix + s * 0.55f, iy + s * 0.92f, ix + s * 0.25f, iy + s * 0.65f, ix, iy + s * 0.65f};
+        list.polygon(cone, 6, kWhite);
+        const float wx = ix + s * 0.5f, wy = plate.cy();
+        if (percent == 0)
+        {
+            const float pen = 2.5f * dp;
+            list.line(wx + s * 0.18f, wy - s * 0.2f, wx + s * 0.5f, wy + s * 0.2f, pen, kWhite);
+            list.line(wx + s * 0.18f, wy + s * 0.2f, wx + s * 0.5f, wy - s * 0.2f, pen, kWhite);
+        }
+        else
+        {
+            constexpr float kRight = 1.5707963f;
+            const int waves = percent > 66 ? 3 : percent > 33 ? 2 : 1;
+            for (int i = 0; i < waves; ++i)
+            {
+                const float r = s * (0.22f + 0.16f * static_cast<float>(i));
+                list.arc(wx, wy, r, 2.5f * dp, kRight - 0.8f, 1.6f, kWhite);
+            }
+        }
+
+        // "Громкость: 85%" over the bar
+        const float tx = ix + s + 16.0f * dp;
+        const float bar_w = plate.x + plate.w - 24.0f * dp - tx;
+        tv_text(list, tv_medium(), "Громкость: " + std::to_string(percent) + "%", tx, plate.y + 10.0f * dp, 16.0f * dp, 22.0f * dp, kWhite,
+                gfx::Align::left, 0.3f * dp);
+        const Rect bar{tx, plate.y + h - 20.0f * dp, bar_w, 6.0f * dp};
+        list.rounded_rect(bar, bar.h * 0.5f, kWhite.with_alpha(0.25f));
+        if (volume > 0.001f)
+            list.rounded_rect({bar.x, bar.y, std::max(bar.h, bar.w * volume), bar.h}, bar.h * 0.5f, tv_primary());
+        list.pop_opacity();
+    }
+
     void draw_player(app::Frame &frame) const
     {
         auto &app = rezka::App::instance();
@@ -1212,6 +1287,9 @@ class Store final : public app::Concept
             list.pop_opacity();
         }
 
+        if (pl_vol_in_.value > 0.01f)
+            pl_draw_volume(list);
+
         if (pl_sub_open_)
         {
             const std::vector<std::string> names = pl_subtitles();
@@ -1301,6 +1379,9 @@ class Store final : public app::Concept
                 else if (key == "r2") input.pressed |= action_bit(Action::jump_next);
                 else if (key == "touchpad") input.pressed |= action_bit(Action::touch);
                 else if (key == "untouch") host_touch_.down = false;
+                // "rstick=-1": the right stick held up (down-positive) until "rstick=0"
+                else if (key.rfind("rstick=", 0) == 0)
+                    host_stick_y_ = std::clamp(std::strtof(key.c_str() + 7, nullptr), -1.0f, 1.0f);
                 else if (key.rfind("touch=", 0) == 0)
                 {
                     char *slash = nullptr;
@@ -1325,6 +1406,8 @@ class Store final : public app::Concept
         InputFrame input = pad_input;
 #if defined(PS5_HOST_REFERENCE)
         host_script(input, dt);
+        if (host_stick_y_ != 0.0f)
+            input.stick2_y = host_stick_y_;
 #endif
         // The touch pad this frame: the finger's place, and its click
         {
@@ -4595,7 +4678,7 @@ class Store final : public app::Concept
     // update check under it), with this title's own links: the version row
     // checks for an update, the channel and the donation open their QR codes.
     static constexpr StDef kStAboutItems[] = {
-        {kStAppInfo, kStAction, "HDrezka homebrew for PS5", "Версия: 1.0.1", kTvIconInfoOutlined},
+        {kStAppInfo, kStAction, "HDrezka homebrew for PS5", "Версия: 1.0.2", kTvIconInfoOutlined},
         {kStAutoUpdate, kStSwitch, "Автоматическая проверка обновлений", "Проверять наличие обновлений при запуске приложения",
          kTvIconBrowserUpdated},
         {kStTelegram, kStAction, "Telegram канал", "t.me/hdrezkaps5", kTvIconSend},
@@ -8702,7 +8785,28 @@ class Store final : public app::Concept
         wd_quality_ = false;
         wd_focus_section_ = -1; // settled by the first layout
         wd_scroll_.snap(0.0f);
+        wd_reload_episodes(); // a voice kept from "Продолжить" has its own seasons
         feedback.play(audio::Cue::modal_open);
+    }
+    // The seasons shown are those of the voice chosen: another voice's are
+    // asked of the site (they differ between studios) and replace them.
+    void wd_reload_episodes()
+    {
+        if (translator_idx_ == wd_episodes_tr_)
+            return;
+        auto &app = rezka::App::instance();
+        std::string tr_id;
+        {
+            std::lock_guard<std::mutex> lock(app.catalog_mutex);
+            if (page_item_ < 0 || page_item_ >= static_cast<int>(app.movies.size()))
+                return;
+            const rezka::VideoDetails &d = app.movies[static_cast<std::size_t>(page_item_)].details;
+            if (!d.is_series || translator_idx_ < 0 || translator_idx_ >= static_cast<int>(d.translators.size()))
+                return;
+            tr_id = d.translators[static_cast<std::size_t>(translator_idx_)].id;
+        }
+        wd_episodes_tr_ = translator_idx_;
+        app.get_episodes_async(page_item_, tr_id);
     }
     int wd_selected(int section) const
     {
@@ -8744,13 +8848,14 @@ class Store final : public app::Concept
             }
         if (!d.is_series)
             return;
+        // The site's own names ("Серия 23-24" for a double episode), else the number
         for (const rezka::Season &s : d.seasons)
-            out[1].push_back("Сезон " + s.id);
+            out[1].push_back(s.title.empty() ? "Сезон " + s.id : s.title);
         if (!d.seasons.empty())
         {
             const rezka::Season &season = d.seasons[static_cast<std::size_t>(std::clamp(season_idx_, 0, static_cast<int>(d.seasons.size()) - 1))];
             for (const rezka::Episode &e : season.episodes)
-                out[2].push_back("Серия " + e.id);
+                out[2].push_back(e.title.empty() ? "Серия " + e.id : e.title);
         }
     }
     // A chip's content after the 16 dp padding: the name with its flag (one
@@ -8851,6 +8956,31 @@ class Store final : public app::Concept
         std::vector<std::string> labels[3];
         std::vector<WdVoice> voices;
         wd_labels(labels, voices);
+        // Another voice's seasons may be fewer: keep the choices inside them
+        if (!labels[1].empty())
+            season_idx_ = std::clamp(season_idx_, 0, static_cast<int>(labels[1].size()) - 1);
+        if (!labels[2].empty())
+            episode_idx_ = std::clamp(episode_idx_, 0, static_cast<int>(labels[2].size()) - 1);
+        // L2 / R2 step through the seasons wherever the focus is; the
+        // episodes below follow at once
+        if ((input.is_pressed(Action::jump_prev) || input.is_pressed(Action::jump_next)) && !labels[1].empty())
+        {
+            const int n = static_cast<int>(labels[1].size());
+            const int to = season_idx_ + (input.is_pressed(Action::jump_next) ? 1 : -1);
+            if (to < 0 || to >= n)
+                tv_refuse(feedback, false);
+            else
+            {
+                season_idx_ = to;
+                episode_idx_ = 0;
+                if (wd_focus_section_ == 1)
+                    wd_focus_index_ = to;
+                else if (wd_focus_section_ == 2)
+                    wd_focus_index_ = 0;
+                feedback.play(audio::Cue::tab);
+            }
+            return;
+        }
         const WdLayout L = wd_layout(labels, voices);
         if (wd_focus_section_ < 0)
         {
@@ -8909,6 +9039,14 @@ class Store final : public app::Concept
             {
                 wd_focus_section_ = L.items[static_cast<std::size_t>(next)].section;
                 wd_focus_index_ = L.items[static_cast<std::size_t>(next)].index;
+                // Walking the seasons' chips sideways picks them: the
+                // episodes' list switches with the focus
+                if (wd_focus_section_ == 1 && here.section == 1 &&
+                    (input.nav == Direction::left || input.nav == Direction::right) && season_idx_ != wd_focus_index_)
+                {
+                    season_idx_ = wd_focus_index_;
+                    episode_idx_ = 0;
+                }
                 tv_tick(feedback, kWidth * 0.5f);
             }
             return;
@@ -8941,7 +9079,10 @@ class Store final : public app::Concept
         if (wd_selected(here.section) != here.index)
         {
             if (here.section == 0)
+            {
                 translator_idx_ = here.index;
+                wd_reload_episodes();
+            }
             else if (here.section == 1)
             {
                 season_idx_ = here.index;
@@ -9024,9 +9165,10 @@ class Store final : public app::Concept
         const float left = card.x + 18.0f * dp;
         const float scroll = wd_scroll_.value;
         list.push_clip({card.x, card.y + 4.0f, card.w, L.view_h});
+        const bool reloading = rezka::App::instance().episodes_loading.load() > 0;
         for (int s = 0; s < 3; ++s)
             if (L.header_y[s] >= 0.0f)
-                tv_text(list, tv_medium(), kHeaders[s], left + 14.0f * dp, card.y + L.header_y[s] + 24.0f * dp - scroll, 16.0f * dp, 20.0f * dp,
+                tv_text(list, tv_medium(), s > 0 && reloading ? std::string(kHeaders[s]) + " · загрузка…" : std::string(kHeaders[s]), left + 14.0f * dp, card.y + L.header_y[s] + 24.0f * dp - scroll, 16.0f * dp, 20.0f * dp,
                         tv_on_surface(), gfx::Align::left, 0.2f * dp);
         for (const WdItem &item : L.items)
         {
@@ -9912,6 +10054,7 @@ class Store final : public app::Concept
         cast_index_ = 0;
         open_rows_[0] = open_rows_[1] = open_rows_[2] = false;
         translator_idx_ = 0;
+        wd_episodes_tr_ = 0; // the page's seasons are the first voice's
         quality_idx_ = 0;
         season_idx_ = 0;
         episode_idx_ = 0;
@@ -12480,6 +12623,7 @@ class Store final : public app::Concept
     TouchFrame touch_;
 #if defined(PS5_HOST_REFERENCE)
     TouchFrame host_touch_; // HDREZKA_HOST_KEYS's finger
+    float host_stick_y_ = 0.0f; // and its right stick ("rstick=")
 #endif
     // The player's controls.
     bool pl_controls_ = true;
@@ -12493,6 +12637,11 @@ class Store final : public app::Concept
     std::string pl_flash_text_;
     int pl_flash_side_ = 0;
     float pl_flash_left_ = 0.0f;
+    // The volume's plate (the right stick): seconds since the stick was let go
+    // (it fades out after 1.5), its fade, and whether a change awaits saving.
+    float pl_vol_idle_ = 10.0f;
+    tween::Spring pl_vol_in_;
+    bool pl_vol_dirty_ = false;
     bool pl_quality_open_ = false;
     bool pl_sub_open_ = false;
     int pl_sub_focus_ = 0;
@@ -12519,6 +12668,7 @@ class Store final : public app::Concept
     bool page_from_banner_ = false;
     int page_item_ = 0;
     int translator_idx_ = 0;
+    int wd_episodes_tr_ = 0; // the voice whose seasons the page's details hold
     int quality_idx_ = 0;
     int season_idx_ = 0;
     int episode_idx_ = 0;

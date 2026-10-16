@@ -491,10 +491,6 @@ audio_stop(void)
  * then asked for through sceSysmoduleLoadModule before the first dialog. The
  * structures are the IME dialog's as PS4 and PS5 share them (no sdkVersion in
  * it: that is the Vita's); its text is UTF-16. */
-int sceKernelLoadStartModule(const char *path, size_t argc, const void *argv, uint32_t flags,
-                             void *option, int *result);
-int sceKernelDlsym(int handle, const char *symbol, void **address);
-
 struct ime_dialog_param;
 struct ime_dialog_result;
 int sceSysmoduleLoadModule(uint16_t id);
@@ -717,24 +713,26 @@ keyboard_poll(char *out, size_t size)
    return 1;
 }
 
-/* The microphone (the DualSense's, or a headset's). libSceAudioIn is, like the
- * IME dialog, not among the modules a title starts with: it is loaded when
- * first asked for and its calls are looked up by name, so a console without it
- * costs a false. A thread of its own reads grains of 16 kHz mono 16-bit
- * samples into a buffer of MIC_MAX_SECONDS; mic_get_samples copies it out.
- * The call set is the PS4/PS5 one: sceAudioInOpen(user, type, index, grain,
- * freq, param), sceAudioInInput(port, dest) (blocks for one grain) and
- * sceAudioInClose. "sceAudioInRead" is tried as a second name for the read. */
+/* The microphone (the DualSense's, or a headset's). libSceAudioIn's calls are
+ * imported, as libSceAudioOut's are: the title's stub (ps5/stubs/, linked by
+ * tools/link-title.sh, since the SDK ships none) names libSceAudioIn.sprx for
+ * the system's loader, which a title's sandbox could not load by its path
+ * (ENOENT, 0x80020002). Like libSceAudioOut it is no sysmodule: no
+ * sceSysmoduleLoadModule before it. A thread of its own reads grains of 16 kHz
+ * mono 16-bit samples into a buffer of MIC_MAX_SECONDS; mic_get_samples copies
+ * it out. The call set is the PS4/PS5 one: sceAudioInOpen(user, type, index,
+ * grain, freq, param), sceAudioInInput(port, dest) (blocks for one grain) and
+ * sceAudioInClose. Every step goes to debug.log as "[DEBUG] mic: ...". */
 #define MIC_RATE 16000
 #define MIC_GRAIN 256
 #define MIC_MAX_SECONDS 20
 #define MIC_MAX_SAMPLES (MIC_RATE * MIC_MAX_SECONDS)
 
+int sceAudioInOpen(int32_t user, uint32_t type, uint32_t index, uint32_t grain, uint32_t freq, uint32_t param);
+int sceAudioInInput(int32_t port, void *dest);
+int sceAudioInClose(int32_t port);
+
 static struct {
-   bool looked_up, available;
-   int (*open)(int32_t user, uint32_t type, uint32_t index, uint32_t grain, uint32_t freq, uint32_t param);
-   int (*input)(int32_t port, void *dest);
-   int (*close)(int32_t port);
    int32_t port;
    pthread_t thread;
    bool running_thread;
@@ -743,33 +741,19 @@ static struct {
 } mic = { .port = -1 };
 static int16_t mic_buffer[MIC_MAX_SAMPLES];
 
-static bool
-mic_look_up(void)
+static void
+mic_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static void
+mic_log(const char *format, ...)
 {
-   if (mic.looked_up)
-      return mic.available;
-   mic.looked_up = true;
-   const int module = sceKernelLoadStartModule("/system/common/lib/libSceAudioIn.sprx", 0, NULL, 0, NULL, NULL);
-   if (module < 0) {
-      say("mic: no libSceAudioIn (0x%08x)", (unsigned)module);
-      return false;
-   }
-   void *open = NULL, *input = NULL, *close = NULL;
-   if (sceKernelDlsym(module, "sceAudioInOpen", &open) < 0 || !open ||
-       sceKernelDlsym(module, "sceAudioInClose", &close) < 0 || !close) {
-      say("mic: libSceAudioIn has no Open/Close");
-      return false;
-   }
-   if ((sceKernelDlsym(module, "sceAudioInInput", &input) < 0 || !input) &&
-       (sceKernelDlsym(module, "sceAudioInRead", &input) < 0 || !input)) {
-      say("mic: libSceAudioIn has no sceAudioInInput / sceAudioInRead");
-      return false;
-   }
-   mic.open = (int (*)(int32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))open;
-   mic.input = (int (*)(int32_t, void *))input;
-   mic.close = (int (*)(int32_t))close;
-   mic.available = true;
-   return true;
+   char line[256];
+   va_list args;
+   va_start(args, format);
+   vsnprintf(line, sizeof(line), format, args);
+   va_end(args);
+   say("mic: %s", line);
+   if (console_write_log)
+      console_write_log("[DEBUG] mic: %s\n", line);
 }
 
 static void *
@@ -777,16 +761,31 @@ mic_main(void *unused)
 {
    (void)unused;
    static int16_t grain[MIC_GRAIN] __attribute__((aligned(64)));
+   unsigned grains = 0;
+   int peak = 0;
    while (atomic_load(&mic.recording)) {
-      if (mic.input(mic.port, grain) < 0) {
-         say("mic: read failed");
+      const int got = sceAudioInInput(mic.port, grain);
+      if (got < 0) {
+         mic_log("sceAudioInInput(port %d) -> 0x%08x after %u grains: stopped", mic.port, (unsigned)got, grains);
          break;
       }
       unsigned at = atomic_load(&mic.count);
-      if (at + MIC_GRAIN > MIC_MAX_SAMPLES)
-         break; /* the buffer is full: what there is, is kept */
+      if (at + MIC_GRAIN > MIC_MAX_SAMPLES) {
+         mic_log("the buffer is full (%u samples): stopped", at);
+         break; /* what there is, is kept */
+      }
       memcpy(&mic_buffer[at], grain, sizeof(grain));
       atomic_store(&mic.count, at + MIC_GRAIN);
+      for (int i = 0; i < MIC_GRAIN; i++) {
+         const int v = grain[i] < 0 ? -grain[i] : grain[i];
+         if (v > peak)
+            peak = v;
+      }
+      /* Every second: the samples read and the loudest of them (0 is silence) */
+      if (++grains % (MIC_RATE / MIC_GRAIN) == 0) {
+         mic_log("read %u samples (sceAudioInInput -> 0x%08x), peak %d", at + MIC_GRAIN, (unsigned)got, peak);
+         peak = 0;
+      }
    }
    atomic_store(&mic.recording, false);
    return NULL;
@@ -795,27 +794,36 @@ mic_main(void *unused)
 bool
 mic_start_recording(void)
 {
-   if (mic.running_thread || !mic_look_up())
+   if (mic.running_thread) {
+      mic_log("start: already recording");
       return false;
+   }
    int32_t user = 0;
-   if (sceUserServiceGetInitialUser(&user) < 0)
+   const int got_user = sceUserServiceGetInitialUser(&user);
+   if (got_user < 0) {
+      mic_log("sceUserServiceGetInitialUser -> 0x%08x", (unsigned)got_user);
       return false;
+   }
    /* type 0: voice chat (the pad's microphone), index 0, S16 mono (param 0) */
-   mic.port = mic.open(user, 0, 0, MIC_GRAIN, MIC_RATE, 0);
+   mic.port = sceAudioInOpen(user, 0, 0, MIC_GRAIN, MIC_RATE, 0);
+   mic_log("sceAudioInOpen(user %d, type 0, index 0, grain %d, %d Hz, S16 mono) -> 0x%08x", user, MIC_GRAIN,
+           MIC_RATE, (unsigned)mic.port);
    if (mic.port < 0) {
-      say("mic: sceAudioInOpen 0x%08x", (unsigned)mic.port);
       mic.port = -1;
       return false;
    }
    atomic_store(&mic.count, 0);
    atomic_store(&mic.recording, true);
-   if (pthread_create(&mic.thread, NULL, mic_main, NULL) != 0) {
+   const int started = pthread_create(&mic.thread, NULL, mic_main, NULL);
+   if (started != 0) {
+      mic_log("pthread_create -> %d", started);
       atomic_store(&mic.recording, false);
-      (void)mic.close(mic.port);
+      mic_log("sceAudioInClose(port %d) -> 0x%08x", mic.port, (unsigned)sceAudioInClose(mic.port));
       mic.port = -1;
       return false;
    }
    mic.running_thread = true;
+   mic_log("recording on port %d", mic.port);
    return true;
 }
 
@@ -827,7 +835,8 @@ mic_stop_recording(void)
    atomic_store(&mic.recording, false);
    pthread_join(mic.thread, NULL);
    mic.running_thread = false;
-   (void)mic.close(mic.port);
+   mic_log("stopped: %u samples (%.1f s)", atomic_load(&mic.count), (double)atomic_load(&mic.count) / MIC_RATE);
+   mic_log("sceAudioInClose(port %d) -> 0x%08x", mic.port, (unsigned)sceAudioInClose(mic.port));
    mic.port = -1;
 }
 

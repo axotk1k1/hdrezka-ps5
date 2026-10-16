@@ -48,6 +48,11 @@ stub() {
 }
 stub libSceAgc vendor/ps5/sdk/stubs/agc_canary_link_stub.c
 stub libSceAgcDriver vendor/ps5/sdk/stubs/agc_driver_canary_link_stub.c
+# The microphone's libSceAudioIn, which the SDK has no stub for either: the
+# title's own (ps5/stubs/), named as the system's module is.
+cc -std=c11 -O2 -fPIC -c "$ps5/stubs/libSceAudioIn.c" -o "$work/link/obj/libSceAudioIn_stub.o"
+"$sdk/bin/prospero-lld" --shared -soname libSceAudioIn.sprx \
+    -o "$work/link/stubs/libSceAudioIn.so" "$work/link/obj/libSceAudioIn_stub.o"
 
 # shellcheck source=/dev/null
 source "$vulkan/tools/radv-link.sh"
@@ -115,7 +120,7 @@ fi
     "$work/link/stubs/libSceAgc.so" "$work/link/stubs/libSceAgcDriver.so" \
     "${radv_link_inputs[@]}" \
     "${pacbrew_libs[@]}" \
-    --as-needed "$sdk"/target/lib/*.so
+    --as-needed "$work/link/stubs/libSceAudioIn.so" "$sdk"/target/lib/*.so
 # A title whose localeconv is still the console's reads every glTF fraction as 0
 # (black materials, models scaled to nothing): refuse it here, not on the console
 if $platform_has_localeconv &&
@@ -131,7 +136,8 @@ fi
 null_imports=$(comm -23 \
     <("$sdk/bin/llvm-nm" -D --undefined-only "$work/link/llvm-pie.elf" |
         awk '$1 == "U" { sub(/@.*/, "", $2); print $2 }' | sort -u) \
-    <(for library in "$sdk"/target/lib/*.so "$work/link/stubs/libSceAgc.so" "$work/link/stubs/libSceAgcDriver.so"; do
+    <(for library in "$sdk"/target/lib/*.so "$work/link/stubs/libSceAgc.so" "$work/link/stubs/libSceAgcDriver.so" \
+            "$work/link/stubs/libSceAudioIn.so"; do
         case ${library##*/} in libkernel_sys.so | libScePosixForWebKit.so) continue ;; esac
         "$sdk/bin/llvm-nm" -D --defined-only "$library" 2>/dev/null | awk '{ print $NF }'
     done | sort -u))
@@ -142,7 +148,7 @@ if [[ -n $null_imports ]]; then
 fi
 "$tool" link --in "$work/link/llvm-pie.elf" --out "$work/eboot.elf.new" \
     --stub-dir "$sdk/target/lib" --stub "$work/link/stubs/libSceAgc.so" \
-    --stub "$work/link/stubs/libSceAgcDriver.so" --module-sdk 0x02000009 \
+    --stub "$work/link/stubs/libSceAgcDriver.so" --stub "$work/link/stubs/libSceAudioIn.so" --module-sdk 0x02000009 \
     --companion-sdk 0x08050001 --file-name eboot.elf
 
 # The title folder

@@ -62,6 +62,11 @@ public:
     // resampled to keep up (its pitch moves with it).
     void set_speed(double speed);
     double get_speed() const { return speed_.load(); }
+    // The sound's level, 0..1 (1 is the stream as decoded). The mixer applies
+    // it as the stream's gain where the samples leave the ring, so a change is
+    // heard at once rather than after the ~5 s the ring holds.
+    void set_volume(float v) { volume_.store(v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v); }
+    float volume() const { return volume_.load(); }
     // "Длительность буфера" and "Размер буфера потока" (0 bytes: the automatic
     // choice), for the next open: the demuxer reads that far ahead at most.
     void set_buffer_limits(double seconds, std::size_t bytes);
@@ -138,6 +143,7 @@ private:
     PacketQueue audio_packets_{640};
     std::atomic<bool> video_need_flush_{false};
     std::atomic<double> speed_{1.0};
+    std::atomic<float> volume_{1.0f};
     double buffer_seconds_ = 60.0;
     std::size_t buffer_bytes_ = 0;
     std::atomic<bool> eof_{false};

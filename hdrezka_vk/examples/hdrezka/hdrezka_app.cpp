@@ -1115,7 +1115,7 @@ bool parse_release(const std::string &json, UpdateInfo &info)
         const size_t url_at = json.find("\"browser_download_url\"", after);
         if (url_at == std::string::npos)
             break;
-        if (name == "eboot.bin") {
+        if (name.rfind(".zip") == name.length() - 4 || name.rfind(".pkg") == name.length() - 4) {
             info.url = json_text(json, "browser_download_url", url_at);
             const long long size = json_number(json, "size", after, url_at);
             if (size > 0)
@@ -2058,6 +2058,36 @@ void App::list_async(std::function<std::vector<CatalogItem>(Client &)> fetch, co
     });
 }
 
+void App::get_episodes_async(int movie_idx, const std::string &translator_id)
+{
+    const uint32_t serial = ++episodes_serial_;
+    ++episodes_loading;
+    BigThread([this, movie_idx, translator_id, serial]() {
+        struct Done {
+            std::atomic<int> &n;
+            ~Done() { --n; }
+        } done{episodes_loading};
+        VideoDetails det;
+        {
+            std::lock_guard<std::mutex> lock(catalog_mutex);
+            if (movie_idx < 0 || movie_idx >= static_cast<int>(movies.size())) return;
+            det = movies[movie_idx].details;
+        }
+        if (!det.is_series || det.id.empty()) return;
+        std::vector<Season> seasons;
+        client.get_episodes(det, translator_id, seasons);
+        write_log("[DEBUG] get_episodes_async movie=%d tr=%s seasons=%zu\n", movie_idx,
+                  translator_id.c_str(), seasons.size());
+        // A later voice's request wins over this one
+        if (episodes_serial_.load() != serial || seasons.empty()) return;
+        std::lock_guard<std::mutex> lock(catalog_mutex);
+        if (movie_idx < static_cast<int>(movies.size()) && movies[movie_idx].details.id == det.id) {
+            movies[movie_idx].details.seasons = std::move(seasons);
+            episodes_version++;
+        }
+    });
+}
+
 void App::load_details_async(int movie_idx)
 {
     details_requests++;
@@ -2818,7 +2848,7 @@ void App::play_stream(const std::string &title, const std::string &voice, const 
         if (mixer) {
             mixer->set_stream_gain(0, 0.0f, 0.1f);
             video_audio_live_ = mixer->swap_stream(1, &audio_ring);
-            mixer->set_stream_gain(1, 1.0f, 0.1f);
+            mixer->set_stream_gain(1, player.volume(), 0.1f);
         }
         is_playing = true;
         osd_timer = 4.0f;
@@ -3079,6 +3109,28 @@ void App::apply_settings()
     Client::set_ssl_bypass(s.bypass_ssl);
     if (player.is_open())
         player.set_speed(kPlaySpeeds[std::clamp(s.play_speed, 0, 7)]);
+    set_volume(static_cast<float>(std::clamp(s.volume, 0, 100)) / 100.0f);
+}
+
+void App::set_volume(float volume)
+{
+    player.set_volume(volume);
+    if (mixer)
+        mixer->set_stream_gain(1, player.volume(), 0.05f);
+}
+
+void App::save_volume()
+{
+    AppSettings next = settings_snapshot();
+    const int percent = static_cast<int>(std::lround(player.volume() * 100.0f));
+    if (next.volume == percent)
+        return;
+    next.volume = percent;
+    std::lock_guard<std::mutex> lock(settings_mutex_);
+    settings_ = next;
+    const std::string path = data_file_path(client.get_cookie_file(), "settings.cfg");
+    if (!settings_.save(path))
+        write_log("[DEBUG] settings: cannot write %s\n", path.c_str());
 }
 
 bool App::hidden_by_filter(const std::string &info)

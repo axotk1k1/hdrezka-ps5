@@ -160,7 +160,8 @@ file(GLOB PS5_SCE_SYS_FILES CONFIGURE_DEPENDS
 add_custom_command(
 	OUTPUT ${CMAKE_BINARY_DIR}/eboot.elf
 	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tools/link-title.sh ${CMAKE_BINARY_DIR} ${PS5_VULKAN_DIR} ${PS5_PAYLOAD_SDK} "$<TARGET_OBJECTS:samples>"
-	DEPENDS samples "$<TARGET_OBJECTS:samples>" ${CMAKE_CURRENT_SOURCE_DIR}/tools/link-title.sh ${PS5_SCE_SYS_FILES}
+	DEPENDS samples "$<TARGET_OBJECTS:samples>" ${CMAKE_CURRENT_SOURCE_DIR}/tools/link-title.sh
+		${CMAKE_CURRENT_SOURCE_DIR}/stubs/libSceAudioIn.c ${PS5_SCE_SYS_FILES}
 	COMMAND_EXPAND_LISTS
 	VERBATIM)
 add_custom_target(title ALL DEPENDS ${CMAKE_BINARY_DIR}/eboot.elf)

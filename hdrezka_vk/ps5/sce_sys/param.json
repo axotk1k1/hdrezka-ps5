@@ -10,7 +10,7 @@
   "conceptId": "99380",
   "contentBadgeType": 1,
   "contentId": "UP9000-PPSA99380_00-HDREZKA000000000",
-  "contentVersion": "01.000.000",
+  "contentVersion": "01.002.000",
   "downloadDataSize": 256,
   "gameIntent": {
     "permittedIntents": [
@@ -31,7 +31,7 @@
       "titleName": "HDRezka"
     }
   },
-  "masterVersion": "01.00",
+  "masterVersion": "01.02",
   "pubtools": {
     "creationDate": "2026-10-09 00:00:00",
     "loudnessSnd0": "-28.00",
