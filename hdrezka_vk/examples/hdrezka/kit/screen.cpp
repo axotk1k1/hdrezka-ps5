@@ -763,6 +763,26 @@ class Store final : public app::Concept
             pl_scrub_ = false;
         }
     }
+    // Circle leaves the player in two presses: the first brings the controls
+    // up (if they were down) with "Нажмите ○ ещё раз, чтобы выйти" for three
+    // seconds; a second within them stops the playback.
+    void pl_back(rezka::App &app, app::Feedback &feedback)
+    {
+        write_log("[DEBUG] player back: %s (controls=%d, %.2f s left)\n",
+                  pl_exit_left_ > 0.0f ? "leaving" : "asking to confirm", (int)pl_controls_, pl_exit_left_);
+        if (pl_exit_left_ > 0.0f)
+        {
+            pl_exit_left_ = 0.0f;
+            app.stop_playback();
+            feedback.play(audio::Cue::back);
+            return;
+        }
+        if (!pl_controls_)
+            pl_show(true);
+        pl_timer_ = 4.0f;
+        pl_exit_left_ = kPlExitSeconds;
+        feedback.play(audio::Cue::focus);
+    }
     void pl_flash(int icon, const std::string &text, int side)
     {
         pl_flash_icon_ = icon;
@@ -823,6 +843,8 @@ class Store final : public app::Concept
             pl_vol_in_.target = pl_vol_idle_ < 1.5f ? 1.0f : 0.0f;
             pl_vol_in_.update(dt, omega(10.0f));
         }
+        // Circle's confirmation runs out: the hint goes, the controls hide as usual
+        pl_exit_left_ = std::max(0.0f, pl_exit_left_ - dt);
 
         if (app.is_buffering && !app.is_playing)
         {
@@ -835,6 +857,7 @@ class Store final : public app::Concept
             pl_timer_ = 4.0f;
             pl_quality_open_ = false;
             pl_sub_open_ = false;
+            pl_exit_left_ = 0.0f; // a new stream asks again
             return;
         }
         const double position = app.player.get_position();
@@ -937,10 +960,7 @@ class Store final : public app::Concept
         if (!pl_controls_)
         {
             if (input.is_pressed(Action::back))
-            {
-                app.stop_playback();
-                feedback.play(audio::Cue::back);
-            }
+                pl_back(app, feedback);
             else if (input.is_pressed(Action::confirm))
             {
                 app.player.toggle_pause();
@@ -994,8 +1014,7 @@ class Store final : public app::Concept
         }
         if (input.is_pressed(Action::back))
         {
-            app.stop_playback();
-            feedback.play(audio::Cue::back);
+            pl_back(app, feedback);
             return;
         }
         int at = 0;
@@ -1153,6 +1172,33 @@ class Store final : public app::Concept
         list.pop_opacity();
     }
 
+    // "Нажмите ○ ещё раз, чтобы выйти": a dark pill in the screen's centre, the
+    // Circle drawn as the pad's coral ring (the font has no ○); it fades out
+    // over the confirmation's last quarter second.
+    void pl_draw_exit_hint(gfx::DrawList &list, float cy = kHeight * 0.5f) const
+    {
+        const float dp = kTvDp;
+        const float size = 18.0f * dp, line = 24.0f * dp;
+        const char *before = "Нажмите ";
+        const char *after = " ещё раз, чтобы выйти";
+        const float ring = 20.0f * dp;
+        const float w_before = tv_medium().measure(before, size, 0.3f * dp);
+        const float w_after = tv_medium().measure(after, size, 0.3f * dp);
+        const float pad = 28.0f * dp;
+        const float w = pad * 2.0f + w_before + ring + 8.0f * dp + w_after;
+        const float h = 64.0f * dp;
+        const Rect pill{(kWidth - w) * 0.5f, cy - h * 0.5f, w, h};
+        list.push_opacity(tween::clamp01(pl_exit_left_ * 4.0f));
+        list.rounded_rect(pill, h * 0.5f, kBlack.with_alpha(0.7f));
+        float x = pill.x + pad;
+        const float ty = pill.cy() - line * 0.5f;
+        x += tv_text(list, tv_medium(), before, x, ty, size, line, kWhite, gfx::Align::left, 0.3f * dp);
+        list.ring(x + 4.0f * dp + ring * 0.5f, pill.cy(), ring * 0.5f, 3.0f * dp, tv_hero_red());
+        x += ring + 8.0f * dp;
+        tv_text(list, tv_medium(), after, x, ty, size, line, kWhite, gfx::Align::left, 0.3f * dp);
+        list.pop_opacity();
+    }
+
     void draw_player(app::Frame &frame) const
     {
         auto &app = rezka::App::instance();
@@ -1168,6 +1214,11 @@ class Store final : public app::Concept
         if (!has_frame)
         {
             pl_spinner(frame.scene);
+            // While the stream catches up, the volume and Circle's hint still answer
+            if (pl_vol_in_.value > 0.01f)
+                pl_draw_volume(list);
+            if (pl_exit_left_ > 0.0f)
+                pl_draw_exit_hint(list, kHeight * 0.5f + 100.0f * kTvDp); // under the spinner
             return;
         }
         float vw = static_cast<float>(app.player.get_width());
@@ -1289,6 +1340,8 @@ class Store final : public app::Concept
 
         if (pl_vol_in_.value > 0.01f)
             pl_draw_volume(list);
+        if (pl_exit_left_ > 0.0f)
+            pl_draw_exit_hint(list);
 
         if (pl_sub_open_)
         {
@@ -6742,9 +6795,15 @@ class Store final : public app::Concept
         list.gradient_rect({back.x - kTvSlide, b.y + b.h - fall * 0.4f, far - back.x + kTvSlide, fall * 0.4f + 1.0f}, 0.0f, none,
                            page);
         list.rounded_rect({back.x - kTvSlide, b.y + b.h, far - back.x + kTvSlide, kTvHeroGap}, 0.0f, page);
-        // The top: a light shade under the tabs, the chips and the clock
-        list.gradient_rect({back.x - kTvSlide, back.y - 1.0f, far - back.x + kTvSlide, kTvGridTop + kTvGridPad}, 0.0f,
-                           kBlack.with_alpha(0.45f), kBlack.with_alpha(0.0f));
+        // The top: the page's colour, 85% down to the chips' top, falling to
+        // nothing a little under them, so a poster's own lettering there
+        // (titles are often printed at the top) sinks behind the tabs, the
+        // chips and the clock. A second layer from the very top deepens it
+        // without a step anywhere (each layer is continuous on its own).
+        const float shade_w = far - back.x + kTvSlide;
+        list.rounded_rect({back.x - kTvSlide, back.y - 1.0f, shade_w, 141.0f}, 0.0f, page.with_alpha(0.85f));
+        list.gradient_rect({back.x - kTvSlide, back.y + 140.0f, shade_w, 180.0f}, 0.0f, page.with_alpha(0.85f), none);
+        list.gradient_rect({back.x - kTvSlide, back.y - 1.0f, shade_w, 261.0f}, 0.0f, page.with_alpha(0.6f), none);
         list.pop_clip();
     }
 
@@ -12666,6 +12725,9 @@ class Store final : public app::Concept
     float pl_vol_idle_ = 10.0f;
     tween::Spring pl_vol_in_;
     bool pl_vol_dirty_ = false;
+    // Seconds left in which a second Circle leaves the player (0: none asked)
+    static constexpr float kPlExitSeconds = 3.0f;
+    float pl_exit_left_ = 0.0f;
     bool pl_quality_open_ = false;
     bool pl_sub_open_ = false;
     int pl_sub_focus_ = 0;

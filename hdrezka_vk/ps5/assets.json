@@ -260,7 +260,7 @@
       "author": "Google",
       "licence": "Apache-2.0",
       "url": "https://github.com/google/material-design-icons",
-      "changes": "rasterised at 96 px, white on transparent, packed in one strip; the last two are HDrezkaTV 1.4.0's ic_prem_translator and ic_ad vector drawables, fitted into the cell as Compose's Icon fits them",
+      "changes": "rasterised at 96 px, white on transparent, packed in one strip; the first seven (the drawer: circle-user-round, search, house, sparkles, film, bell, settings) are Lucide's outline icons (https://lucide.dev, ISC licence, Copyright (c) Lucide Contributors) drawn at a 1.75 stroke; the last two are HDrezkaTV 1.4.0's ic_prem_translator and ic_ad vector drawables, fitted into the cell as Compose's Icon fits them",
       "licence_file": "licenses/Apache-2.0.txt"
     },
     {
