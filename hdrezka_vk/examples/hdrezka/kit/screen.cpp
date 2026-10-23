@@ -4731,7 +4731,7 @@ class Store final : public app::Concept
     // update check under it), with this title's own links: the version row
     // checks for an update, the channel and the donation open their QR codes.
     static constexpr StDef kStAboutItems[] = {
-        {kStAppInfo, kStAction, "HDrezka homebrew for PS5", "Версия: 1.0.2", kTvIconInfoOutlined},
+        {kStAppInfo, kStAction, "HDrezka homebrew for PS5", "Версия: 1.0.3", kTvIconInfoOutlined},
         {kStAutoUpdate, kStSwitch, "Автоматическая проверка обновлений", "Проверять наличие обновлений при запуске приложения",
          kTvIconBrowserUpdated},
         {kStTelegram, kStAction, "Telegram канал", "t.me/hdrezkaps5", kTvIconSend},

@@ -528,7 +528,10 @@ struct ime_dialog_result {
 };
 #define IME_OPTION_PASSWORD 0x00000004u
 #define IME_OPTION_NO_AUTO_CAPITALIZATION 0x00000002u
-#define IME_OPTION_NO_LEARNING 0x00000040u
+/* 0x40 is the SDK's fixed-position bit (no learning is 0x20); the text's
+ * dialog has always been opened with it */
+#define IME_OPTION_FIXED_POSITION 0x00000040u
+#define IME_TYPE_BASIC_LATIN 1
 #define IME_DIALOG_FINISHED 2
 
 static struct {
@@ -662,7 +665,7 @@ keyboard_open(const char *title, const char *text, bool password, int max_chars)
    }
    utf8_to_utf16(text, ime.text, sizeof(ime.text) / sizeof(ime.text[0]));
    utf8_to_utf16(title, ime.title, sizeof(ime.title) / sizeof(ime.title[0]));
-   param.option = IME_OPTION_NO_AUTO_CAPITALIZATION | IME_OPTION_NO_LEARNING | (password ? IME_OPTION_PASSWORD : 0);
+   param.option = IME_OPTION_NO_AUTO_CAPITALIZATION | IME_OPTION_FIXED_POSITION;
    const int capacity = (int)(sizeof(ime.text) / sizeof(ime.text[0])) - 1;
    param.max_text_length = (uint32_t)(max_chars > 0 && max_chars < capacity ? max_chars : capacity);
    param.input_text_buffer = ime.text;
@@ -671,8 +674,23 @@ keyboard_open(const char *title, const char *text, bool password, int max_chars)
    param.pos_y = 1080.0f / 2.0f;
    param.horizontal_alignment = 1; /* centred on the position */
    param.vertical_alignment = 1;
-   const int result = ime.init(&param, NULL);
-   ime_log("sceImeDialogInit(user %d, max %u) -> 0x%08x", param.user_id, param.max_text_length, (unsigned)result);
+   int result = -1;
+   if (password) {
+      /* A masked field: basic Latin, no other option beside it (the text's
+       * set with the password bit was refused, 0x80bc0030 invalid param) */
+      struct ime_dialog_param masked = param;
+      masked.type = IME_TYPE_BASIC_LATIN;
+      masked.option = IME_OPTION_PASSWORD | IME_OPTION_NO_AUTO_CAPITALIZATION;
+      result = ime.init(&masked, NULL);
+      ime_log("sceImeDialogInit(user %d, max %u, masked) -> 0x%08x", param.user_id, param.max_text_length,
+              (unsigned)result);
+   }
+   if (result < 0) {
+      /* As the text's: the console's keyboard shows it, the app's field hides it */
+      result = ime.init(&param, NULL);
+      ime_log("sceImeDialogInit(user %d, max %u) -> 0x%08x", param.user_id, param.max_text_length,
+              (unsigned)result);
+   }
    if (result < 0)
       return false;
    ime.open = true;

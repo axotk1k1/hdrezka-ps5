@@ -178,6 +178,15 @@ uint8_t *TextureLoader::decode_image_rgba(const uint8_t *data, size_t size, int 
     return stbi_load_from_memory(data, static_cast<int>(size), w, h, &channels, 4);
 }
 
+bool TextureLoader::inflate_raw(const uint8_t *data, size_t size, std::vector<uint8_t> &out)
+{
+    if (!data || size > 0x7fffffff || out.empty() || out.size() > 0x7fffffff)
+        return false;
+    const int n = stbi_zlib_decode_noheader_buffer(reinterpret_cast<char *>(out.data()), static_cast<int>(out.size()),
+                                                   reinterpret_cast<const char *>(data), static_cast<int>(size));
+    return n == static_cast<int>(out.size());
+}
+
 uint8_t *TextureLoader::load_file_rgba(const char *path, int *w, int *h)
 {
     if (!path || !w || !h) return nullptr;

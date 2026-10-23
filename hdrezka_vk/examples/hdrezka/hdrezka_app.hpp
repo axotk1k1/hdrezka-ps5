@@ -24,7 +24,7 @@ namespace rezka
 {
 
 // The title's version: what the updater compares GitHub's releases with.
-inline constexpr const char *kAppVersion = "1.0.2";
+inline constexpr const char *kAppVersion = "1.0.3";
 // The releases of the title (Настройки → О приложении, the updater).
 inline constexpr const char *kUpdateRepo = "axotk1k1/hdrezka-ps5";
 
@@ -358,6 +358,8 @@ public:
     AppSettings settings_snapshot();
     // Keeps the new preferences, saves them and applies what they change at once.
     void update_settings(const AppSettings &next);
+    // Writes the current preferences to settings.cfg in the writable data folder.
+    bool save_settings();
     // The player's volume (0..1, the right stick): heard at once; save_volume
     // keeps it in settings.cfg (once the stick is let go, not every frame).
     void set_volume(float volume);

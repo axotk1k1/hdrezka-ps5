@@ -36,6 +36,8 @@ public:
     static uint8_t *decode_image_rgba(const uint8_t *data, size_t size, int *w, int *h);
     static uint8_t *load_file_rgba(const char *path, int *w, int *h);
     static void free_decoded_image(uint8_t *pixels);
+    // Raw deflate (a zip entry, method 8) into out's size; false when it does not fill it.
+    static bool inflate_raw(const uint8_t *data, size_t size, std::vector<uint8_t> &out);
 
     static void destroy_texture(vks::VulkanDevice *device, TextureResource &tex);
 };

@@ -15,28 +15,101 @@
 
 namespace
 {
-// A file kept beside the others in the data folder (continue.txt, favorites.txt).
-std::string data_file_path(const std::string &cookie_file, const std::string &name)
+// The files the app changes; /app0 is read-only on the console, so they live
+// in the first data folder that takes a write.
+const char *const kDataFiles[] = {"settings.cfg", "cookies.txt", "continue.txt", "favorites.txt",
+                                  "search_history.txt"};
+
+bool folder_writable(const std::string &folder)
 {
-    if (!cookie_file.empty()) {
-        const auto slash = cookie_file.find_last_of("/\\");
-        if (slash != std::string::npos)
-            return cookie_file.substr(0, slash + 1) + name;
+    if (!folder.empty())
+        mkdir(folder.substr(0, folder.size() - 1).c_str(), 0777);
+    const std::string probe = folder + ".rw_probe";
+    FILE *f = fopen(probe.c_str(), "wb");
+    if (!f)
+        return false;
+    const bool ok = fputc('1', f) != EOF;
+    fclose(f);
+    remove(probe.c_str());
+    return ok;
+}
+
+bool copy_file(const std::string &from, const std::string &to)
+{
+    FILE *in = fopen(from.c_str(), "rb");
+    if (!in)
+        return false;
+    FILE *out = fopen(to.c_str(), "wb");
+    if (!out) {
+        fclose(in);
+        return false;
     }
-    const std::string folders[] = {
-        "/app0/data/",
-        "/data/homebrew/PPSA99380/data/",
-        "/mnt/usb0/homebrew/PPSA99380/data/",
-        "data/",
-    };
-    for (const std::string &folder : folders) {
-        FILE *f = fopen((folder + name).c_str(), "ab");
-        if (f) {
-            fclose(f);
-            return folder + name;
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+        fwrite(buf, 1, n, out);
+    fclose(in);
+    return fclose(out) == 0;
+}
+
+struct DataFolder {
+    std::string path; // ends with '/', or empty for the working folder
+    bool writable = false;
+};
+
+// Picked once: the first writable folder; a file it lacks is copied in from an
+// older folder (an earlier build's homebrew data, then the package's defaults).
+const DataFolder &data_folder()
+{
+    static const DataFolder folder = [] {
+        const char *candidates[] = {
+#if defined(PS5_HOST_REFERENCE)
+            "data/",
+            "",
+#else
+            "/download0/data/",
+            "/data/homebrew/PPSA99380/data/",
+            "/mnt/usb0/homebrew/PPSA99380/data/",
+            "/mnt/usb1/homebrew/PPSA99380/data/",
+#endif
+        };
+        DataFolder found;
+        for (const char *c : candidates) {
+            if (folder_writable(c)) {
+                found.path = c;
+                found.writable = true;
+                break;
+            }
         }
-    }
-    return name;
+        if (!found.writable)
+            found.path = candidates[0];
+        const char *seeds[] = {
+            "/data/homebrew/PPSA99380/data/",
+            "/mnt/usb0/homebrew/PPSA99380/data/",
+            "/app0/data/",
+        };
+        for (const char *name : kDataFiles) {
+            const std::string target = found.path + name;
+            if (!found.writable || access(target.c_str(), F_OK) == 0)
+                continue;
+            for (const char *seed : seeds) {
+                if (found.path == seed)
+                    continue;
+                if (copy_file(std::string(seed) + name, target)) {
+                    write_log("[DEBUG] data: %s copied from %s\n", name, seed);
+                    break;
+                }
+            }
+        }
+        return found;
+    }();
+    return folder;
+}
+
+// A file in the writable data folder (settings.cfg, continue.txt, favorites.txt).
+std::string data_file_path(const std::string & /*cookie_file*/, const std::string &name)
+{
+    return data_folder().path + name;
 }
 
 // A request the player is waiting on: the poster worker stands aside for it.
@@ -78,27 +151,14 @@ void App::init(vks::VulkanDevice *dev, VkQueue q, hui::gfx::VkRenderer *rend, hu
     renderer = rend;
     mixer = mix;
 
-    // Detect cookies file
-    const char *cookie_paths[] = {
-        "/app0/data/cookies.txt",
-        "/data/homebrew/PPSA99380/data/cookies.txt",
-        "/mnt/usb0/homebrew/PPSA99380/data/cookies.txt",
-        "/mnt/usb1/homebrew/PPSA99380/data/cookies.txt",
-        "data/cookies.txt",
-        "./data/cookies.txt",
-        "../data/cookies.txt",
-        "/home/axotn1k1/vscode/hdrezka-ps5/data/cookies.txt"
-    };
-    for (const char *cp : cookie_paths) {
-        if (access(cp, R_OK) == 0) {
-            client.set_cookie_file(cp);
-            break;
-        }
-    }
+    // Every file the app changes lives in the writable data folder
+    client.set_cookie_file(data_file_path("", "cookies.txt"));
 
     player.set_audio_ring(&audio_ring);
     {
         const std::string path = data_file_path(client.get_cookie_file(), "settings.cfg");
+        write_log("[DEBUG] settings path: %s (writable=%d)\n", path.c_str(),
+                  data_folder().writable ? 1 : 0);
         std::lock_guard<std::mutex> lock(settings_mutex_);
         const bool loaded = settings_.load(path);
         write_log("[DEBUG] settings %s %s\n", loaded ? "loaded from" : "default, no", path.c_str());
@@ -116,32 +176,13 @@ void App::init(vks::VulkanDevice *dev, VkQueue q, hui::gfx::VkRenderer *rend, hu
                   vi && vi->version ? vi->version : "?",
                   vi && vi->ssl_version ? vi->ssl_version : "none");
     }
-    write_log("[DEBUG] App::init cookie file: '%s'\n", client.get_cookie_file().c_str());
+    write_log("[DEBUG] App::init cookie file: %s\n", client.get_cookie_file().c_str());
 
     init_defaults();
     write_log("[DEBUG] App::init init_defaults done\n");
     {
         std::lock_guard<std::mutex> lock(catalog_mutex);
         catalog_status = "Завантаження каталогу HDRezka...";
-    }
-
-    if (client.get_cookie_file().empty()) {
-        const char *writable[] = {
-            "/download0/cookies.txt",
-            "/data/homebrew/PPSA99380/data/cookies.txt",
-            "/mnt/usb0/homebrew/PPSA99380/data/cookies.txt",
-#if defined(PS5_HOST_REFERENCE)
-            "cookies.txt", // the reference build: in its title folder
-#endif
-        };
-        for (const char *cp : writable) {
-            FILE *f = fopen(cp, "ab");
-            if (f) {
-                fclose(f);
-                client.set_cookie_file(cp);
-                break;
-            }
-        }
     }
 
     // The disk cache: beside the cookies (the data folder), else the first
@@ -1099,13 +1140,21 @@ int compare_versions(const std::string &a, const std::string &b)
     return 0;
 }
 
-// GitHub's release: tag_name, body, and the asset named eboot.bin (its size,
-// its digest "sha256:…" when GitHub states one, its download address).
+bool ends_with(const std::string &s, const char *tail)
+{
+    const size_t n = strlen(tail);
+    return s.size() >= n && s.compare(s.size() - n, n, tail) == 0;
+}
+
+// GitHub's release: tag_name, body, and the asset to install (its size, its
+// digest "sha256:…" when GitHub states one, its download address): eboot.bin
+// itself, else another .bin, else a .zip that eboot.bin is taken out of.
 bool parse_release(const std::string &json, UpdateInfo &info)
 {
     info = {};
     info.version = json_text(json, "tag_name");
     info.notes = json_text(json, "body");
+    int best = 0; // 3 eboot.bin, 2 *.bin, 1 *.zip
     for (size_t at = json.find("\"assets\""); at != std::string::npos;) {
         const size_t name_at = json.find("\"name\"", at);
         if (name_at == std::string::npos)
@@ -1115,8 +1164,15 @@ bool parse_release(const std::string &json, UpdateInfo &info)
         const size_t url_at = json.find("\"browser_download_url\"", after);
         if (url_at == std::string::npos)
             break;
-        if (name.rfind(".zip") == name.length() - 4 || name.rfind(".pkg") == name.length() - 4) {
+        std::string lower = name;
+        for (char &c : lower)
+            c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        const int rank = lower == "eboot.bin" ? 3 : ends_with(lower, ".bin") ? 2 : ends_with(lower, ".zip") ? 1 : 0;
+        if (rank > best) {
+            best = rank;
             info.url = json_text(json, "browser_download_url", url_at);
+            info.size = 0;
+            info.sha256.clear();
             const long long size = json_number(json, "size", after, url_at);
             if (size > 0)
                 info.size = static_cast<size_t>(size);
@@ -1124,7 +1180,6 @@ bool parse_release(const std::string &json, UpdateInfo &info)
             const size_t digest_at = json.find("\"digest\"", after);
             if (digest_at != std::string::npos && digest_at < url_at && digest.rfind("sha256:", 0) == 0)
                 info.sha256 = digest.substr(7);
-            break;
         }
         at = url_at + 1;
     }
@@ -1145,6 +1200,73 @@ bool parse_version_json(const std::string &json, UpdateInfo &info)
     if (size > 0)
         info.size = static_cast<size_t>(size);
     return !info.version.empty();
+}
+
+// A program the console runs: a plain ELF, or the SELF the build signs (4F 15 3D 1D).
+bool is_executable(const std::vector<uint8_t> &b)
+{
+    if (b.size() < 4)
+        return false;
+    return (b[0] == 0x7f && b[1] == 'E' && b[2] == 'L' && b[3] == 'F') ||
+           (b[0] == 0x4f && b[1] == 0x15 && b[2] == 0x3d && b[3] == 0x1d);
+}
+
+bool is_zip(const std::vector<uint8_t> &b)
+{
+    return b.size() >= 4 && b[0] == 'P' && b[1] == 'K' && b[2] == 3 && b[3] == 4;
+}
+
+// eboot.bin out of a release zip (stored or deflated); empty when it has none.
+std::vector<uint8_t> unzip_eboot(const std::vector<uint8_t> &zip)
+{
+    auto u16 = [&](size_t at) { return static_cast<uint32_t>(zip[at] | zip[at + 1] << 8); };
+    auto u32 = [&](size_t at) { return u16(at) | u16(at + 2) << 16; };
+    if (zip.size() < 22)
+        return {};
+    // The end record: within the last 64 KiB (its comment) of the file
+    size_t end = std::string::npos;
+    for (size_t i = zip.size() - 22;; --i) {
+        if (u32(i) == 0x06054b50) {
+            end = i;
+            break;
+        }
+        if (i == 0 || zip.size() - i > 22 + 0xffff)
+            break;
+    }
+    if (end == std::string::npos)
+        return {};
+    const uint32_t count = u16(end + 10);
+    size_t at = u32(end + 16);
+    for (uint32_t n = 0; n < count && at + 46 <= zip.size() && u32(at) == 0x02014b50; ++n) {
+        const uint32_t method = u16(at + 10), packed = u32(at + 20), size = u32(at + 24);
+        const uint32_t name_len = u16(at + 28), extra_len = u16(at + 30), comment_len = u16(at + 32);
+        const size_t local = u32(at + 42);
+        if (at + 46 + name_len > zip.size())
+            break;
+        std::string name(reinterpret_cast<const char *>(zip.data() + at + 46), name_len);
+        for (char &c : name)
+            c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        at += 46 + name_len + extra_len + comment_len;
+        if (name != "eboot.bin" && !ends_with(name, "/eboot.bin"))
+            continue;
+        if (local + 30 > zip.size() || u32(local) != 0x04034b50 || size == 0)
+            return {};
+        const size_t data = local + 30 + u16(local + 26) + u16(local + 28);
+        if (data + packed > zip.size())
+            return {};
+        std::vector<uint8_t> out;
+        if (method == 0 && packed == size) {
+            out.assign(zip.begin() + data, zip.begin() + data + size);
+        } else if (method == 8) {
+            out.resize(size);
+            if (!TextureLoader::inflate_raw(zip.data() + data, packed, out))
+                out.clear();
+        }
+        write_log("[DEBUG] updater: zip entry %s method=%u %u -> %zu bytes\n", name.c_str(), method, packed,
+                  out.size());
+        return out;
+    }
+    return {};
 }
 
 // Where the running title's eboot.bin is, writable: the new one goes there.
@@ -1260,13 +1382,33 @@ void App::download_update_async()
                                  std::to_string(info.size) + ")");
             return;
         }
-        if (!info.sha256.empty()) {
+        // The release's sum is for what was downloaded, or (stated in the notes) for eboot.bin
+        bool sum_ok = info.sha256.empty() || Client::sha256_hex(bytes.data(), bytes.size()) == info.sha256;
+        if (is_zip(bytes)) {
+            std::vector<uint8_t> eboot = unzip_eboot(bytes);
+            if (eboot.empty()) {
+                write_log("[DEBUG] updater: no eboot.bin in the zip %s\n", info.url.c_str());
+                set_update_state(UpdateState::install_failed,
+                                 "Для этой версии доступен только полный ZIP-архив, обновите вручную");
+                return;
+            }
+            bytes.swap(eboot);
+        }
+        if (!sum_ok) {
             const std::string sha = Client::sha256_hex(bytes.data(), bytes.size());
             if (sha != info.sha256) {
                 write_log("[DEBUG] updater: sha256 %s, expected %s\n", sha.c_str(), info.sha256.c_str());
                 set_update_state(UpdateState::install_failed, "Контрольная сумма обновления не совпадает");
                 return;
             }
+        }
+        // Never an archive or an error page over the running program
+        if (!is_executable(bytes)) {
+            write_log("[DEBUG] updater: not an executable (%02x %02x %02x %02x, %zu bytes), not installed\n",
+                      bytes.size() > 0 ? bytes[0] : 0, bytes.size() > 1 ? bytes[1] : 0,
+                      bytes.size() > 2 ? bytes[2] : 0, bytes.size() > 3 ? bytes[3] : 0, bytes.size());
+            set_update_state(UpdateState::install_failed, "Скачанный файл не является eboot.bin, обновите вручную");
+            return;
         }
         // Beside the running eboot.bin, then renamed over it in one step
         for (const std::string &target : update_targets()) {
@@ -3095,11 +3237,18 @@ void App::update_settings(const AppSettings &next)
     {
         std::lock_guard<std::mutex> lock(settings_mutex_);
         settings_ = next;
-        const std::string path = data_file_path(client.get_cookie_file(), "settings.cfg");
-        if (!settings_.save(path))
-            write_log("[DEBUG] settings: cannot write %s\n", path.c_str());
     }
+    save_settings();
     apply_settings();
+}
+
+bool App::save_settings()
+{
+    const std::string path = data_file_path(client.get_cookie_file(), "settings.cfg");
+    std::lock_guard<std::mutex> lock(settings_mutex_);
+    const int ok = settings_.save(path) ? 1 : 0;
+    write_log("[DEBUG] save_settings to '%s': success=%d\n", path.c_str(), ok);
+    return ok != 0;
 }
 
 void App::apply_settings()
@@ -3126,11 +3275,11 @@ void App::save_volume()
     if (next.volume == percent)
         return;
     next.volume = percent;
-    std::lock_guard<std::mutex> lock(settings_mutex_);
-    settings_ = next;
-    const std::string path = data_file_path(client.get_cookie_file(), "settings.cfg");
-    if (!settings_.save(path))
-        write_log("[DEBUG] settings: cannot write %s\n", path.c_str());
+    {
+        std::lock_guard<std::mutex> lock(settings_mutex_);
+        settings_ = next;
+    }
+    save_settings();
 }
 
 bool App::hidden_by_filter(const std::string &info)
