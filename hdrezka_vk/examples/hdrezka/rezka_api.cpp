@@ -392,6 +392,47 @@ void Client::set_ssl_bypass(bool on)
     g_ssl_bypass.store(on);
 }
 
+// A mirror a provider drops packets to fails in seconds instead of holding the
+// network's lock: the connection gets kConnectTimeout, a page kPageTimeout.
+static constexpr long kConnectTimeout = 5L;
+static constexpr long kPageTimeout = 8L;
+// A request slower than this is logged with its phases even when it succeeds.
+static constexpr long kSlowRequestMs = 5000;
+
+static long now_ms()
+{
+    return static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count());
+}
+
+// What a failed or slow request went through: the address it reached, the
+// time of DNS, TCP and TLS, curl's error and the HTTP status. A 403/503 or
+// Cloudflare's "Just a moment..." page is named as the protection's challenge.
+static void log_curl_diagnostics(CURL *curl, const char *what, const std::string &url, CURLcode rc,
+                                 const char *errbuf, long elapsed_ms, const std::string *body = nullptr)
+{
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    const bool challenge = http_code == 403 || http_code == 503 ||
+                           (body && body->find("<title>Just a moment...</title>") != std::string::npos);
+    if (challenge)
+        write_log("[DEBUG] Network: Cloudflare/DDoS protection challenge detected! (%s http=%ld)\n", url.c_str(),
+                  http_code);
+    if (rc == CURLE_OK && elapsed_ms <= kSlowRequestMs)
+        return;
+    char *ip = nullptr;
+    double dns = 0.0, connect = 0.0, tls = 0.0;
+    curl_easy_getinfo(curl, CURLINFO_PRIMARY_IP, &ip);
+    curl_easy_getinfo(curl, CURLINFO_NAMELOOKUP_TIME, &dns);
+    curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &connect);
+    curl_easy_getinfo(curl, CURLINFO_APPCONNECT_TIME, &tls);
+    write_log("[DEBUG] Network: %s %s %s after %ld ms: ip=%s dns=%.3fs connect=%.3fs tls=%.3fs "
+              "rc=%d (%s) err='%s' http=%ld\n",
+              what, rc == CURLE_OK ? "slow" : "FAILED", url.c_str(), elapsed_ms, ip && *ip ? ip : "-", dns,
+              connect, tls, (int)rc, curl_easy_strerror(rc), errbuf ? errbuf : "", http_code);
+}
+
 static void setup_curl_headers(CURL *curl, struct curl_slist **headers, const std::string &mirror, const std::string &cookie_file, bool is_post = false)
 {
     console_curl_setup(curl);
@@ -414,6 +455,7 @@ static void setup_curl_headers(CURL *curl, struct curl_slist **headers, const st
     curl_easy_setopt(curl, CURLOPT_USERAGENT, kBrowserAgent);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kConnectTimeout);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     const long verify = g_ssl_bypass.load() ? 0L : 1L;
@@ -570,12 +612,19 @@ bool Client::pick_mirror(bool force)
             disk_cache::write_note("last_mirror.txt", mirror_);
         return ok;
     };
-    if (!preferred.empty())
-        return verified(check_mirror(preferred));
+    if (!preferred.empty()) {
+        // The mirror chosen by hand stays the mirror even when it does not
+        // answer now: no other one is put in its place.
+        const bool ok = check_mirror(preferred);
+        if (!ok) {
+            std::lock_guard<std::recursive_mutex> lock(net_mu_);
+            set_mirror(preferred);
+        }
+        return verified(ok);
+    }
     static const char *known[] = {
-        "https://hdrezka.ag",
-        "https://rezka.ag",
-        "https://hdrezka.me",
+        "https://hdrezka.ag",   "https://rezka.ag",    "https://hdrezka.me",  "https://hdrezka.tv",
+        "https://hdrezka.co",   "https://hdrezka.club", "https://hdrezka.net", "https://hdrezka.org",
         "https://hdrezka-home.tv",
     };
     // The one that answered last time first, then the others
@@ -586,20 +635,24 @@ bool Client::pick_mirror(bool force)
     for (const char *k : known)
         if (k != last)
             candidates.push_back(k);
+    const long search_started = now_ms();
     for (const std::string &candidate : candidates) {
         std::lock_guard<std::recursive_mutex> lock(net_mu_);
         set_mirror(candidate);
         write_log("[DEBUG] pick_mirror trying %s\n", candidate.c_str());
+        const long started = now_ms();
         const std::string html = http_get("/films/?filter=popular");
         const bool ok = html.find("class=\"b-content__inline_item\"") != std::string::npos;
-        write_log("[DEBUG] pick_mirror %s -> %zu bytes, catalog %s (mirror now %s)\n",
-                  candidate.c_str(), html.size(), ok ? "found" : "missing", mirror_.c_str());
+        write_log("[DEBUG] pick_mirror %s -> %zu bytes in %ld ms, catalog %s (mirror now %s)\n",
+                  candidate.c_str(), html.size(), now_ms() - started, ok ? "found" : "missing", mirror_.c_str());
         if (!ok && !html.empty()) {
             write_log("[DEBUG] pick_mirror head: %.300s\n", html.c_str());
         }
         if (ok)
             return verified(true);
     }
+    write_log("[DEBUG] Network: pick_mirror: none of %zu mirrors answered with a catalog in %ld ms\n",
+              candidates.size(), now_ms() - search_started);
     set_mirror("https://hdrezka.ag");
     return verified(false);
 }
@@ -677,8 +730,12 @@ bool Client::fetch_binary(const std::string &url, std::vector<uint8_t> &out_byte
     curl_easy_setopt(curl, CURLOPT_URL, full_url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_binary_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out_bytes);
+    char errbuf[CURL_ERROR_SIZE] = {0};
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
+    const long started = now_ms();
     CURLcode res = curl_easy_perform(curl);
+    log_curl_diagnostics(curl, "GET binary", full_url, res, errbuf, now_ms() - started);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
@@ -710,13 +767,18 @@ std::string Client::http_get(const std::string &url)
     curl_easy_setopt(curl, CURLOPT_URL, full_url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    // The mirror's check and the lists are pages: they answer in seconds or not at all
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, kPageTimeout);
 
     write_log("[DEBUG] http_get perform %s\n", full_url.c_str());
+    const long started = now_ms();
     CURLcode res = curl_easy_perform(curl);
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     write_log("[DEBUG] http_get done rc=%d (%s) http=%ld bytes=%zu err='%s'\n",
               (int)res, curl_easy_strerror(res), http_code, response.size(), errbuf);
+    log_curl_diagnostics(curl, "GET", full_url, res, errbuf, now_ms() - started, &response);
+    net_failed_ = res != CURLE_OK;
     char *effective = nullptr;
     curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective);
     if (effective && strstr(effective, "http")) {
@@ -798,11 +860,13 @@ std::string Client::http_post(const std::string &url, const std::map<std::string
 
     write_log("[DEBUG] http_post perform %s fields: %s\n", full_url.c_str(), post_data.c_str());
     write_log("[DEBUG] http_post before curl_easy_perform (post_len=%zu)\n", post_data.size());
+    const long started = now_ms();
     CURLcode res = curl_easy_perform(curl);
     long post_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &post_code);
     write_log("[DEBUG] http_post after curl_easy_perform rc=%d (%s) http=%ld err='%s'\n",
               (int)res, curl_easy_strerror(res), post_code, errbuf);
+    log_curl_diagnostics(curl, "POST", full_url, res, errbuf, now_ms() - started, &response);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 

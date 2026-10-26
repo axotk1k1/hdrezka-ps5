@@ -418,6 +418,9 @@ public:
     std::string preferred_mirror() const;
     // Whether `mirror` answers with a catalog page; it becomes the mirror when it does.
     bool check_mirror(const std::string &mirror);
+    // Whether the last page request failed in the network (DNS, connection,
+    // timeout) rather than answering: an empty list is then not "nothing found".
+    bool network_failed() const { return net_failed_; }
     // "Включить обход SSL": no certificate check when on (every Client).
     static void set_ssl_bypass(bool on);
 
@@ -437,6 +440,7 @@ public:
 private:
     bool cache_only_ = false;
     std::atomic<time_t> mirror_verified_at_{0}; // when pick_mirror last saw mirror_ answer
+    std::atomic<bool> net_failed_{false};
     std::string mirror_{"https://hdrezka.ag"};
     mutable std::mutex preferred_mu_;
     std::string preferred_mirror_;

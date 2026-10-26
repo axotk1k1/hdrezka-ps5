@@ -26,13 +26,29 @@ inline constexpr SettingChoice kAnimNavDrawerChoices[] = {
     {"ScreenSliding", "Сдвиг экрана"},
     {"ScreenShrinking", "Сжатие экрана"},
 };
-// Подключение и предпочтения. "Свой домен" is this port's: the app has the
-// two mirrors only, a console has no other way to reach a third.
+// Раздел в меню PS5: where the console's home screen files the title (its
+// param.json's applicationCategoryType, rewritten on change).
+inline constexpr SettingChoice kAppCategoryChoices[] = {
+    {"Media", "Мультимедиа"},
+    {"Game", "Игры"},
+};
+inline constexpr int kAppCategoryMedia = 0;
+// Подключение и предпочтения. The mirrors past hdrezka.ag and "Свой домен"
+// are this port's: a console has no other way to reach another one. A mirror's
+// label is its domain (mirror() makes the address of it).
 inline constexpr SettingChoice kSourceChoices[] = {
-    {"Default", "По умолчанию"},
+    {"Default", "Авто"},
     {"Hdrezka", "hdrezka.ag"},
+    {"RezkaAg", "rezka.ag"},
+    {"HdrezkaMe", "hdrezka.me"},
+    {"HdrezkaTv", "hdrezka.tv"},
+    {"HdrezkaCo", "hdrezka.co"},
+    {"HdrezkaClub", "hdrezka.club"},
+    {"HdrezkaNet", "hdrezka.net"},
+    {"HdrezkaOrg", "hdrezka.org"},
     {"Custom", "Свой домен…"},
 };
+inline constexpr int kSourceCustom = 9;
 // Плеер
 inline constexpr SettingChoice kVideoQualityChoices[] = {
     {"QualityAskAlways", "Всегда спрашивать"},
@@ -123,6 +139,7 @@ struct AppSettings
     bool show_clock = true;           // isShowClock
     bool rainbow_progress = false;    // isRainbowProgressBar
     int anim_nav_drawer = 0;          // animNavDrawer: kAnimNavDrawerChoices
+    int app_category = 1;             // appCategory: kAppCategoryChoices, Game as the package is built
     // Подключение и предпочтения
     int source = 0;                   // source: kSourceChoices
     std::string custom_mirror;        // source=Custom: "https://…"
@@ -150,11 +167,32 @@ struct AppSettings
     // The mirror the source names; empty for the default (probe the known ones).
     std::string mirror() const
     {
-        if (source == 1)
-            return "https://hdrezka.ag";
-        if (source == 2)
+        if (source == kSourceCustom)
             return custom_mirror;
+        if (source > 0 && source < kSourceCustom)
+            return std::string("https://") + kSourceChoices[source].label;
         return {};
+    }
+    // Points the source at an address: a known mirror by its choice, another
+    // one as "Свой домен", "" for Авто.
+    void set_mirror(const std::string &url)
+    {
+        std::string m = url;
+        while (!m.empty() && (m.back() == '/' || m.back() == ' '))
+            m.pop_back();
+        if (m.empty()) {
+            source = 0;
+            return;
+        }
+        if (m.find("://") == std::string::npos)
+            m = "https://" + m;
+        for (int i = 1; i < kSourceCustom; ++i)
+            if (m == std::string("https://") + kSourceChoices[i].label) {
+                source = i;
+                return;
+            }
+        source = kSourceCustom;
+        custom_mirror = m;
     }
     // The quality label to play by default, "" for the best one, nullptr to ask.
     const char *quality_label() const
@@ -199,6 +237,7 @@ struct AppSettings
         put_bool("isShowClock", show_clock);
         put_bool("isRainbowProgressBar", rainbow_progress);
         put_choice("animNavDrawer", kAnimNavDrawerChoices, setting_count(kAnimNavDrawerChoices), anim_nav_drawer);
+        put_choice("appCategory", kAppCategoryChoices, setting_count(kAppCategoryChoices), app_category);
         put_choice("source", kSourceChoices, setting_count(kSourceChoices), source);
         std::fprintf(f, "customMirror=%s\n", custom_mirror.c_str());
         put_bool("isEnableBypassSsl", bypass_ssl);
@@ -252,8 +291,15 @@ struct AppSettings
         else if (key == "isShowClock") show_clock = on;
         else if (key == "isRainbowProgressBar") rainbow_progress = on;
         else if (key == "animNavDrawer") set_choice(anim_nav_drawer, kAnimNavDrawerChoices, value);
+        else if (key == "appCategory" || key == "app_category") {
+            // app_category=media|game, as written by hand
+            set_choice(app_category, kAppCategoryChoices, value);
+            if (value == "media") app_category = 0;
+            else if (value == "game") app_category = 1;
+        }
         else if (key == "source") set_choice(source, kSourceChoices, value);
         else if (key == "customMirror") custom_mirror = value;
+        else if (key == "custom_mirror") set_mirror(value); // by hand: the source follows it
         else if (key == "isEnableBypassSsl") bypass_ssl = on;
         else if (key == "countryFilter") {
             country_filter.clear();

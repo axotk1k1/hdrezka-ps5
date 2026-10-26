@@ -348,7 +348,7 @@ void App::load_category_async(int category_idx)
         if (!client.pick_mirror()) {
             write_log("[DEBUG] worker_thread pick_mirror failed\n");
             std::lock_guard<std::mutex> lock(catalog_mutex);
-            catalog_status = "HDRezka не отвечает. Проверьте интернет.";
+            catalog_status = kNetworkErrorText;
             catalog_loading = false;
             catalog_version++;
             return;
@@ -398,7 +398,7 @@ void App::load_category_async(int category_idx)
         write_log("[DEBUG] worker_thread get_catalog returned %d items\n", (int)items.size());
         if (items.empty()) {
             std::lock_guard<std::mutex> lock(catalog_mutex);
-            catalog_status = "Каталог HDRezka недоступен";
+            catalog_status = client.network_failed() ? kNetworkErrorText : "Каталог HDRezka недоступен";
             catalog_loading = false;
             catalog_version++;
             return;
@@ -460,7 +460,7 @@ void App::load_home_async(int filter_idx)
         }
         if (!client.pick_mirror()) {
             std::lock_guard<std::mutex> lock(catalog_mutex);
-            catalog_status = "HDRezka не отвечает. Проверьте интернет.";
+            catalog_status = kNetworkErrorText;
             catalog_loading = false;
             catalog_version++;
             return;
@@ -516,7 +516,7 @@ void App::load_home_async(int filter_idx)
             home_sections.clear();
             featured_indices.clear();
             featured_movies.clear();
-            catalog_status = "Главная HDRezka недоступна";
+            catalog_status = client.network_failed() ? kNetworkErrorText : "Главная HDRezka недоступна";
             catalog_loading = false;
             catalog_version++;
             return;
@@ -672,13 +672,14 @@ void App::load_movie_list_async(int tab, int type, int kind)
         if (!client.pick_mirror()) {
             std::lock_guard<std::mutex> lock(catalog_mutex);
             if (!shown_cached)
-                catalog_status = "Ошибка сети";
+                catalog_status = kNetworkErrorText;
             catalog_loading = false;
             catalog_version++;
             return;
         }
         bool has_next = false;
         auto items = fetch_list_page(client, tab, type, kind, 1, &has_next);
+        const bool net_failed = items.empty() && client.network_failed();
         if (stop_worker_) {
             catalog_loading = false;
             return;
@@ -719,7 +720,7 @@ void App::load_movie_list_async(int tab, int type, int kind)
                 movies = std::move(new_movies);
                 list_page = 1;
                 list_has_next = has_next && !movies.empty();
-                catalog_status = movies.empty() ? "Ничего не найдено" : "";
+                catalog_status = !movies.empty() ? "" : net_failed ? kNetworkErrorText : "Ничего не найдено";
             }
             catalog_version++;
         }
@@ -1418,13 +1419,39 @@ void App::download_update_async()
                 write_log("[DEBUG] updater: cannot write %s\n", temp.c_str());
                 continue;
             }
-            const bool written = fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size() && fflush(f) == 0;
-            fclose(f);
+            // On the disk before the rename, not in the cache: a restart right after must find it whole
+            bool written = fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size() && fflush(f) == 0;
+            written = fsync(fileno(f)) == 0 && written;
+            written = fclose(f) == 0 && written;
+            // The kernel refuses to start a program without the execute bits
+            if (written && chmod(temp.c_str(), 0777) != 0)
+                write_log("[DEBUG] updater: chmod %s failed\n", temp.c_str());
+            // What landed in the file: as large as an eboot.bin is, and a program
+            struct stat st {};
+            uint8_t magic[4] = {};
+            if (written) {
+                written = stat(temp.c_str(), &st) == 0 && static_cast<size_t>(st.st_size) == bytes.size() &&
+                          st.st_size > 50ll * 1024 * 1024;
+                if (FILE *check = written ? fopen(temp.c_str(), "rb") : nullptr) {
+                    written = fread(magic, 1, 4, check) == 4 &&
+                              is_executable(std::vector<uint8_t>(magic, magic + 4));
+                    fclose(check);
+                } else
+                    written = false;
+                if (!written)
+                    write_log("[DEBUG] updater: %s is not a whole eboot.bin (%lld bytes, %02x %02x %02x %02x)\n",
+                              temp.c_str(), static_cast<long long>(st.st_size), magic[0], magic[1], magic[2],
+                              magic[3]);
+            }
             if (!written || rename(temp.c_str(), target.c_str()) != 0) {
                 write_log("[DEBUG] updater: cannot replace %s\n", target.c_str());
                 remove(temp.c_str());
                 continue;
             }
+            chmod(target.c_str(), 0777);
+            sync();
+            write_log("[DEBUG] updater: eboot.bin installed via rename + chmod 0777 (bytes=%zu)\n",
+                      static_cast<size_t>(st.st_size));
             write_log("[DEBUG] updater: %s installed at %s (%zu bytes)\n", info.version.c_str(), target.c_str(),
                       bytes.size());
             set_update_state(UpdateState::installed, "Обновление установлено! Перезапустите приложение");
@@ -2131,7 +2158,7 @@ void App::list_async(std::function<std::vector<CatalogItem>(Client &)> fetch, co
         }
         if (!client.pick_mirror()) {
             std::lock_guard<std::mutex> lock(catalog_mutex);
-            catalog_status = "HDRezka не отвечает. Проверьте интернет.";
+            catalog_status = kNetworkErrorText;
             catalog_loading = false;
             catalog_version++;
             return;
@@ -3316,6 +3343,80 @@ void App::check_mirror_async(const std::string &mirror)
         std::lock_guard<std::mutex> lock(catalog_mutex);
         catalog_version++;
     }).detach();
+}
+
+void App::set_mirror(const std::string &url, int tab, int type, int kind)
+{
+    {
+        std::lock_guard<std::mutex> lock(settings_mutex_);
+        settings_.set_mirror(url);
+    }
+    save_settings();
+    apply_settings();
+    write_log("[DEBUG] set_mirror '%s' -> preferred '%s'\n", url.c_str(), client.preferred_mirror().c_str());
+    load_movie_list_async(tab, type, kind);
+}
+
+// applicationCategoryType: 0 files the title under Игры, 65792 (a media app,
+// as the console's video services are) under Мультимедиа.
+static constexpr long kParamCategoryGame = 0;
+static constexpr long kParamCategoryMedia = 65792;
+
+int App::write_app_category(bool media)
+{
+    const long category = media ? kParamCategoryMedia : kParamCategoryGame;
+    static const char *const kParamFiles[] = {
+        "/data/homebrew/PPSA99380/sce_sys/param.json",
+        "/mnt/usb0/homebrew/PPSA99380/sce_sys/param.json",
+        "/mnt/usb1/homebrew/PPSA99380/sce_sys/param.json",
+        "/system_data/priv/appmeta/PPSA99380/param.json",
+        "/user/appmeta/PPSA99380/param.json",
+        "dist/PPSA99380/sce_sys/param.json",
+    };
+    static const std::string kKey = "\"applicationCategoryType\"";
+    int written = 0;
+    for (const char *path : kParamFiles) {
+        FILE *in = fopen(path, "rb");
+        if (!in)
+            continue;
+        std::string json;
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+            json.append(buf, n);
+        fclose(in);
+        // "applicationCategoryType": <number>, the number replaced
+        const size_t key = json.find(kKey);
+        const size_t colon = key == std::string::npos ? key : json.find(':', key + kKey.size());
+        if (colon == std::string::npos) {
+            write_log("[DEBUG] write_app_category: no %s in %s\n", kKey.c_str(), path);
+            continue;
+        }
+        size_t from = colon + 1;
+        while (from < json.size() && (json[from] == ' ' || json[from] == '\t'))
+            ++from;
+        size_t to = from;
+        while (to < json.size() && (std::isdigit(static_cast<unsigned char>(json[to])) || json[to] == '-'))
+            ++to;
+        if (to == from)
+            continue;
+        json.replace(from, to - from, std::to_string(category));
+        // Written beside it and moved over it: a cut-off write leaves the old file
+        const std::string tmp = std::string(path) + ".tmp";
+        FILE *out = fopen(tmp.c_str(), "wb");
+        if (!out)
+            continue;
+        const bool ok = fwrite(json.data(), 1, json.size(), out) == json.size();
+        fclose(out);
+        if (!ok || rename(tmp.c_str(), path) != 0) {
+            remove(tmp.c_str());
+            write_log("[DEBUG] write_app_category: %s not rewritten\n", path);
+            continue;
+        }
+        write_log("[DEBUG] write_app_category: %s -> %ld\n", path, category);
+        ++written;
+    }
+    return written;
 }
 
 void App::clear_cache_async()

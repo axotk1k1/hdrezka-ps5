@@ -1484,6 +1484,14 @@ class Store final : public app::Concept
         }
 
         const bool triangle_pressed = input.is_pressed(Action::north) || ((ps5_pad().pressed & PAD_TRIANGLE) != 0);
+        // Over the home list's network error, △ changes the mirror instead
+        if (triangle_pressed && !search_open_ && sx_screen_ == SxScreen::none && !upd_open_ && !kb_active() &&
+            !settings_open_ && !profile_open_ && !person_open_ && !qr_open_ && !dialog_open_ && !drawer_open_ &&
+            !page_open_ && tv_offline())
+        {
+            tv_next_mirror(feedback);
+            return;
+        }
         if (!search_open_ && sx_screen_ == SxScreen::none && !upd_open_ && !kb_active() && triangle_pressed)
         {
             search_open_ = true;
@@ -4654,6 +4662,7 @@ class Store final : public app::Concept
         kStClock,
         kStRainbow,
         kStAnimDrawer,
+        kStAppCategory,
         kStSource,
         kStSsl,
         kStCountries,
@@ -4697,6 +4706,9 @@ class Store final : public app::Concept
         {kStClock, kStSwitch, "Часы", "Показывать часы и дату на некоторых экранах", kTvIconAccessTime},
         {kStRainbow, kStSwitch, "Радужная полоса прогресса", "Радужная полоса прогресса в плеере", kTvIconColorLens},
         {kStAnimDrawer, kStList, "Анимация при открытии панели навигации", nullptr, kTvIconAnimation},
+        {kStAppCategory, kStList, "Раздел в меню PS5",
+         "Изменения вступят в силу после перезапуска консоли / обновления списка в ShadowMount/Itemzflow",
+         kTvIconViewColumn},
     };
     static constexpr StDef kStConnection[] = {
         {kStSource, kStList, "Источник", nullptr, kTvIconLanguage},
@@ -4731,7 +4743,7 @@ class Store final : public app::Concept
     // update check under it), with this title's own links: the version row
     // checks for an update, the channel and the donation open their QR codes.
     static constexpr StDef kStAboutItems[] = {
-        {kStAppInfo, kStAction, "HDrezka homebrew for PS5", "Версия: 1.0.3", kTvIconInfoOutlined},
+        {kStAppInfo, kStAction, "HDrezka homebrew for PS5", "Версия: 1.0.5", kTvIconInfoOutlined},
         {kStAutoUpdate, kStSwitch, "Автоматическая проверка обновлений", "Проверять наличие обновлений при запуске приложения",
          kTvIconBrowserUpdated},
         {kStTelegram, kStAction, "Telegram канал", "t.me/hdrezkaps5", kTvIconSend},
@@ -4782,6 +4794,7 @@ class Store final : public app::Concept
         switch (key)
         {
         case kStAnimDrawer: choices = kAnimNavDrawerChoices; count = setting_count(kAnimNavDrawerChoices); return &s.anim_nav_drawer;
+        case kStAppCategory: choices = kAppCategoryChoices; count = setting_count(kAppCategoryChoices); return &s.app_category;
         case kStSource: choices = kSourceChoices; count = setting_count(kSourceChoices); return &s.source;
         case kStQuality: choices = kVideoQualityChoices; count = setting_count(kVideoQualityChoices); return &s.video_quality;
         case kStSpeed: choices = kPlaySpeedChoices; count = setting_count(kPlaySpeedChoices); return &s.play_speed;
@@ -4836,7 +4849,7 @@ class Store final : public app::Concept
         std::string text = choices[std::clamp(*at, 0, count - 1)].label;
         if (def.key == kStSource)
         {
-            if (s.source == 2)
+            if (s.source == rezka::kSourceCustom)
                 text = s.custom_mirror.empty() ? std::string("Свой домен не задан") : s.custom_mirror;
             const int check = rezka::App::instance().mirror_check.load();
             if (check == 1)
@@ -4902,6 +4915,14 @@ class Store final : public app::Concept
             app.check_mirror_async(next.mirror());
             st_reconnect_ = true;
         }
+        if (before.app_category != next.app_category)
+        {
+            // The console's home screen reads the param.json again after a restart
+            const int written = app.write_app_category(next.app_category == rezka::kAppCategoryMedia);
+            show_message(written > 0 ? "Изменения вступят в силу после перезапуска консоли / обновления списка в "
+                                       "ShadowMount/Itemzflow"
+                                     : "Не удалось изменить param.json приложения");
+        }
     }
 
     void update_settings(const InputFrame &input, float dt, app::Feedback &feedback)
@@ -4922,7 +4943,7 @@ class Store final : public app::Concept
                     if (domain.find("://") == std::string::npos)
                         domain = "https://" + domain;
                     rezka::AppSettings next = app.settings();
-                    next.source = 2;
+                    next.source = rezka::kSourceCustom;
                     next.custom_mirror = domain;
                     st_commit(next);
                 }
@@ -5024,6 +5045,28 @@ class Store final : public app::Concept
             }
             else if (input.nav == Direction::up || input.nav == Direction::down)
                 tv_refuse(feedback, input.nav_repeat);
+            return;
+        }
+        // "Источник" and "Раздел в меню PS5" step through their choices with
+        // left and right as well (Circle goes back to the groups)
+        if ((def.key == kStSource || def.key == kStAppCategory) &&
+            (input.nav == Direction::left || input.nav == Direction::right))
+        {
+            const rezka::SettingChoice *choices = nullptr;
+            int count = 0;
+            int *at = st_choice(s, def.key, choices, count);
+            int next = *at + (input.nav == Direction::right ? 1 : -1);
+            // "Свой домен" only once one is typed (Cross opens the sheet for it)
+            if (def.key == kStSource && next == rezka::kSourceCustom && s.custom_mirror.empty())
+                next += input.nav == Direction::right ? 1 : -1;
+            if (next < 0 || next >= count)
+                tv_refuse(feedback, input.nav_repeat);
+            else
+            {
+                *at = next;
+                st_commit(s);
+                tv_tick(feedback, kWidth * 0.75f);
+            }
             return;
         }
         if (input.is_pressed(Action::back) || input.nav == Direction::left)
@@ -5199,7 +5242,7 @@ class Store final : public app::Concept
             feedback.play(audio::Cue::toggle);
             return;
         }
-        if (st_sheet_key_ == kStSource && st_sheet_focus_ == 2)
+        if (st_sheet_key_ == kStSource && st_sheet_focus_ == rezka::kSourceCustom)
         {
             // "Свой домен…": typed with the console's keyboard (the sheet of keys on a PC)
             st_sheet_ = false;
@@ -5672,7 +5715,10 @@ class Store final : public app::Concept
                 checked.push_back(i == *at);
             }
             if (key == kStSource && !s.custom_mirror.empty())
-                extra = {"", "", s.custom_mirror};
+            {
+                extra.assign(static_cast<std::size_t>(count), std::string());
+                extra[rezka::kSourceCustom] = s.custom_mirror;
+            }
         }
 
         // The list: 20 dp in, 8 from the top, 4 between rows, a 48 dp row
@@ -6479,6 +6525,87 @@ class Store final : public app::Concept
         }
     }
 
+    // Under the network's error: "Нажмите △ для смены зеркала" and the mirrors
+    // as chips, the one in use selected (△ steps to the next, tv_next_mirror).
+    void tv_draw_mirror_chips(gfx::DrawList &list, float y) const
+    {
+        const float dp = kTvDp;
+        const float center = (kWidth - kTvRail) * 0.5f;
+        const float size = 14.0f * dp;
+        {
+            const char *before = "Нажмите", *after = "для смены зеркала";
+            const float gap = 6.0f * dp;
+            const float glyph = draw_pad_glyph(list, PadGlyph::triangle, 0.0f, 0.0f, true);
+            const float a = tv_regular().measure(before, size, 0.0f), b = tv_regular().measure(after, size, 0.0f);
+            float x = center - (a + gap + glyph + gap + b) * 0.5f;
+            x += tv_text(list, tv_regular(), before, x, y, size, 20.0f * dp, tv_on_surface_variant()) + gap;
+            x += draw_pad_glyph(list, PadGlyph::triangle, x, y + 10.0f * dp) + gap;
+            tv_text(list, tv_regular(), after, x, y, size, 20.0f * dp, tv_on_surface_variant());
+        }
+        y += 20.0f * dp + 16.0f * dp;
+        // The chips in rows that fit the list's width, each row centred
+        const int current = rezka::App::instance().settings().source;
+        const float max_w = kWidth - kTvRail - 2.0f * kTvPad;
+        const float chip_gap = 8.0f * dp, row_gap = 8.0f * dp;
+        std::vector<float> widths;
+        for (int i = 0; i < rezka::kSourceCustom; ++i)
+            widths.push_back(tv_medium().measure(rezka::kSourceChoices[i].label, size, 0.1f * dp) + 32.0f * dp);
+        int first = 0;
+        while (first < static_cast<int>(widths.size()))
+        {
+            int last = first;
+            float row_w = widths[static_cast<std::size_t>(first)];
+            while (last + 1 < static_cast<int>(widths.size()) &&
+                   row_w + chip_gap + widths[static_cast<std::size_t>(last + 1)] <= max_w)
+                row_w += chip_gap + widths[static_cast<std::size_t>(++last)];
+            float x = center - row_w * 0.5f;
+            for (int i = first; i <= last; ++i)
+            {
+                const Rect r{x, y, widths[static_cast<std::size_t>(i)], kTvChipH};
+                const bool selected = i == current;
+                if (selected)
+                    list.rounded_rect(r, 8.0f * dp, tv_on_surface());
+                else
+                    list.bordered_rect(r, 8.0f * dp, kClear, 1.0f * dp, tv_border());
+                tv_text(list, tv_medium(), rezka::kSourceChoices[i].label, r.x + 16.0f * dp, r.y + 8.0f * dp, size,
+                        20.0f * dp, selected ? tv_inverse_on_surface() : tv_on_surface_variant(), gfx::Align::left,
+                        0.1f * dp);
+                x += r.w + chip_gap;
+            }
+            y += kTvChipH + row_gap;
+            first = last + 1;
+        }
+    }
+
+    // The empty list says the network failed, or its placeholders gave up.
+    bool tv_offline() const
+    {
+        if (!tv_cards_.empty())
+            return false;
+        const auto &app = rezka::App::instance();
+        if (app.catalog_loading)
+            return tv_skeleton_since_ >= 0.0f && clock_ - tv_skeleton_since_ > kTvSkeletonSeconds;
+        return tv_status_ == rezka::kNetworkErrorText || tv_status_ == "Ошибка сети";
+    }
+    // △ under the network's error: the next mirror (Авто after the last one),
+    // kept in settings.cfg, and the list asked for again from it.
+    void tv_next_mirror(app::Feedback &feedback)
+    {
+        auto &app = rezka::App::instance();
+        const int source = app.settings().source;
+        const int next = source + 1 >= rezka::kSourceCustom ? 0 : source + 1;
+        const std::string label = rezka::kSourceChoices[next].label;
+        tv_tab_delay_ = -1.0f;
+        tv_focus_ = 0;
+        tv_scroll_.snap(0.0f);
+        tv_cards_.clear();
+        tv_skeleton_since_ = -1.0f;
+        app.mirror_check = 0;
+        app.set_mirror(next == 0 ? std::string() : "https://" + label, tv_tab_, tv_type_, tv_kind_);
+        show_message("Зеркало: " + label);
+        feedback.play(audio::Cue::select);
+    }
+
     void tv_draw_grid(gfx::DrawList &list) const
     {
         const float scroll = tv_scroll_.value;
@@ -6486,9 +6613,16 @@ class Store final : public app::Concept
         const int count = static_cast<int>(tv_cards_.size());
         const float radius = 8.0f * kTvDp;
         const auto &app = rezka::App::instance();
+        if (count != 0 || !app.catalog_loading)
+            tv_skeleton_since_ = -1.0f;
         if (count == 0)
         {
-            if (app.catalog_loading)
+            // The placeholders stay for kTvSkeletonSeconds at most: a network
+            // that drops the packets says so while the mirrors are still tried.
+            if (app.catalog_loading && tv_skeleton_since_ < 0.0f)
+                tv_skeleton_since_ = clock_;
+            const bool stalled = app.catalog_loading && clock_ - tv_skeleton_since_ > kTvSkeletonSeconds;
+            if (app.catalog_loading && !stalled)
             {
                 // The app's placeholder grid while the first page loads
                 const float pulse = 0.35f + 0.15f * std::sin(clock_ * 3.0f);
@@ -6499,10 +6633,25 @@ class Store final : public app::Concept
                                       tv_surface_variant().with_alpha(pulse));
                 }
             }
-            else if (!tv_status_.empty())
-                tv_text(list, tv_regular(), tv_status_, (kWidth - kTvRail) * 0.5f,
-                        kTvGridTop + tv_grid_offset() + (view - tv_grid_offset()) * 0.4f - scroll,
-                        22.0f * kTvDp, 28.0f * kTvDp, tv_on_surface(), gfx::Align::center);
+            else
+            {
+                const std::string status = stalled ? rezka::kNetworkErrorText : tv_status_;
+                // A long message is cut after its first sentence, two lines.
+                const std::size_t cut = status.find(". ");
+                const float line_h = 28.0f * kTvDp;
+                float y = kTvGridTop + tv_grid_offset() + (view - tv_grid_offset()) * 0.4f - scroll;
+                for (const std::string &line :
+                     {status.substr(0, cut == std::string::npos ? status.size() : cut + 1),
+                      cut == std::string::npos ? std::string() : status.substr(cut + 2)})
+                {
+                    if (!line.empty())
+                        tv_text(list, tv_regular(), line, (kWidth - kTvRail) * 0.5f, y, 22.0f * kTvDp, line_h,
+                                tv_on_surface(), gfx::Align::center);
+                    y += line_h;
+                }
+                if (tv_offline())
+                    tv_draw_mirror_chips(list, y + 16.0f * kTvDp);
+            }
             return;
         }
 
@@ -7384,7 +7533,8 @@ class Store final : public app::Concept
         }
         if (tv_zone_ == TvZone::drawer)
             return {{G::cross, "Выбрать"}, {G::triangle, "Поиск"}, {G::circle, "Назад"}};
-        std::vector<PadHint> hints = {{G::cross, "Выбрать"}, {G::square, "В мой список"}, {G::triangle, "Поиск"}};
+        std::vector<PadHint> hints = {{G::cross, "Выбрать"}, {G::square, "В мой список"},
+                                      {G::triangle, tv_offline() ? "Сменить зеркало" : "Поиск"}};
         if (home_layout_)
         {
             if (tv_kind_ == 0)
@@ -12610,6 +12760,10 @@ class Store final : public app::Concept
     // The home page (HDrezkaTV's MovieList screen).
     std::vector<TvCard> tv_cards_;
     std::string tv_status_;       // what the catalogue says when it has no cards
+    // When the placeholder grid appeared (clock_), -1 while it is not shown:
+    // after kTvSkeletonSeconds the network's error replaces it.
+    mutable float tv_skeleton_since_ = -1.0f;
+    static constexpr float kTvSkeletonSeconds = 8.0f;
     TvZone tv_zone_ = TvZone::tabs;
     TvZone tv_return_ = TvZone::tabs; // where the focus was when the drawer opened
     int tv_kind_ = 0;             // 0 the home tabs, 1 Новинки, 2 Анонсы

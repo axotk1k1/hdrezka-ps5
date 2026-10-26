@@ -24,9 +24,12 @@ namespace rezka
 {
 
 // The title's version: what the updater compares GitHub's releases with.
-inline constexpr const char *kAppVersion = "1.0.3";
+inline constexpr const char *kAppVersion = "1.0.5";
 // The releases of the title (Настройки → О приложении, the updater).
 inline constexpr const char *kUpdateRepo = "axotk1k1/hdrezka-ps5";
+// What the catalogue says when no mirror answered or its list did not arrive.
+inline constexpr const char *kNetworkErrorText =
+    "Не удалось подключиться к серверу (DNS/Timeout). Проверьте настройки сети или зеркало";
 
 // A newer title found on GitHub: its version, notes and eboot.bin.
 struct UpdateInfo
@@ -370,6 +373,13 @@ public:
     // 2 it answers (and is now the mirror), 3 it does not.
     void check_mirror_async(const std::string &mirror);
     std::atomic<int> mirror_check{0};
+    // Makes url the mirror ("" for Авто) by hand: kept in settings.cfg at once,
+    // and the catalogue is asked for again from it.
+    void set_mirror(const std::string &url, int tab = 0, int type = 0, int kind = 0);
+    // "Раздел в меню PS5": rewrites applicationCategoryType in the title's
+    // param.json (the installed folder and the console's copies of it). The
+    // number of files rewritten; the shell reads them after a restart.
+    int write_app_category(bool media);
     // "Очистить кэш": data/cache/ emptied on a worker; cache_clearing while it runs.
     void clear_cache_async();
     std::atomic<bool> cache_clearing{false};
