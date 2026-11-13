@@ -63,7 +63,7 @@
 
 Для запуска потребуется консоль PS5 с поддержкой Homebrew.
 
-1. Загрузите архив `PPSA99380-v1.0.3.zip` со страницы [Releases](https://github.com/axotk1k1/hdrezka-ps5/releases).
+1. Загрузите архив `PPSA99380-v1.0.5.zip` со страницы [Releases](https://github.com/axotk1k1/hdrezka-ps5/releases).
 2. Распакуйте папку `PPSA99380` на консоль по пути:
    ```text
    /data/homebrew/PPSA99380/
