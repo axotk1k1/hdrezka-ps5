@@ -199,7 +199,7 @@ void App::init(vks::VulkanDevice *dev, VkQueue q, hui::gfx::VkRenderer *rend, hu
         disk_cache::init(roots);
         cache_client.set_cache_only(true);
         const std::string last = disk_cache::read_note("last_mirror.txt");
-        if (last.rfind("http", 0) == 0) {
+        if (settings_snapshot().mirror().empty() && last.rfind("http", 0) == 0) {
             cache_client.set_mirror(last);
             client.set_mirror(last);
         }
@@ -2037,6 +2037,9 @@ void App::load_hero_async()
         }
         if (!wait_turn())
             return;
+        const std::string pref = client.preferred_mirror();
+        if (!pref.empty())
+            client.set_mirror(pref);
         std::vector<HeroSlide> slides = list_slides(client);
         write_log("[DEBUG] hero: %zu slides\n", slides.size());
         if (slides.empty() && shown_cached)
@@ -2985,6 +2988,13 @@ void App::release_video_texture()
     video_frame_rgba_ = {};
 }
 
+static float stream_gain_for_volume(float volume)
+{
+    if (volume <= 1.0f)
+        return std::clamp(volume, 0.0f, 1.0f);
+    return 1.0f + (std::min(volume, 2.0f) - 1.0f) * 1.5f;
+}
+
 void App::play_stream(const std::string &title, const std::string &voice, const std::string &url)
 {
     const std::string quality = pending_play_quality_.empty() ? std::string("HD") : pending_play_quality_;
@@ -3017,7 +3027,7 @@ void App::play_stream(const std::string &title, const std::string &voice, const 
         if (mixer) {
             mixer->set_stream_gain(0, 0.0f, 0.1f);
             video_audio_live_ = mixer->swap_stream(1, &audio_ring);
-            mixer->set_stream_gain(1, player.volume(), 0.1f);
+            mixer->set_stream_gain(1, stream_gain_for_volume(player.volume()), 0.1f);
         }
         is_playing = true;
         osd_timer = 4.0f;
@@ -3281,18 +3291,23 @@ bool App::save_settings()
 void App::apply_settings()
 {
     const AppSettings s = settings_snapshot();
-    client.set_preferred_mirror(s.mirror());
+    const std::string m = s.mirror();
+    client.set_preferred_mirror(m);
+    if (!m.empty()) {
+        client.set_mirror(m);
+        cache_client.set_mirror(m);
+    }
     Client::set_ssl_bypass(s.bypass_ssl);
     if (player.is_open())
         player.set_speed(kPlaySpeeds[std::clamp(s.play_speed, 0, 7)]);
-    set_volume(static_cast<float>(std::clamp(s.volume, 0, 100)) / 100.0f);
+    set_volume(static_cast<float>(std::clamp(s.volume, 0, 200)) / 100.0f);
 }
 
 void App::set_volume(float volume)
 {
     player.set_volume(volume);
     if (mixer)
-        mixer->set_stream_gain(1, player.volume(), 0.05f);
+        mixer->set_stream_gain(1, stream_gain_for_volume(player.volume()), 0.05f);
 }
 
 void App::save_volume()

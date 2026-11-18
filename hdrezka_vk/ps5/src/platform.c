@@ -40,6 +40,7 @@ int scePadSetLightBar(int32_t handle, const void *color);
 int sceAudioOutInit(void);
 int sceAudioOutOpen(int32_t user, int32_t type, int32_t index, uint32_t grain, uint32_t rate,
                     uint32_t format);
+int sceAudioOutSetVolume(int32_t port, int32_t flag, int32_t *vol);
 int sceAudioOutOutput(int32_t port, const void *samples);
 int sceAudioOutClose(int32_t port);
 int sceKernelUsleep(uint32_t microseconds);
@@ -412,6 +413,10 @@ pad_light_bar(uint8_t r, uint8_t g, uint8_t b)
 
 #define AUDIO_GRAIN 256
 #define AUDIO_ALREADY_INITIALISED ((int)0x8026000e)
+#define SCE_AUDIO_OUT_PORT_TYPE_MAIN 0
+#define SCE_AUDIO_OUT_VOLUME_FLAG_L_CH (1 << 0)
+#define SCE_AUDIO_OUT_VOLUME_FLAG_R_CH (1 << 1)
+#define SCE_AUDIO_OUT_VOLUME_0DB 32768
 
 static int32_t audio_port = -1;
 static pthread_t audio_thread;
@@ -450,12 +455,17 @@ audio_start(audio_fill_fn fill, void *user)
       return false;
    }
    /* The system user's main port: 256 frames, 48 kHz, 16-bit stereo. */
-   audio_port = sceAudioOutOpen(0xff, 0, 0, AUDIO_GRAIN, 48000, 1);
+   audio_port = sceAudioOutOpen(0xff, SCE_AUDIO_OUT_PORT_TYPE_MAIN, 0, AUDIO_GRAIN, 48000, 1);
    if (audio_port < 0) {
       say("audio: sceAudioOutOpen 0x%08x", (unsigned)audio_port);
       audio_port = -1;
       return false;
    }
+   int32_t vol[2] = {SCE_AUDIO_OUT_VOLUME_0DB, SCE_AUDIO_OUT_VOLUME_0DB};
+   const int vrc = sceAudioOutSetVolume(
+       audio_port, SCE_AUDIO_OUT_VOLUME_FLAG_L_CH | SCE_AUDIO_OUT_VOLUME_FLAG_R_CH, vol);
+   if (vrc < 0)
+      say("audio: sceAudioOutSetVolume 0x%08x", (unsigned)vrc);
    audio_fill = fill;
    audio_user = user;
    atomic_store(&audio_running, true);

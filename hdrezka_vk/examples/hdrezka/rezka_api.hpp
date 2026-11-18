@@ -441,6 +441,7 @@ private:
     bool cache_only_ = false;
     std::atomic<time_t> mirror_verified_at_{0}; // when pick_mirror last saw mirror_ answer
     std::atomic<bool> net_failed_{false};
+    long last_http_code_{0};
     std::string mirror_{"https://hdrezka.ag"};
     mutable std::mutex preferred_mu_;
     std::string preferred_mirror_;

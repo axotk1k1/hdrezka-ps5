@@ -1130,7 +1130,7 @@ class Store final : public app::Concept
         const float dp = kTvDp;
         const float shown = tween::clamp01(pl_vol_in_.value);
         const float volume = rezka::App::instance().player.volume();
-        const int percent = static_cast<int>(std::lround(volume * 100.0f));
+        const int percent = static_cast<int>(std::lround(std::clamp(volume / 2.0f, 0.0f, 1.0f) * 100.0f));
         const float w = 300.0f * dp, h = 64.0f * dp;
         const Rect plate{kWidth - 32.0f * dp - w, 32.0f * dp - (1.0f - shown) * 16.0f * dp, w, h};
         list.push_opacity(shown);
@@ -1168,7 +1168,7 @@ class Store final : public app::Concept
         const Rect bar{tx, plate.y + h - 20.0f * dp, bar_w, 6.0f * dp};
         list.rounded_rect(bar, bar.h * 0.5f, kWhite.with_alpha(0.25f));
         if (volume > 0.001f)
-            list.rounded_rect({bar.x, bar.y, std::max(bar.h, bar.w * volume), bar.h}, bar.h * 0.5f, tv_primary());
+            list.rounded_rect({bar.x, bar.y, std::max(bar.h, bar.w * std::clamp(volume / 2.0f, 0.0f, 1.0f)), bar.h}, bar.h * 0.5f, tv_primary());
         list.pop_opacity();
     }
 
@@ -4668,6 +4668,7 @@ class Store final : public app::Concept
         kStCountries,
         kStClearCache,
         kStQuality,
+        kStVolume,
         kStAutoNext,
         kStStepForward,
         kStStepReplay,
@@ -4720,6 +4721,7 @@ class Store final : public app::Concept
     };
     static constexpr StDef kStPlayer[] = {
         {kStQuality, kStList, "Качество по умолчанию", nullptr, kTvIconHighQuality},
+        {kStVolume, kStRange, "Громкость", nullptr, kTvIconPlayCircle},
         {kStAutoNext, kStSwitch, "Автоматически включать следующую серию", "Плеер начнет воспроизведение следующей серии",
          kTvIconSkipNext},
         {kStStepForward, kStRange, "Шаг быстрой перемотки вперед", nullptr, kTvIconForward10},
@@ -4743,7 +4745,7 @@ class Store final : public app::Concept
     // update check under it), with this title's own links: the version row
     // checks for an update, the channel and the donation open their QR codes.
     static constexpr StDef kStAboutItems[] = {
-        {kStAppInfo, kStAction, "HDrezka homebrew for PS5", "Версия: 1.0.5", kTvIconInfoOutlined},
+        {kStAppInfo, kStAction, "HDrezka homebrew for PS5", "Версия: 1.0.7", kTvIconInfoOutlined},
         {kStAutoUpdate, kStSwitch, "Автоматическая проверка обновлений", "Проверять наличие обновлений при запуске приложения",
          kTvIconBrowserUpdated},
         {kStTelegram, kStAction, "Telegram канал", "t.me/hdrezkaps5", kTvIconSend},
@@ -4813,6 +4815,11 @@ class Store final : public app::Concept
         {
             lo = 5, hi = 9, step = 1;
             return &s.columns;
+        }
+        if (key == kStVolume)
+        {
+            lo = 0, hi = 200, step = 20;
+            return &s.volume;
         }
         lo = 5, hi = 60, step = 5;
         if (key == kStStepForward)
@@ -5033,12 +5040,12 @@ class Store final : public app::Concept
             }
             else if (value && (input.nav == Direction::left || input.nav == Direction::right))
             {
-                const int next = *value + (input.nav == Direction::right ? step : -step);
-                if (next < lo || next > hi)
+                const int dir = input.nav == Direction::right ? 1 : -1;
+                if ((dir < 0 && *value <= lo) || (dir > 0 && *value >= hi))
                     tv_refuse(feedback, input.nav_repeat);
                 else
                 {
-                    *value = next;
+                    *value = std::clamp(*value + dir * step, lo, hi);
                     st_commit(s);
                     tv_tick(feedback, kWidth * 0.75f);
                 }
@@ -5397,7 +5404,10 @@ class Store final : public app::Concept
                             num.with_alpha(value && *value > lo ? 1.0f : 0.35f));
                     tv_icon(list, kTvIconAdd, cx + 20.0f * dp, rs.cy() - 10.0f * dp, 20.0f * dp,
                             num.with_alpha(value && *value < hi ? 1.0f : 0.35f));
-                    tv_text(list, tv_medium(), value ? std::to_string(*value) : "", cx, rs.cy() - 12.0f * dp, 16.0f * dp,
+                    std::string label = value ? std::to_string(*value) : "";
+                    if (def.key == kStVolume && value)
+                        label = std::to_string(static_cast<int>(std::lround(std::clamp(*value / 200.0, 0.0, 1.0) * 100.0))) + "%";
+                    tv_text(list, tv_medium(), label, cx, rs.cy() - 12.0f * dp, 16.0f * dp,
                             24.0f * dp, num, gfx::Align::center, 0.1f * dp);
                 }
                 y += h + 4.0f * dp;

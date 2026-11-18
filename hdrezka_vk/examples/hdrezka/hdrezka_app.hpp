@@ -24,7 +24,7 @@ namespace rezka
 {
 
 // The title's version: what the updater compares GitHub's releases with.
-inline constexpr const char *kAppVersion = "1.0.5";
+inline constexpr const char *kAppVersion = "1.0.7";
 // The releases of the title (Настройки → О приложении, the updater).
 inline constexpr const char *kUpdateRepo = "axotk1k1/hdrezka-ps5";
 // What the catalogue says when no mirror answered or its list did not arrive.

@@ -576,19 +576,48 @@ std::string Client::preferred_mirror() const
     return preferred_mirror_;
 }
 
+static bool is_anubis_page(const std::string &html)
+{
+    return html.find("anubis_challenge") != std::string::npos ||
+           html.find("techaro.lol") != std::string::npos ||
+           html.find("anubis") != std::string::npos;
+}
+
+static bool is_mirror_alive(const std::string &html, long http_code)
+{
+    if (html.find("class=\"b-content__inline_item\"") != std::string::npos)
+        return true;
+    return http_code == 200 && !html.empty() &&
+           html.find("This domain may be for sale") == std::string::npos;
+}
+
 bool Client::check_mirror(const std::string &mirror)
 {
     std::lock_guard<std::recursive_mutex> lock(net_mu_);
     const std::string before = mirror_;
     std::string m = mirror;
+    while (!m.empty() && (m.back() == '/' || m.back() == ' '))
+        m.pop_back();
     if (!m.empty() && m.find("://") == std::string::npos)
         m = "https://" + m;
     set_mirror(m);
-    const std::string html = http_get("/films/?filter=popular");
-    const bool ok = html.find("class=\"b-content__inline_item\"") != std::string::npos;
-    write_log("[DEBUG] check_mirror %s -> %zu bytes, catalog %s\n", m.c_str(), html.size(), ok ? "found" : "missing");
-    if (!ok)
-        set_mirror(before);
+    std::string html = http_get("/films/?filter=popular");
+    bool has_catalog = html.find("class=\"b-content__inline_item\"") != std::string::npos;
+    if (!has_catalog && last_http_code_ == 200 && is_anubis_page(html)) {
+        write_log("[DEBUG] check_mirror %s -> anubis detected, solving\n", m.c_str());
+        if (solve_anubis_challenge(html, m + "/films/?filter=popular")) {
+            html = http_get("/films/?filter=popular");
+            has_catalog = html.find("class=\"b-content__inline_item\"") != std::string::npos;
+        }
+    }
+    const bool ok = is_mirror_alive(html, last_http_code_);
+    write_log("[DEBUG] check_mirror %s -> %zu bytes (http=%ld), catalog %s\n",
+              m.c_str(), html.size(), last_http_code_,
+              has_catalog ? "found" : (ok ? "missing (http 200 alive)" : "missing"));
+    if (!ok) {
+        const std::string pref = preferred_mirror();
+        set_mirror(!pref.empty() ? pref : before);
+    }
     return ok;
 }
 
@@ -624,8 +653,7 @@ bool Client::pick_mirror(bool force)
     }
     static const char *known[] = {
         "https://hdrezka.ag",   "https://rezka.ag",    "https://hdrezka.me",  "https://hdrezka.tv",
-        "https://hdrezka.co",   "https://hdrezka.club", "https://hdrezka.net", "https://hdrezka.org",
-        "https://hdrezka-home.tv",
+        "https://hdrezka.co",   "https://hdrezka.club", "https://hdrezka-home.tv", "https://rezka.si",
     };
     // The one that answered last time first, then the others
     std::vector<std::string> candidates;
@@ -641,10 +669,20 @@ bool Client::pick_mirror(bool force)
         set_mirror(candidate);
         write_log("[DEBUG] pick_mirror trying %s\n", candidate.c_str());
         const long started = now_ms();
-        const std::string html = http_get("/films/?filter=popular");
-        const bool ok = html.find("class=\"b-content__inline_item\"") != std::string::npos;
+        std::string html = http_get("/films/?filter=popular");
+        bool has_catalog = html.find("class=\"b-content__inline_item\"") != std::string::npos;
+        if (!has_catalog && last_http_code_ == 200 && is_anubis_page(html)) {
+            write_log("[DEBUG] pick_mirror %s -> anubis detected, solving\n", candidate.c_str());
+            if (solve_anubis_challenge(html, candidate + "/films/?filter=popular")) {
+                html = http_get("/films/?filter=popular");
+                has_catalog = html.find("class=\"b-content__inline_item\"") != std::string::npos;
+            }
+        }
+        const bool ok = is_mirror_alive(html, last_http_code_);
         write_log("[DEBUG] pick_mirror %s -> %zu bytes in %ld ms, catalog %s (mirror now %s)\n",
-                  candidate.c_str(), html.size(), now_ms() - started, ok ? "found" : "missing", mirror_.c_str());
+                  candidate.c_str(), html.size(), now_ms() - started,
+                  has_catalog ? "found" : (ok ? "missing (http 200 alive)" : "missing"),
+                  mirror_.c_str());
         if (!ok && !html.empty()) {
             write_log("[DEBUG] pick_mirror head: %.300s\n", html.c_str());
         }
@@ -749,6 +787,7 @@ std::string Client::http_get(const std::string &url)
     CURL *curl = curl_easy_init();
     if (!curl) {
         write_log("[DEBUG] http_get curl_easy_init FAILED\n");
+        last_http_code_ = 0;
         return "";
     }
 
@@ -775,6 +814,7 @@ std::string Client::http_get(const std::string &url)
     CURLcode res = curl_easy_perform(curl);
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    last_http_code_ = http_code;
     write_log("[DEBUG] http_get done rc=%d (%s) http=%ld bytes=%zu err='%s'\n",
               (int)res, curl_easy_strerror(res), http_code, response.size(), errbuf);
     log_curl_diagnostics(curl, "GET", full_url, res, errbuf, now_ms() - started, &response);

@@ -44,8 +44,8 @@ inline constexpr SettingChoice kSourceChoices[] = {
     {"HdrezkaTv", "hdrezka.tv"},
     {"HdrezkaCo", "hdrezka.co"},
     {"HdrezkaClub", "hdrezka.club"},
-    {"HdrezkaNet", "hdrezka.net"},
-    {"HdrezkaOrg", "hdrezka.org"},
+    {"HdrezkaHome", "hdrezka-home.tv"},
+    {"RezkaSi", "rezka.si"},
     {"Custom", "Свой домен…"},
 };
 inline constexpr int kSourceCustom = 9;
@@ -157,7 +157,7 @@ struct AppSettings
     int stream_buffer_size = 0;       // streamBufferSize
     int buffer_duration = 0;          // bufferDuration
     int back_buffer_duration = 1;     // backBufferDuration
-    int volume = 100;                 // the player's volume, 0..100 (the right stick)
+    int volume = 160;                 // the player's volume, 0..200 (80% display by default)
     // Субтитры
     int subtitle_arrangement = 3;     // subtitleArrangement: BottomCenter
     int subtitle_font_size = 1;       // subtitleFontSize: Medium
@@ -322,7 +322,7 @@ struct AppSettings
         else if (key == "streamBufferSize") set_choice(stream_buffer_size, kStreamBufferSizeChoices, value);
         else if (key == "bufferDuration") set_choice(buffer_duration, kBufferDurationChoices, value);
         else if (key == "backBufferDuration") set_choice(back_buffer_duration, kBackBufferDurationChoices, value);
-        else if (key == "volume") set_int(volume, value, 0, 100);
+        else if (key == "volume") set_int(volume, value, 0, 200);
         else if (key == "subtitleArrangement") set_choice(subtitle_arrangement, kSubtitleArrangementChoices, value);
         else if (key == "subtitleFontSize") set_choice(subtitle_font_size, kSubtitleFontSizeChoices, value);
         else if (key == "isCheckUpdate") check_update = on;

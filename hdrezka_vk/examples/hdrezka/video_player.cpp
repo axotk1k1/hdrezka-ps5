@@ -126,6 +126,32 @@ bool VideoPlayer::wait_interruptible(double seconds)
     return false;
 }
 
+bool VideoPlayer::recreate_swr(int in_rate)
+{
+    if (!audio_codec_ctx_)
+        return false;
+    AVChannelLayout out_layout;
+    av_channel_layout_default(&out_layout, 2);
+    swr_free(&swr_ctx_);
+    swr_alloc_set_opts2(&swr_ctx_, &out_layout, AV_SAMPLE_FMT_FLT, audio_out_rate_,
+                        &audio_codec_ctx_->ch_layout, audio_codec_ctx_->sample_fmt, in_rate, 0,
+                        nullptr);
+    av_channel_layout_uninit(&out_layout);
+    if (!swr_ctx_)
+        return false;
+    if (audio_codec_ctx_->ch_layout.nb_channels > 2) {
+        // Compensate FFmpeg's default downmix attenuation so 5.1/7.1 dialogue
+        // matches stereo tracks in perceived loudness.
+        av_opt_set_double(swr_ctx_, "rematrix_volume", 1.8, 0);
+        av_opt_set_double(swr_ctx_, "center_mix_level", 1.0, 0);
+    }
+    if (swr_init(swr_ctx_) < 0) {
+        swr_free(&swr_ctx_);
+        return false;
+    }
+    return true;
+}
+
 void VideoPlayer::write_audio_blocking(const float *samples, int frames)
 {
     if (!audio_ring_ || frames <= 0)
@@ -459,13 +485,7 @@ bool VideoPlayer::prepare_decoder()
             audio_codec_ctx_ = avcodec_alloc_context3(a_codec);
             avcodec_parameters_to_context(audio_codec_ctx_, a_par);
             if (avcodec_open2(audio_codec_ctx_, a_codec, nullptr) >= 0) {
-                AVChannelLayout out_layout;
-                av_channel_layout_default(&out_layout, 2);
-                swr_alloc_set_opts2(&swr_ctx_, &out_layout, AV_SAMPLE_FMT_FLT, audio_out_rate_,
-                                    &audio_codec_ctx_->ch_layout, audio_codec_ctx_->sample_fmt,
-                                    audio_codec_ctx_->sample_rate, 0, nullptr);
-                if (swr_ctx_) {
-                    swr_init(swr_ctx_);
+                if (recreate_swr(audio_codec_ctx_->sample_rate)) {
                     write_log("[DEBUG] audio codec=%s src_rate=%d ch=%d -> %d Hz stereo float\n",
                               a_codec->name ? a_codec->name : "?", audio_codec_ctx_->sample_rate,
                               audio_codec_ctx_->ch_layout.nb_channels, audio_out_rate_);
@@ -898,13 +918,7 @@ void VideoPlayer::audio_loop()
         const double speed = speed_.load();
         if (speed != built_speed) {
             in_rate = static_cast<int>(std::lround(audio_codec_ctx_->sample_rate * speed));
-            AVChannelLayout out_layout;
-            av_channel_layout_default(&out_layout, 2);
-            swr_free(&swr_ctx_);
-            swr_alloc_set_opts2(&swr_ctx_, &out_layout, AV_SAMPLE_FMT_FLT, audio_out_rate_,
-                                &audio_codec_ctx_->ch_layout, audio_codec_ctx_->sample_fmt, in_rate, 0,
-                                nullptr);
-            if (!swr_ctx_ || swr_init(swr_ctx_) < 0) {
+            if (!recreate_swr(in_rate)) {
                 write_log("[DEBUG] audio speed %.2f: swr failed\n", speed);
                 break;
             }
